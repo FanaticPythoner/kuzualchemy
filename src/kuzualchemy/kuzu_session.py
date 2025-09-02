@@ -1,0 +1,858 @@
+"""
+Session management for Kuzu ORM with query execution and transaction support.
+"""
+
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Tuple, Iterator, cast
+from contextlib import contextmanager
+from threading import RLock
+from pathlib import Path
+from .kuzu_query import Query
+from kuzu import Connection
+from kuzu import Database
+
+from .constants import ValidationMessageConstants, QueryFieldConstants
+import re
+
+ModelType = TypeVar("ModelType")
+
+
+class KuzuConnection:
+    """Wrapper for Kuzu database connection."""
+    
+    def __init__(self, db_path: Union[str, Path], **kwargs):
+        """Initialize connection to Kuzu database."""
+        # @@ STEP: Kuzu imports - handle missing package gracefully
+        # || S.1: Try to import kuzu and handle if not installed
+        self.db_path = Path(db_path)
+        self.db = Database(str(self.db_path))
+        self.conn = Connection(self.db, **kwargs)
+        self._lock = RLock()
+    
+    def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        """Execute a Cypher query and normalize results."""
+        with self._lock:
+            if parameters:
+                result = self.conn.execute(query, parameters)
+            else:
+                result = self.conn.execute(query)
+            
+            # @@ STEP: Normalize Kuzu result format
+            # || S.1: Kuzu returns each row as a list of values
+            # || S.2: Need to map to dict based on RETURN clause
+            normalized = []
+            
+            # Parse RETURN clause to get column names
+            return_aliases = self._parse_return_clause(query)
+            
+            for row in result:
+                if isinstance(row, list):
+                    # Row is a list of values, map to dict using return aliases
+                    if len(return_aliases) == len(row):
+                        row_dict = {}
+                        for i, alias in enumerate(return_aliases):
+                            row_dict[alias] = row[i]
+                        normalized.append(row_dict)
+                    else:
+                        # Fallback: single value
+                        if len(row) == 1 and return_aliases:
+                            normalized.append({return_aliases[0]: row[0]})
+                        else:
+                            normalized.append(row)
+                else:
+                    # Already a dict or other structure
+                    normalized.append(row)
+            
+            return normalized
+    
+    def _parse_return_clause(self, query: str) -> List[str]:
+        """Parse RETURN clause to extract column aliases."""
+        # Find RETURN clause
+        match = re.search(r'RETURN\s+(.+?)(?:ORDER|LIMIT|UNION|$)', query, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return []
+        
+        return_clause = match.group(1).strip()
+        # Simple parsing - split by comma and extract aliases
+        parts = return_clause.split(',')
+        aliases = []
+        for part in parts:
+            part = part.strip()
+            # Handle "expr AS alias" or just "expr" (case-insensitive)
+            if ' as ' in part.lower():
+                # Split case-insensitively for AS
+                idx = part.lower().index(' as ')
+                alias = part[idx + 4:].strip()
+            else:
+                alias = part.strip()
+            aliases.append(alias)
+        return aliases
+    
+    def close(self) -> None:
+        """Close the connection."""
+        with self._lock:
+            self.conn.close()
+
+
+class KuzuSession:
+    """
+    Session for executing queries and managing transactions.
+    Provides SQLAlchemy-like interface for Kuzu database operations.
+    """
+    
+    def __init__(
+        self,
+        connection: Optional[KuzuConnection] = None,
+        db_path: Optional[Union[str, Path]] = None,
+        autoflush: bool = True,
+        autocommit: bool = False,
+        expire_on_commit: bool = True,
+        **kwargs
+    ):
+        """
+        Initialize a Kuzu session.
+        
+        Args:
+            connection: Existing connection to use
+            db_path: Path to database if creating new connection
+            autoflush: Whether to auto-flush before queries
+            autocommit: Whether to auto-commit after operations
+            expire_on_commit: Whether to expire objects after commit
+        """
+        if connection:
+            self._conn = connection
+            self._owns_connection = False
+        elif db_path:
+            self._conn = KuzuConnection(db_path, **kwargs)
+            self._owns_connection = True
+        else:
+            raise ValueError("Either connection or db_path must be provided")
+        
+        self.autoflush = autoflush
+        self.autocommit = autocommit
+        self.expire_on_commit = expire_on_commit
+        
+        self._dirty = set()
+        self._new = set()
+        self._deleted = set()
+        self._identity_map: Dict[Tuple[Type, Any], Any] = {}
+        self._flushing = False
+    
+    
+    def query(
+        self,
+        model_class: Type[ModelType],
+        alias: str = "n") -> Query[ModelType]:
+        """
+        Create a query for a model class.
+        
+        Args:
+            model_class: The model class to query
+            alias: Alias for the model in the query
+            
+        Returns:
+            Query object for building and executing queries
+        """
+        return Query(model_class, session=self, alias=alias)
+    
+    def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Execute a raw Cypher query.
+        
+        Args:
+            query: Cypher query string
+            parameters: Query parameters
+            
+        Returns:
+            List of result dictionaries
+        """
+        if self.autoflush and not self._flushing:
+            self.flush()
+        
+        result = self._conn.execute(query, parameters)
+        
+        # Convert Kuzu result to list of dicts
+        rows = []
+        if result:
+            # @@ STEP: Check if this is a DDL statement
+            # || S.1: DDL statements don't return row data
+            query_upper = query.strip().upper()
+            is_ddl = any(query_upper.startswith(ddl) for ddl in [
+                'CREATE', 'DROP', 'ALTER', 'COPY'
+            ])
+            
+            if is_ddl:
+                # DDL statements return status, not rows
+                return []
+            
+            try:
+                for row in result:
+                    if hasattr(row, '__dict__'):
+                        rows.append(row.__dict__)
+                    elif hasattr(row, 'to_dict') and callable(row.to_dict):
+                        rows.append(row.to_dict())
+                    else:
+                        try:
+                            rows.append(dict(row))
+                        except (TypeError, ValueError) as conv_err:
+                            # @@ STEP: Handle UNION query results that return tuples/lists
+                            # || S.1: UNION queries may return results in tuple format
+                            try:
+                                # || S.2: Try to convert tuple/list to dict using column names
+                                if hasattr(result, 'get_column_names'):
+                                    column_names = result.get_column_names()
+                                    if len(column_names) == len(row):
+                                        row_dict = dict(zip(column_names, row))
+                                        rows.append(row_dict)
+                                        continue
+
+                                # || S.3: Fallback - create generic column names
+                                row_dict = {f"{QueryFieldConstants.COLUMN_PREFIX}{i}": val for i, val in enumerate(row)}
+                                rows.append(row_dict)
+                            except Exception:
+                                # || S.4: Last resort - raise original error
+                                raise ValueError(ValidationMessageConstants.ROW_NOT_DICT) from conv_err
+            except TypeError as e:
+                # Result is not iterable - THIS IS AN ERROR
+                raise RuntimeError(
+                    ValidationMessageConstants.QUERY_VALIDATION_FAILED.format(type(result).__name__, e)
+                ) from e
+        
+        return rows
+    
+    def add(self, instance: Any) -> None:
+        """
+        Add an instance to the session for insertion.
+        
+        Args:
+            instance: Model instance to add
+        """
+        self._new.add(instance)
+        
+        if self.autocommit:
+            self.commit()
+    
+    def add_all(self, instances: List[Any]) -> None:
+        """
+        Add multiple instances to the session.
+
+        Args:
+            instances: List of model instances to add
+        """
+        for instance in instances:
+            self.add(instance)
+
+    def create_relationship(
+        self,
+        relationship_class: Type[Any],
+        from_node: Any,
+        to_node: Any,
+        **properties
+    ) -> Any:
+        """
+        Create and add a relationship between two nodes.
+
+        Args:
+            relationship_class: The relationship class to create
+            from_node: Source node instance or primary key
+            to_node: Target node instance or primary key
+            **properties: Additional relationship properties
+
+        Returns:
+            The created relationship instance
+        """
+        from .kuzu_orm import KuzuRelationshipBase
+
+        if not issubclass(relationship_class, KuzuRelationshipBase):
+            raise ValueError(f"{relationship_class.__name__} must inherit from KuzuRelationshipBase")
+
+        relationship = relationship_class.create_between(from_node, to_node, **properties)
+        self.add(relationship)
+        return relationship
+    
+    def delete(self, instance: Any) -> None:
+        """
+        Mark an instance for deletion.
+        
+        Args:
+            instance: Model instance to delete
+        """
+        self._deleted.add(instance)
+        
+        if instance in self._new:
+            self._new.remove(instance)
+        if instance in self._dirty:
+            self._dirty.remove(instance)
+        
+        if self.autocommit:
+            self.commit()
+    
+    def merge(self, instance: Any) -> Any:
+        """
+        Merge an instance into the session.
+        
+        Args:
+            instance: Model instance to merge
+            
+        Returns:
+            Merged instance
+        """
+        model_class = type(instance)
+        
+        # Get primary key value
+        pk_value = self._get_primary_key(instance)
+        if not pk_value:
+            self.add(instance)
+            return instance
+        
+        # Check identity map
+        identity_key = (model_class, pk_value)
+        if identity_key in self._identity_map:
+            existing = self._identity_map[identity_key]
+            # Update existing with new values
+            for field_name, field_value in instance.model_dump().items():
+                setattr(existing, field_name, field_value)
+            self._dirty.add(existing)
+            return existing
+        else:
+            # Add to identity map
+            self._identity_map[identity_key] = instance
+            self._dirty.add(instance)
+            return instance
+    
+    def flush(self) -> None:
+        """
+        Flush pending changes to the database without committing.
+        """
+        if self._flushing:
+            return
+
+        self._flushing = True
+        try:
+            # Process new instances in correct order: nodes first, then relationships
+            # This ensures that nodes exist before relationships try to reference them
+
+            # Separate nodes and relationships
+            nodes_to_insert = []
+            relationships_to_insert = []
+
+            for instance in self._new:
+                model_class = type(instance)
+                if hasattr(model_class, '__kuzu_node_name__'):
+                    nodes_to_insert.append(instance)
+                elif hasattr(model_class, '__kuzu_rel_name__'):
+                    relationships_to_insert.append(instance)
+                else:
+                    # Unknown type - process immediately to maintain existing behavior
+                    self._insert_instance(instance)
+
+            # Process nodes first
+            for instance in nodes_to_insert:
+                self._insert_instance(instance)
+
+            # Then process relationships
+            for instance in relationships_to_insert:
+                self._insert_instance(instance)
+
+            # Process dirty instances
+            for instance in self._dirty:
+                self._update_instance(instance)
+
+            # Process deleted instances
+            for instance in self._deleted:
+                self._delete_instance(instance)
+
+            # Clear pending sets
+            self._new.clear()
+            self._dirty.clear()
+            self._deleted.clear()
+        finally:
+            self._flushing = False
+    
+    def commit(self) -> None:
+        """
+        Flush all pending operations to the database.
+        """
+        self.flush()
+        
+        if self.expire_on_commit:
+            self.expire_all()
+    
+    def rollback(self) -> None:
+        """
+        Clear all pending operations without executing them.
+        """
+        # Clear all pending changes
+        self._new.clear()
+        self._dirty.clear()
+        self._deleted.clear()
+        
+        # Clear identity map
+        self._identity_map.clear()
+    
+    def expire(self, instance: Any) -> None:
+        """
+        Expire an instance from the session.
+        
+        Args:
+            instance: Instance to expire
+        """
+        pk_value = self._get_primary_key(instance)
+        if pk_value:
+            identity_key = (type(instance), pk_value)
+            if identity_key in self._identity_map:
+                del self._identity_map[identity_key]
+    
+    def expire_all(self) -> None:
+        """
+        Expire all instances from the session.
+        """
+        self._identity_map.clear()
+    
+    def close(self) -> None:
+        """
+        Close the session.
+        """
+        self.rollback()
+        
+        if self._owns_connection:
+            self._conn.close()
+    
+    @contextmanager
+    def begin(self) -> Iterator["KuzuSession"]:
+        """
+        Batch operations context manager.
+        Execute multiple operations and flush them together.
+        """
+        original_autocommit = self.autocommit
+        self.autocommit = False
+        try:
+            yield self
+            self.commit()
+        except (RuntimeError, ValueError, TypeError) as e:
+            self.rollback()
+            raise e
+        except Exception as e:
+            self.rollback()
+            raise RuntimeError(f"Unexpected error in transaction: {type(e).__name__}: {e}") from e
+        finally:
+            self.autocommit = original_autocommit
+    
+    @contextmanager
+    def begin_nested(self) -> Iterator["KuzuSession"]:
+        """
+        Nested batch operations context manager.
+        Note: Kuzu doesn't support savepoints, so this is a best-effort simulation.
+        """
+        # Save current state
+        saved_new = set(self._new)
+        saved_dirty = set(self._dirty)
+        saved_deleted = set(self._deleted)
+        
+        try:
+            yield self
+        except (RuntimeError, ValueError, TypeError) as e:
+            # Restore previous state
+            self._new = saved_new
+            self._dirty = saved_dirty
+            self._deleted = saved_deleted
+            raise e
+        except Exception as e:
+            # Restore previous state
+            self._new = saved_new
+            self._dirty = saved_dirty
+            self._deleted = saved_deleted
+            raise RuntimeError(f"Unexpected error in nested session: {type(e).__name__}: {e}") from e
+    
+    def _get_primary_key(self, instance: Any) -> Optional[Any]:
+        """Get primary key value from an instance."""
+        model_class = type(instance)
+        
+        if hasattr(model_class, 'get_primary_key_fields'):
+            get_pk_fields = model_class.get_primary_key_fields
+            if not callable(get_pk_fields):
+                raise ValueError(
+                    f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
+                )
+            pk_fields = cast(List[str], get_pk_fields())
+
+            if len(pk_fields) == 1:
+                pk_field = pk_fields[0]
+                if not hasattr(instance, pk_field):
+                    raise ValueError(
+                        f"Primary key field '{pk_field}' not found on {model_class.__name__} instance"
+                    )
+                # @@ STEP 1: Check __dict__ first for performance (avoids descriptor overhead)
+                value = instance.__dict__.get(pk_field)
+                
+                # @@ STEP 2: If not in __dict__, try getattr for properties/descriptors
+                # || S.S.1: Only call getattr if we know the attribute exists
+                if value is None and hasattr(instance, pk_field):
+                    # || S.S.2: Safe to call getattr since hasattr confirmed existence
+                    value = getattr(instance, pk_field)
+                
+                # @@ STEP 3: Validate that we got a non-None value
+                if value is None:
+                    # || S.S.3: Explicit error with detailed context
+                    raise ValueError(
+                        f"Primary key field '{pk_field}' is None on {model_class.__name__} instance. "
+                        f"The field exists but has no value. Instance must have a non-None primary key."
+                    )
+                return value
+
+            elif len(pk_fields) > 1:
+                # Composite key - ALL fields must exist and be non-None
+                values = []
+                for field in pk_fields:
+                    if not hasattr(instance, field):
+                        raise ValueError(
+                            f"Composite key field '{field}' not found on {model_class.__name__} instance"
+                        )
+                    # @@ STEP 1: Check __dict__ first for performance
+                    value = instance.__dict__.get(field)
+                    
+                    # @@ STEP 2: If not in __dict__, try getattr for properties/descriptors
+                    # || S.S.1: Only call getattr if we know the attribute exists
+                    if value is None and hasattr(instance, field):
+                        # || S.S.2: Safe to call getattr since hasattr confirmed existence
+                        value = getattr(instance, field)
+                    
+                    # @@ STEP 3: Validate that we got a non-None value
+                    if value is None:
+                        # || S.S.3: Explicit error with detailed context
+                        raise ValueError(
+                            f"Composite key field '{field}' is None on {model_class.__name__} instance. "
+                            f"The field exists but has no value. All composite key fields must be non-None."
+                        )
+                    values.append(value)
+                return tuple(values)
+        
+        # Try common primary key field names
+        for field_name in ('id', 'uid', 'uuid', 'pk'):
+            if hasattr(instance, field_name):
+                value = getattr(instance, field_name)
+                if value is not None:
+                    return value
+        
+        # No primary key found - THIS IS AN ERROR
+        raise ValueError(
+            f"Cannot determine primary key for {model_class.__name__} instance. "
+            f"Instance must have a primary key field or implement get_primary_key_fields() method."
+        )
+    
+    def _insert_instance(self, instance: Any) -> None:
+        """Insert a new instance into the database."""
+        model_class = type(instance)
+
+        # Check if it's a node or relationship
+        if hasattr(model_class, '__kuzu_node_name__'):
+            self._insert_node_instance(instance)
+        elif hasattr(model_class, '__kuzu_rel_name__'):
+            self._insert_relationship_instance(instance)
+        else:
+            raise ValueError(
+                f"Model {model_class.__name__} is not a registered node or relationship - "
+                f"missing __kuzu_node_name__ or __kuzu_rel_name__ attribute"
+            )
+
+    def _insert_node_instance(self, instance: Any) -> None:
+        """Insert a node instance into the database."""
+        model_class = type(instance)
+        node_name = model_class.__kuzu_node_name__
+
+        # Build CREATE query
+        properties = instance.model_dump(exclude_unset=True)
+
+        if not properties:
+            query = f"CREATE (:{node_name})"
+            self._conn.execute(query)
+        else:
+            prop_str = ", ".join(f"{k}: ${k}" for k in properties.keys())
+            query = f"CREATE (:{node_name} {{{prop_str}}})"
+            self._conn.execute(query, properties)
+
+        # Add to identity map
+        pk_value = self._get_primary_key(instance)
+        if pk_value:
+            self._identity_map[(model_class, pk_value)] = instance
+
+    def _insert_relationship_instance(self, instance: Any) -> None:
+        """Insert a relationship instance into the database."""
+        from .kuzu_orm import KuzuRelationshipBase
+
+        if not isinstance(instance, KuzuRelationshipBase):
+            raise ValueError(f"Relationship instance must inherit from KuzuRelationshipBase")
+
+        model_class = type(instance)
+        rel_name = model_class.__kuzu_rel_name__
+
+        # Get from and to node primary keys
+        from_pk = instance.from_node_pk
+        to_pk = instance.to_node_pk
+
+        if from_pk is None or to_pk is None:
+            raise ValueError(
+                f"Relationship {model_class.__name__} must have both from_node and to_node specified"
+            )
+
+        # Get relationship pairs to determine node types
+        rel_pairs = instance.get_relationship_pairs()
+        if not rel_pairs:
+            raise ValueError(f"No relationship pairs defined for {model_class.__name__}")
+
+        # For now, use the first pair (could be enhanced for multi-pair relationships)
+        from_node_class = rel_pairs[0].from_node
+        to_node_class = rel_pairs[0].to_node
+
+        # Get node names - handle both class types and strings
+        if isinstance(from_node_class, str):
+            from_node_name = from_node_class
+        else:
+            from_node_name = from_node_class.__kuzu_node_name__
+
+        if isinstance(to_node_class, str):
+            to_node_name = to_node_class
+        else:
+            to_node_name = to_node_class.__kuzu_node_name__
+
+        # Build relationship properties (exclude internal fields)
+        properties = instance.model_dump(exclude_unset=True)
+        # Remove internal fields that shouldn't be in the relationship
+        internal_fields = {'_from_node', '_to_node', '_from_node_pk', '_to_node_pk'}
+        properties = {k: v for k, v in properties.items() if k not in internal_fields}
+
+        # Get primary key field names
+        if isinstance(from_node_class, str):
+            from_pk_field = "id"  # Default assumption for string node names
+        else:
+            from_pk_field = self._get_primary_key_field_name(from_node_class)
+
+        if isinstance(to_node_class, str):
+            to_pk_field = "id"  # Default assumption for string node names
+        else:
+            to_pk_field = self._get_primary_key_field_name(to_node_class)
+
+        # Build Cypher query to create relationship
+        if properties:
+            prop_str = ", ".join(f"{k}: ${k}" for k in properties.keys())
+            query = f"""
+            MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
+            WHERE from_node.{from_pk_field} = $from_pk
+              AND to_node.{to_pk_field} = $to_pk
+            CREATE (from_node)-[:{rel_name} {{{prop_str}}}]->(to_node)
+            """
+            params = {**properties, 'from_pk': from_pk, 'to_pk': to_pk}
+        else:
+            query = f"""
+            MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
+            WHERE from_node.{from_pk_field} = $from_pk
+              AND to_node.{to_pk_field} = $to_pk
+            CREATE (from_node)-[:{rel_name}]->(to_node)
+            """
+            params = {'from_pk': from_pk, 'to_pk': to_pk}
+
+        self._conn.execute(query, params)
+
+    def _get_primary_key_field_name(self, model_class: Type[Any]) -> str:
+        """Get the primary key field name for a model class."""
+        from .kuzu_orm import _kuzu_registry
+
+        for field_name, field_info in model_class.model_fields.items():
+            metadata = _kuzu_registry.get_field_metadata(field_info)
+            if metadata and metadata.primary_key:
+                return field_name
+        raise ValueError(f"No primary key field found in {model_class.__name__}")
+    
+    def _update_instance(self, instance: Any) -> None:
+        """Update an existing instance in the database."""
+        model_class = type(instance)
+        
+        if not hasattr(model_class, '__kuzu_node_name__'):
+            raise ValueError(
+                f"Model {model_class.__name__} is not a registered node - "
+                f"missing __kuzu_node_name__ attribute"
+            )
+        node_name = model_class.__kuzu_node_name__
+        pk_value = self._get_primary_key(instance)
+        
+        if not pk_value:
+            raise ValueError(f"Cannot update instance without primary key")
+        
+        # Build UPDATE query
+        properties = instance.model_dump(exclude_unset=True)
+        
+        # Remove primary key from properties to update
+        if hasattr(model_class, 'get_primary_key_fields'):
+            get_pk_fields = model_class.get_primary_key_fields
+            if not callable(get_pk_fields):
+                raise ValueError(
+                    f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
+                )
+            pk_fields = cast(List[str], get_pk_fields())
+        else:
+            pk_fields = ['id']
+        for pk_field in pk_fields:
+            properties.pop(pk_field, None)
+        
+        if properties:
+            set_clause = ", ".join(f"n.{k} = ${k}" for k in properties.keys())
+
+            # Build WHERE clause for primary key
+            if len(pk_fields) == 1:
+                where_clause = f"n.{pk_fields[0]} = $pk_value"
+                params = {**properties, "pk_value": pk_value}
+            else:
+                where_parts = [f"n.{field} = $pk_{i}" for i, field in enumerate(pk_fields)]
+                where_clause = " AND ".join(where_parts)
+                params = {**properties}
+                for i, value in enumerate(pk_value):
+                    params[f"pk_{i}"] = value
+            
+            query = f"MATCH (n:{node_name}) WHERE {where_clause} SET {set_clause}"
+            self._conn.execute(query, params)
+    
+    def _delete_instance(self, instance: Any) -> None:
+        """Delete an instance from the database."""
+        model_class = type(instance)
+        
+        if not hasattr(model_class, '__kuzu_node_name__'):
+            raise ValueError(
+                f"Model {model_class.__name__} is not a registered node - "
+                f"missing __kuzu_node_name__ attribute"
+            )
+        node_name = model_class.__kuzu_node_name__
+        pk_value = self._get_primary_key(instance)
+        
+        if not pk_value:
+            raise ValueError(f"Cannot delete instance without primary key")
+        
+        # Build DELETE query
+        if hasattr(model_class, 'get_primary_key_fields'):
+            get_pk_fields = model_class.get_primary_key_fields
+            if not callable(get_pk_fields):
+                raise ValueError(
+                    f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
+                )
+            pk_fields = cast(List[str], get_pk_fields())
+        else:
+            pk_fields = ['id']
+
+        if len(pk_fields) == 1:
+            where_clause = f"n.{pk_fields[0]} = $pk_value"
+            params = {"pk_value": pk_value}
+        else:
+            where_parts = [f"n.{field} = $pk_{i}" for i, field in enumerate(pk_fields)]
+            where_clause = " AND ".join(where_parts)
+            params = {}
+            for i, value in enumerate(pk_value):
+                params[f"pk_{i}"] = value
+        
+        query = f"MATCH (n:{node_name}) WHERE {where_clause} DELETE n"
+        self._conn.execute(query, params)
+        
+        # Remove from identity map
+        identity_key = (model_class, pk_value)
+        if identity_key in self._identity_map:
+            del self._identity_map[identity_key]
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        _ = exc_val, exc_tb  # Mark as intentionally unused
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.close()
+    
+    def __repr__(self) -> str:
+        """String representation."""
+        return f"<KuzuSession(autocommit={self.autocommit})>"
+
+
+class KuzuTransaction:
+    """Context manager for batched operations in Kuzu."""
+    
+    def __init__(self, session: "KuzuSession"):
+        """Initialize transaction."""
+        self.session = session
+        self._original_autocommit = session.autocommit
+    
+    def __enter__(self):
+        """Begin batched operations."""
+        self.session.autocommit = False
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """End batched operations."""
+        _ = exc_val, exc_tb  # Mark as intentionally unused
+        try:
+            if exc_type is None:
+                self.session.commit()
+            else:
+                self.session.rollback()
+        finally:
+            self.session.autocommit = self._original_autocommit
+
+
+class SessionFactory:
+    """Factory for creating sessions with consistent configuration."""
+    
+    def __init__(
+        self,
+        db_path: Union[str, Path],
+        **default_kwargs
+    ):
+        """
+        Initialize session factory.
+        
+        Args:
+            db_path: Path to database
+            **default_kwargs: Default session configuration
+        """
+        self.db_path = Path(db_path)
+        self.default_kwargs = default_kwargs
+    
+    def create_session(self, **kwargs) -> KuzuSession:
+        """
+        Create a new session.
+        
+        Args:
+            **kwargs: Override default configuration
+            
+        Returns:
+            New KuzuSession instance
+        """
+        config = {**self.default_kwargs, **kwargs}
+        return KuzuSession(db_path=self.db_path, **config)
+    
+    @contextmanager
+    def session_scope(self, **kwargs):
+        """
+        Provide a transactional scope for a series of operations.
+        
+        Args:
+            **kwargs: Override default configuration
+            
+        Yields:
+            KuzuSession instance
+        """
+        session = self.create_session(**kwargs)
+        try:
+            yield session
+            session.commit()
+        except (RuntimeError, ValueError, TypeError) as e:
+            session.rollback()
+            raise e
+        except Exception as e:
+            session.rollback()
+            raise RuntimeError(f"Unexpected error in session: {type(e).__name__}: {e}") from e
+        finally:
+            session.close()
+    
+    def __call__(self, **kwargs) -> KuzuSession:
+        """Allow factory to be called directly."""
+        return self.create_session(**kwargs)
