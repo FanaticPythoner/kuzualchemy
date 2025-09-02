@@ -13,7 +13,7 @@ _ENUM_CACHE: Dict[Type[Enum], Dict[str, Dict[Any, Enum]]] = {}
 
 class BaseModel(KuzuBaseModel):
     """
-    Base model for all models in the code analyzer graph system.
+    Base model with automatic enum conversion for Kuzu ORM
     
     :class:`BaseModel`
     :synopsis: Base model with automatic enum conversion for Kuzu ORM
