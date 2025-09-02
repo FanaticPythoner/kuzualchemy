@@ -61,10 +61,10 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kuzualchemy/kuzualchemy"
+Homepage = "https://github.com/FanaticPythoner/kuzualchemy"
 Documentation = "https://kuzualchemy.readthedocs.io"
-Repository = "https://github.com/kuzualchemy/kuzualchemy"
-"Bug Tracker" = "https://github.com/kuzualchemy/kuzualchemy/issues"
+Repository = "https://github.com/FanaticPythoner/kuzualchemy"
+"Bug Tracker" = "https://github.com/FanaticPythoner/kuzualchemy/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
