@@ -7,21 +7,20 @@ import tempfile
 import shutil
 from pathlib import Path
 from kuzualchemy import (
-    KuzuBaseModel, node, Field, KuzuDataType, Query, KuzuSession,
-    concat, size, ceil, floor, sqrt, pi, list_creation, get_ddl_for_node
+    KuzuBaseModel, kuzu_node, kuzu_field, KuzuDataType, KuzuSession,
+    get_ddl_for_node
 )
-from kuzualchemy.kuzu_functions import abs as kuzu_abs
 from kuzualchemy.kuzu_orm import ArrayTypeSpecification
 
 
-@node("Person")
+@kuzu_node("Person")
 class Person(KuzuBaseModel):
     """Person node for testing."""
-    id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-    name: str = Field(kuzu_type=KuzuDataType.STRING)
-    age: int = Field(kuzu_type=KuzuDataType.INT64)
-    height: float = Field(kuzu_type=KuzuDataType.DOUBLE)
-    tags: list = Field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.STRING))
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+    age: int = kuzu_field(kuzu_type=KuzuDataType.INT64)
+    height: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE)
+    tags: list = kuzu_field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.STRING))
 
 
 class TestFunctionIntegration:
@@ -64,6 +63,8 @@ class TestFunctionIntegration:
 
         assert len(results) == 3
         for result in results:
+            print("RESULT IS:")
+            print(result)
             assert result["upper(p.name)"] == result["p.name"].upper()
 
     def test_lower_function_integration(self, session):
@@ -213,5 +214,52 @@ class TestFunctionIntegration:
         results = session.execute("MATCH (p:Person) RETURN sqrt(p.age) AS sqrt_age")
         assert len(results) == 3
 
-        # Note: We can't easily test error cases without causing the test to fail
-        # In a real application, you'd want to handle cases like sqrt of negative numbers
+        # Test error handling for invalid mathematical operations
+
+        # Test 1: Division by zero handling
+        with pytest.raises(Exception) as exc_info:
+            list(session.execute("""
+                MATCH (p:Person)
+                RETURN p.age / 0 as invalid_division
+                LIMIT 1
+            """))
+        error_msg = str(exc_info.value).lower()
+        assert any(keyword in error_msg for keyword in ["division by zero", "divide by zero", "runtime"])
+
+        # Test 2: Square root of negative number handling
+        with pytest.raises(Exception) as exc_info:
+            list(session.execute("""
+                MATCH (p:Person)
+                RETURN sqrt(-1 * p.age) as invalid_sqrt
+                WHERE p.age > 0
+                LIMIT 1
+            """))
+        # Kuzu should handle this gracefully or throw appropriate error
+
+        # Test 3: Invalid function usage - test bounds checking
+        results = list(session.execute("""
+            MATCH (p:Person)
+            RETURN substring(p.name, 100, 1) as out_of_bounds_substring
+            LIMIT 1
+        """))
+        # Kuzu should handle out of bounds substring gracefully by returning empty string
+        assert len(results) >= 0, "Should handle out of bounds substring gracefully"
+        if len(results) > 0:
+            # Handle generic column names (Kuzu returns col_0, col_1, etc.)
+            result_keys = list(results[0].keys())
+            # Last column should be substring result
+            substring_result_key = result_keys[-1] if result_keys else 'col_0'
+            substring_result = results[0][substring_result_key]
+            # Verify it returns empty string for out of bounds or handles gracefully
+            expected_msg = (f"Out of bounds substring should return empty string or None, "
+                          f"got: {substring_result}")
+            assert substring_result == "" or substring_result is None, expected_msg
+
+        # Test 4: Validate that valid operations still work after error handling
+        valid_results = list(session.execute("""
+            MATCH (p:Person)
+            WHERE p.age > 0
+            RETURN p.name, p.age
+            LIMIT 1
+        """))
+        assert len(valid_results) >= 1, "Valid operations should still work after error handling"

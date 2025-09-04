@@ -7,26 +7,61 @@ from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Tuple, Itera
 from contextlib import contextmanager
 from threading import RLock
 from pathlib import Path
-from .kuzu_query import Query
-from kuzu import Connection
-from kuzu import Database
+from collections import defaultdict
+import ahocorasick
 
+import polars as pl
+
+from .kuzu_query import Query
 from .constants import ValidationMessageConstants, QueryFieldConstants
-import re
+from .connection_pool import get_database_manager
 
 ModelType = TypeVar("ModelType")
 
 
+
+
 class KuzuConnection:
-    """Wrapper for Kuzu database connection."""
-    
-    def __init__(self, db_path: Union[str, Path], **kwargs):
-        """Initialize connection to Kuzu database."""
-        # @@ STEP: Kuzu imports - handle missing package gracefully
-        # || S.1: Try to import kuzu and handle if not installed
+    """Wrapper for Kuzu database connection using shared Database objects."""
+
+    # Class-level Aho-Corasick automaton for efficient keyword matching
+    _KEYWORD_AUTOMATON = None
+    _KEYWORD_AUTOMATON_KEYWORDS = ['return', 'order', 'limit', 'union']
+    _KEYWORD_AUTOMATON_KEYWORDS_TERMINATING = {'order', 'limit', 'union'}
+
+    @classmethod
+    def _get_keyword_automaton(cls):
+        """Get or create the keyword automaton using pyahocorasick if available."""
+        if cls._KEYWORD_AUTOMATON is None:
+
+            # Use the optimized pyahocorasick library
+            cls._KEYWORD_AUTOMATON = ahocorasick.Automaton()
+            for keyword in cls._KEYWORD_AUTOMATON_KEYWORDS:
+                cls._KEYWORD_AUTOMATON.add_word(keyword.lower(), keyword.lower())
+            cls._KEYWORD_AUTOMATON.make_automaton()
+
+        return cls._KEYWORD_AUTOMATON
+
+    def __init__(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = 512 * 1024 * 1024, **kwargs):
+        """Initialize connection to Kuzu database using connection pool."""
+        # @@ STEP: Use connection pool for proper concurrent access with limited buffer pool size
+        # || S.1: Get connection from shared Database object to avoid file locking issues
+        # || S.2: Validate and limit buffer pool size to prevent massive memory allocation errors
         self.db_path = Path(db_path)
-        self.db = Database(str(self.db_path))
-        self.conn = Connection(self.db, **kwargs)
+        self.read_only = read_only
+
+        # Validate buffer_pool_size to prevent system crashes
+        if buffer_pool_size is None or buffer_pool_size <= 0 or buffer_pool_size > 2**63:
+            buffer_pool_size = 512 * 1024 * 1024  # Default to 512MB
+
+        # Cap buffer pool size to reasonable maximum (2GB)
+        max_buffer_size = 2 * 1024 * 1024 * 1024  # 2GB
+        if buffer_pool_size > max_buffer_size:
+            buffer_pool_size = max_buffer_size
+
+        self.buffer_pool_size = buffer_pool_size
+        self._manager = get_database_manager()
+        self.conn = self._manager.get_connection(self.db_path, read_only, buffer_pool_size)
         self._lock = RLock()
     
     def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
@@ -66,26 +101,84 @@ class KuzuConnection:
             return normalized
     
     def _parse_return_clause(self, query: str) -> List[str]:
-        """Parse RETURN clause to extract column aliases."""
-        # Find RETURN clause
-        match = re.search(r'RETURN\s+(.+?)(?:ORDER|LIMIT|UNION|$)', query, re.IGNORECASE | re.DOTALL)
-        if not match:
+        """
+        Parse RETURN clause to extract column aliases using Aho-Corasick automaton.
+
+        Efficiently finds RETURN keyword and terminating keywords (ORDER, LIMIT, UNION)
+        using O(n + m + z) complexity instead of regex backtracking.
+
+        Args:
+            query: Cypher query string
+
+        Returns:
+            List of column aliases from RETURN clause
+        """
+        # Use Aho-Corasick automaton to find all keyword matches
+        automaton = self._get_keyword_automaton()
+        matches = []
+
+        # Use pyahocorasick
+        query_lower = query.lower()
+        for end_pos, keyword in automaton.iter(query_lower):
+            start_pos = end_pos - len(keyword) + 1
+            matches.append((start_pos, keyword))
+
+        if not matches:
             return []
-        
-        return_clause = match.group(1).strip()
-        # Simple parsing - split by comma and extract aliases
-        parts = return_clause.split(',')
+
+        # Find RETURN keyword position
+        return_pos = None
+        return_end = None
+
+        for pos, keyword in matches:
+            if keyword == 'return':
+                return_pos = pos
+                return_end = pos + len(keyword)
+                break
+
+        if return_pos is None or return_end is None:
+            return []
+
+        # Find the next terminating keyword after RETURN
+        clause_end = len(query)  # Default to end of query
+
+        for pos, keyword in matches:
+            if keyword in KuzuConnection._KEYWORD_AUTOMATON_KEYWORDS_TERMINATING and pos > return_end:
+                clause_end = pos
+                break
+
+        # Extract RETURN clause content
+        return_content = query[return_end:clause_end].strip()
+
+        # Skip whitespace after RETURN keyword
+        return_content = return_content.lstrip()
+
+        if not return_content:
+            return []
+
+        # Parse column aliases from RETURN clause
+        parts = return_content.split(',')
         aliases = []
+
         for part in parts:
             part = part.strip()
+            if not part:
+                continue
+
             # Handle "expr AS alias" or just "expr" (case-insensitive)
-            if ' as ' in part.lower():
-                # Split case-insensitively for AS
-                idx = part.lower().index(' as ')
-                alias = part[idx + 4:].strip()
+            part_lower = part.lower()
+            as_index = part_lower.find(' as ')
+
+            if as_index != -1:
+                # Extract alias after AS keyword
+                alias = part[as_index + 4:].strip()
             else:
+                # Use entire expression as alias
                 alias = part.strip()
-            aliases.append(alias)
+
+            if alias:
+                aliases.append(alias)
+
         return aliases
     
     def close(self) -> None:
@@ -104,9 +197,13 @@ class KuzuSession:
         self,
         connection: Optional[KuzuConnection] = None,
         db_path: Optional[Union[str, Path]] = None,
+        read_only: bool = False,
+        buffer_pool_size: int = 512 * 1024 * 1024,
         autoflush: bool = True,
         autocommit: bool = False,
         expire_on_commit: bool = True,
+        bulk_insert_threshold: int = 10,
+        bulk_batch_size: int = 10000,
         **kwargs
     ):
         """
@@ -123,15 +220,15 @@ class KuzuSession:
             self._conn = connection
             self._owns_connection = False
         elif db_path:
-            self._conn = KuzuConnection(db_path, **kwargs)
+            self._conn = KuzuConnection(db_path, read_only=read_only, buffer_pool_size=buffer_pool_size, **kwargs)
             self._owns_connection = True
         else:
             raise ValueError("Either connection or db_path must be provided")
-        
         self.autoflush = autoflush
         self.autocommit = autocommit
         self.expire_on_commit = expire_on_commit
-        
+        self.bulk_insert_threshold = bulk_insert_threshold
+        self.bulk_batch_size = bulk_batch_size
         self._dirty = set()
         self._new = set()
         self._deleted = set()
@@ -242,6 +339,178 @@ class KuzuSession:
         for instance in instances:
             self.add(instance)
 
+    def bulk_insert(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
+        """
+        Perform fast bulk insert using Polars DataFrames and Kuzu's COPY FROM.
+
+        This method is orders of magnitude faster than individual add() calls
+        for large datasets (1000+ records).
+
+        Args:
+            instances: List of model instances to bulk insert
+            batch_size: Number of records per batch (uses session default if None)
+        """
+        if not instances:
+            return
+
+        # Use session default batch size if not specified
+        effective_batch_size = batch_size if batch_size is not None else self.bulk_batch_size
+
+        # Group instances by model type for efficient batch processing
+        model_groups = defaultdict(list)
+
+        for instance in instances:
+            model_class = type(instance)
+            model_groups[model_class].append(instance)
+
+        # Process each model type separately
+        for model_class, model_instances in model_groups.items():
+            # Check if this is a multi-pair relationship
+            if (hasattr(model_class, '__kuzu_rel_name__') or
+                hasattr(model_class, '__kuzu_relationship_name__')):
+                # Check if it has multiple pairs
+                pairs = getattr(model_class, '__kuzu_relationship_pairs__', [])
+                if len(pairs) > 1:
+                    # Multi-pair relationships cannot use bulk insert
+                    # Fall back to individual inserts
+                    for instance in model_instances:
+                        self._insert_instance(instance)
+                    continue
+
+            self._bulk_insert_model_type(model_class, model_instances, effective_batch_size)
+
+    def _bulk_insert_model_type(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
+        """
+        Bulk insert instances of a single model type using Polars DataFrame.
+
+        Args:
+            model_class: The model class type
+            instances: List of instances of the same model type
+            batch_size: Number of records per batch
+        """
+        for i in range(0, len(instances), batch_size):
+            batch = instances[i:i + batch_size]
+            self._process_batch_with_polars(model_class, batch)
+
+    def _process_batch_with_polars(self, model_class: Type[Any], instances: List[Any]) -> None:
+        """
+        Process a batch of instances using Polars DataFrame and Kuzu's COPY FROM.
+
+        Args:
+            model_class: The model class type
+            instances: List of instances to process
+        """
+        if not instances:
+            return
+
+        # Convert instances to dictionary format
+        data_dict = {}
+        df = None
+
+        from .kuzu_orm import KuzuRelationshipBase
+        is_relationship = issubclass(model_class, KuzuRelationshipBase)
+
+        if is_relationship:
+            # For relationships, we need to include from_node_pk and to_node_pk
+            # Use class attribute instead of instance attribute to avoid deprecation warning
+            field_names = list(model_class.model_fields.keys())
+
+            # Add node reference columns for relationships
+            data_dict['from_node_pk'] = []
+            data_dict['to_node_pk'] = []
+
+            # Initialize property columns
+            for field_name in field_names:
+                data_dict[field_name] = []
+
+            # Extract data from relationship instances
+            for instance in instances:
+                # Add node references
+                data_dict['from_node_pk'].append(instance.from_node_pk)
+                data_dict['to_node_pk'].append(instance.to_node_pk)
+
+                # Add relationship properties with proper type conversion
+                instance_data = instance.model_dump()
+                for field_name in field_names:
+                    value = instance_data.get(field_name)
+                    # Convert datetime/date objects to proper string format for Kuzu
+                    if hasattr(value, 'isoformat'):
+                        # datetime or date object
+                        value = value.isoformat()
+                    elif (hasattr(value, '__class__') and
+                          'KuzuDefaultFunction' in str(value.__class__)):
+                        # Handle KuzuDefaultFunction objects - generate actual values for bulk insert
+                        # COPY FROM doesn't support DEFAULT functions, so we must generate values
+                        value = self._generate_default_function_value(value)
+                    data_dict[field_name].append(value)
+        else:
+            # For nodes, use regular field extraction
+            # Use class attribute instead of instance attribute to avoid deprecation warning
+            field_names = list(model_class.model_fields.keys())
+
+            # Initialize columns
+            for field_name in field_names:
+                data_dict[field_name] = []
+
+            # Extract data from instances with proper type conversion
+            for instance in instances:
+                instance_data = instance.model_dump()
+                for field_name in field_names:
+                    value = instance_data.get(field_name)
+                    # Convert datetime/date objects to proper string format for Kuzu
+                    if hasattr(value, 'isoformat'):
+                        # datetime or date object
+                        value = value.isoformat()
+                    elif (hasattr(value, '__class__') and
+                          'KuzuDefaultFunction' in str(value.__class__)):
+                        # Handle KuzuDefaultFunction objects - generate actual values for bulk insert
+                        # COPY FROM doesn't support DEFAULT functions, so we must generate values
+                        value = self._generate_default_function_value(value)
+                    data_dict[field_name].append(value)
+
+        try:
+            # Create Polars DataFrame
+            df = pl.DataFrame(data_dict)
+
+            # Clear data_dict to free memory immediately
+            data_dict.clear()
+            del data_dict
+
+            # Determine table name
+            if hasattr(model_class, '__kuzu_node_name__'):
+                table_name = model_class.__kuzu_node_name__
+            elif hasattr(model_class, '__kuzu_rel_name__'):
+                table_name = model_class.__kuzu_rel_name__
+            elif hasattr(model_class, '__kuzu_relationship_name__'):
+                table_name = model_class.__kuzu_relationship_name__
+            else:
+                raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
+
+            # Execute COPY using the Polars DataFrame
+            self._conn.execute(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
+        finally:
+            # Force garbage collection to free memory immediately
+            import gc
+            gc.collect()
+
+    def _generate_default_function_value(self, default_function: Any) -> str:
+        """
+        Generate actual values for KuzuDefaultFunction instances in bulk insert.
+
+        COPY FROM doesn't support DEFAULT functions, so we must generate
+        the actual values that the functions would produce.
+
+        Uses the BulkInsertValueGeneratorRegistry for proper type-based dispatch.
+
+        Args:
+            default_function: KuzuDefaultFunction enum value
+
+        Returns:
+            Generated value as string in Kuzu-compatible format
+        """
+        from .kuzu_orm import BulkInsertValueGeneratorRegistry
+        return BulkInsertValueGeneratorRegistry.generate_value(default_function)
+
     def create_relationship(
         self,
         relationship_class: Type[Any],
@@ -346,13 +615,20 @@ class KuzuSession:
                     # Unknown type - process immediately to maintain existing behavior
                     self._insert_instance(instance)
 
-            # Process nodes first
-            for instance in nodes_to_insert:
-                self._insert_instance(instance)
+            # Use session configuration for bulk insert threshold
+            # Process nodes first - use bulk insert if many instances
+            if len(nodes_to_insert) >= self.bulk_insert_threshold:
+                self.bulk_insert(nodes_to_insert)
+            else:
+                for instance in nodes_to_insert:
+                    self._insert_instance(instance)
 
-            # Then process relationships
-            for instance in relationships_to_insert:
-                self._insert_instance(instance)
+            # Then process relationships - use bulk insert if many instances
+            if len(relationships_to_insert) >= self.bulk_insert_threshold:
+                self.bulk_insert(relationships_to_insert)
+            else:
+                for instance in relationships_to_insert:
+                    self._insert_instance(instance)
 
             # Process dirty instances
             for instance in self._dirty:
@@ -374,10 +650,10 @@ class KuzuSession:
         Flush all pending operations to the database.
         """
         self.flush()
-        
+
         if self.expire_on_commit:
             self.expire_all()
-    
+
     def rollback(self) -> None:
         """
         Clear all pending operations without executing them.
@@ -584,7 +860,7 @@ class KuzuSession:
             raise ValueError(f"Relationship instance must inherit from KuzuRelationshipBase")
 
         model_class = type(instance)
-        rel_name = model_class.__kuzu_rel_name__
+        rel_name = model_class.get_relationship_name()
 
         # Get from and to node primary keys
         from_pk = instance.from_node_pk

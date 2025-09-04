@@ -16,9 +16,9 @@ from __future__ import annotations
 import pytest
 from datetime import datetime, timedelta
 
-from typing import List, Optional
+from typing import List
 
-from kuzualchemy.kuzu_orm import kuzu_node, kuzu_relationship, kuzu_field, KuzuDataType, KuzuBaseModel, KuzuRelationshipBase, ArrayTypeSpecification
+from kuzualchemy.kuzu_orm import kuzu_node, kuzu_relationship, kuzu_field, KuzuDataType, KuzuBaseModel, KuzuRelationshipBase, ArrayTypeSpecification, get_ddl_for_node, get_ddl_for_relationship
 from kuzualchemy.kuzu_query_expressions import AggregateFunction, OrderDirection
 from kuzualchemy.kuzu_session import KuzuSession
 from kuzualchemy.kuzu_query_fields import QueryField
@@ -105,14 +105,38 @@ class TestValidation:
     @pytest.fixture(scope="function")
     def session(self):
         """Create test session with test data."""
-        session = KuzuSession(db_path=":memory:")
-        initialize_schema(session)
-        
+        import tempfile
+        import shutil
+        from pathlib import Path
+
+        temp_dir = tempfile.mkdtemp()
+        db_path = Path(temp_dir) / "validation_test.db"
+        session = KuzuSession(db_path=str(db_path))
+
+        # Generate DDL only for models defined in this test file
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(ProdUser))
+        ddl_statements.append(get_ddl_for_node(ProdCompany))
+        ddl_statements.append(get_ddl_for_node(ProdProject))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(ProdWorksFor))
+        ddl_statements.append(get_ddl_for_relationship(ProdManages))
+        ddl_statements.append(get_ddl_for_relationship(ProdSponsors))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
+
         # Create test data
         self._create_test_data(session)
-        
+
         yield session
+
+        # Cleanup
         session.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
     
     def _create_test_data(self, session: KuzuSession):
         """Create test data."""
@@ -171,12 +195,11 @@ class TestValidation:
         
         # Create relationships
         relationships = []
-        # Users work for companies
+        # Users work for companies - use proper session method
         for i, user in enumerate(users[:8]):  # Only active users
             company = companies[i % 4]  # Only active companies
-            works_for = ProdWorksFor(
-                from_node=user,
-                to_node=company,
+            works_for = session.create_relationship(
+                ProdWorksFor, user, company,
                 position=f"Position {i}",
                 department=user.department,
                 start_date=user.created_at + timedelta(days=1),
@@ -184,35 +207,30 @@ class TestValidation:
                 salary_band=["junior", "mid", "senior", "lead"][i % 4]
             )
             relationships.append(works_for)
-            session.add(works_for)
 
 
         
-        # Users manage projects
+        # Users manage projects - use proper session method
         for i in range(0, 8, 2):  # Every other user manages a project
             if i < len(users) and i//2 < len(projects):
-                manages = ProdManages(
-                    from_node=users[i],
-                    to_node=projects[i//2],
+                manages = session.create_relationship(
+                    ProdManages, users[i], projects[i//2],
                     role="project_manager",
                     authority_level=["full", "limited"][i % 2],
                     start_date=projects[i//2].start_date,
                     budget_limit=projects[i//2].budget * 0.8
                 )
-                session.add(manages)
         
-        # Companies sponsor projects
+        # Companies sponsor projects - use proper session method
         for i, project in enumerate(projects):
             company = companies[i % 4]
-            sponsors = ProdSponsors(
-                from_node=company,
-                to_node=project,
+            sponsors = session.create_relationship(
+                ProdSponsors, company, project,
                 funding_amount=project.budget,
                 contract_type=["fixed", "hourly", "milestone"][i % 3],
                 start_date=project.start_date,
                 is_primary=i % 2 == 0
             )
-            session.add(sponsors)
         
         # @@ STEP: Commit all the test data to the database
         session.commit()

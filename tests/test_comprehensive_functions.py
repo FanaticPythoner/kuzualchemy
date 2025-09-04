@@ -3,7 +3,6 @@ Tests for all KuzuAlchemy functions to verify they work correctly with Kuzu.
 This test suite validates that all implemented functions generate correct Cypher and execute properly.
 """
 
-import pytest
 from kuzualchemy.kuzu_functions import (
     # Pattern matching functions
     regexp_matches, regexp_replace, regexp_extract, regexp_extract_all, regexp_split_to_array,

@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Optional
 
 from kuzualchemy import (
-    node,
-    relationship,
+    kuzu_node,
+    kuzu_relationship,
     KuzuBaseModel,
-    Field,
+    kuzu_field,
     KuzuDataType,
     foreign_key,
     KuzuSession,
@@ -33,36 +33,36 @@ class TestEndToEndWorkflow:
 
     def setup_method(self):
         """Set up test models and database."""
-        @node("IntegrationUser")
+        @kuzu_node("IntegrationUser")
         class IntegrationUser(KuzuBaseModel):
             """Integration test user model."""
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-            email: str = Field(kuzu_type=KuzuDataType.STRING, unique=True)
-            age: int = Field(kuzu_type=KuzuDataType.INT32, default=0)
-            created_at: Optional[str] = Field(kuzu_type=KuzuDataType.STRING, default=None)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+            email: str = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True)
+            age: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
+            created_at: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
 
-        @node("IntegrationPost")
+        @kuzu_node("IntegrationPost")
         class IntegrationPost(KuzuBaseModel):
             """Integration test post model."""
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            title: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-            content: str = Field(kuzu_type=KuzuDataType.STRING, default="")
-            author_id: int = Field(kuzu_type=KuzuDataType.INT64, foreign_key=foreign_key(IntegrationUser, "id"))
-            published: bool = Field(kuzu_type=KuzuDataType.BOOL, default=False)
-            created_at: Optional[str] = Field(kuzu_type=KuzuDataType.STRING, default=None)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            title: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+            content: str = kuzu_field(kuzu_type=KuzuDataType.STRING, default="")
+            author_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, foreign_key=foreign_key(IntegrationUser, "id"))
+            published: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL, default=False)
+            created_at: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
 
-        @relationship("WROTE", pairs=[(IntegrationUser, IntegrationPost)])
+        @kuzu_relationship("WROTE", pairs=[(IntegrationUser, IntegrationPost)])
         class Wrote(KuzuBaseModel):
             """Integration test wrote relationship."""
-            created_at: datetime = Field(kuzu_type=KuzuDataType.TIMESTAMP, default_factory=datetime.now)
-            role: str = Field(kuzu_type=KuzuDataType.STRING, default="author")
+            created_at: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP, default_factory=datetime.now)
+            role: str = kuzu_field(kuzu_type=KuzuDataType.STRING, default="author")
 
-        @relationship("FOLLOWS", pairs=[(IntegrationUser, IntegrationUser)])
+        @kuzu_relationship("FOLLOWS", pairs=[(IntegrationUser, IntegrationUser)])
         class FollowsRel(KuzuBaseModel):
             """Integration test follows relationship."""
-            followed_at: Optional[str] = Field(kuzu_type=KuzuDataType.STRING, default=None)
-            notification_enabled: bool = Field(kuzu_type=KuzuDataType.BOOL, default=True)
+            followed_at: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
+            notification_enabled: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL, default=True)
 
         self.IntegrationUser = IntegrationUser
         self.IntegrationPost = IntegrationPost
@@ -84,12 +84,20 @@ class TestEndToEndWorkflow:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
         
-        # @@ STEP: Initialize schema with DDL
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.IntegrationUser))
+        ddl_statements.append(get_ddl_for_node(self.IntegrationPost))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(self.Wrote))
+        ddl_statements.append(get_ddl_for_relationship(self.FollowsRel))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Create user
         user = self.IntegrationUser(
@@ -110,12 +118,20 @@ class TestEndToEndWorkflow:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
 
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.IntegrationUser))
+        ddl_statements.append(get_ddl_for_node(self.IntegrationPost))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(self.Wrote))
+        ddl_statements.append(get_ddl_for_relationship(self.FollowsRel))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Insert test data
         users = [
@@ -154,12 +170,20 @@ class TestEndToEndWorkflow:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
 
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.IntegrationUser))
+        ddl_statements.append(get_ddl_for_node(self.IntegrationPost))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(self.Wrote))
+        ddl_statements.append(get_ddl_for_relationship(self.FollowsRel))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Create users
         user1 = self.IntegrationUser(id=1, name="Alice", email="alice@example.com")
@@ -190,12 +214,20 @@ class TestEndToEndWorkflow:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path, autocommit=False)
 
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.IntegrationUser))
+        ddl_statements.append(get_ddl_for_node(self.IntegrationPost))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(self.Wrote))
+        ddl_statements.append(get_ddl_for_relationship(self.FollowsRel))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Test transaction with context manager
         with session.begin():
@@ -228,12 +260,20 @@ class TestEndToEndWorkflow:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
 
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.IntegrationUser))
+        ddl_statements.append(get_ddl_for_node(self.IntegrationPost))
+
+        # Add relationship DDL
+        ddl_statements.append(get_ddl_for_relationship(self.Wrote))
+        ddl_statements.append(get_ddl_for_relationship(self.FollowsRel))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Insert a user
         user = self.IntegrationUser(id=1, name="Alice", email="alice@example.com")
@@ -258,19 +298,19 @@ class TestPerformanceScenarios:
 
     def setup_method(self):
         """Set up performance test models."""
-        @node("PerfUser")
+        @kuzu_node("PerfUser")
         class PerfUser(KuzuBaseModel):
             """Performance test user model."""
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING, index=True)
-            email: str = Field(kuzu_type=KuzuDataType.STRING, unique=True)
-            age: int = Field(kuzu_type=KuzuDataType.INT32, default=0)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, index=True)
+            email: str = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True)
+            age: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
 
-        @relationship("PERF_FOLLOWS", pairs=[(PerfUser, PerfUser)])
+        @kuzu_relationship("PERF_FOLLOWS", pairs=[(PerfUser, PerfUser)])
         class PerfFollows(KuzuBaseModel):
             """Performance test follows relationship."""
-            since: datetime = Field(kuzu_type=KuzuDataType.TIMESTAMP, default_factory=datetime.now)
-            strength: float = Field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
+            since: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP, default_factory=datetime.now)
+            strength: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
 
         self.PerfUser = PerfUser
         self.PerfFollows = PerfFollows
@@ -290,12 +330,15 @@ class TestPerformanceScenarios:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
 
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.PerfUser))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Create many users
         users = []
@@ -325,12 +368,15 @@ class TestPerformanceScenarios:
         # @@ STEP: Create real database session
         session = KuzuSession(db_path=self.db_path)
         
-        # @@ STEP: Initialize schema
-        ddl = get_all_ddl()
-        if ddl.strip():
-            statements = [stmt.strip() for stmt in ddl.split(';') if stmt.strip()]
-            # @@ STEP: Initialize schema using centralized utility
-            initialize_schema(session)
+        # @@ STEP: Generate DDL only for models defined in this test file
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+
+        # Add node DDL
+        ddl_statements.append(get_ddl_for_node(self.PerfUser))
+
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # @@ STEP: Insert test data
         for i in range(50):

@@ -23,22 +23,14 @@ from datetime import datetime, date
 from typing import Optional, List
 
 from kuzualchemy.constants import (
-    DDLConstants,
-    CypherConstants,
-    ErrorMessages,
     KuzuDefaultFunction,
 )
 from kuzualchemy.kuzu_orm import (
     KuzuDataType,
-    RelationshipDirection,
-    RelationshipMultiplicity,
-    RelationshipPair,
     ArrayTypeSpecification,
 )
 from kuzualchemy.kuzu_query_expressions import (
-    AggregateFunction,
     OrderDirection,
-    JoinType,
 )
 from kuzualchemy import (
     KuzuBaseModel,
@@ -46,16 +38,8 @@ from kuzualchemy import (
     kuzu_node,
     kuzu_relationship,
     kuzu_field,
-    Field,
-    Query,
     QueryField,
-    FilterExpression,
-    FieldFilterExpression,
-    CompoundFilterExpression,
-    NotFilterExpression,
-    BetweenExpression,
     KuzuSession,
-    get_all_ddl,
 )
 from kuzualchemy.test_utilities import initialize_schema
 
@@ -999,6 +983,15 @@ class TestRelationshipQueries:
             QueryField("project_count", Collaborates) > 2
         )
         results = query.all()
+        
+        # session.create_relationship(
+        #     Collaborates, alice, bob,
+        #     project_count=3, trust_score=0.9, since=date(2020, 1, 1)
+        # )
+        # session.create_relationship(
+        #     Collaborates, diana, eve,
+        #     project_count=4, trust_score=0.95, since=date(2022, 3, 1)
+        # )
         
         assert len(results) == 2  # Alice-Bob and Diana-Eve collaborations
         for r in results:

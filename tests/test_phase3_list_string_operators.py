@@ -3,12 +3,11 @@ Integration tests for List/String Operators Implementation.
 """
 
 import pytest
-from typing import Dict, Any
 
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_query_expressions import (
     ArithmeticExpression, ArithmeticOperator, FunctionExpression,
-    FieldFilterExpression, ComparisonOperator, PatternExpression
+    FieldFilterExpression, ComparisonOperator
 )
 
 

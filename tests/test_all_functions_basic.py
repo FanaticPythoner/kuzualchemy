@@ -5,11 +5,7 @@ Basic test to verify all major function categories are working.
 import pytest
 from kuzualchemy import (
     # Text functions
-    concat, upper, lower, contains, starts_with, ends_with, substring, trim, lpad, rpad,
-    # Numeric functions  
-    pi, abs, ceil, floor, sqrt, sin, cos, tan, ln, log,
-    # List functions
-    list_creation, list_concat, list_append, list_contains, list_slice, list_sort,
+    concat, upper, lower, contains, substring, trim, lpad, pi, abs, ceil, floor, sqrt, sin, list_creation, list_concat, list_append, list_contains, list_slice, list_sort,
     # Date functions
     current_date, current_timestamp, make_date, date_part,
     # Array functions

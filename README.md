@@ -1,15 +1,16 @@
-# KuzuAlchemy: A SQLAlchemy-like ORM for Kuzu graph database
+# KuzuAlchemy
+
+[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml): A SQLAlchemy-like ORM for Kuzu graph database
 # Version: 0.1.0
 **Status**: Alpha
 
 [![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)
 [![Python versions](https://img.shields.io/pypi/pyversions/kuzualchemy.svg)](https://pypi.org/project/kuzualchemy/)
-[![Tests](https://github.com/kuzualchemy/kuzualchemy/workflows/Tests/badge.svg)](https://github.com/kuzualchemy/kuzualchemy/actions)
-[![Coverage](https://codecov.io/gh/kuzualchemy/kuzualchemy/branch/main/graph/badge.svg)](https://codecov.io/gh/kuzualchemy/kuzualchemy)
+
 
 KuzuAlchemy is an Object-Relational Mapping (ORM) library for the [Kuzu graph database](https://kuzudb.com/). It provides a SQLAlchemy-like interface for working with graph data.
 
-> **Note**: This software is currently in alpha development. APIs may change, and it should not be used in production environments.
+> **Note**: This software is currently in alpha development. APIs may change.
 
 ## Table of Contents
 
@@ -49,8 +50,6 @@ KuzuAlchemy provides the following components:
 
 ## Installation
 
-**⚠️ Warning**: This is alpha software. Use at your own risk and do not use in production.
-
 ### Prerequisites
 
 ```bash
@@ -78,7 +77,7 @@ pip install -e ".[dev,test]"
 ```python
 from kuzualchemy import (
     KuzuBaseModel, KuzuRelationshipBase,
-    node, relationship, Field,
+    kuzu_node, kuzu_relationship, kuzu_field,
     KuzuDataType, KuzuSession,
     get_all_ddl
 )
@@ -89,8 +88,7 @@ session = KuzuSession(db_path="database.db")
 # Initialize schema
 ddl = get_all_ddl()
 if ddl.strip():
-    from kuzualchemy.test_utilities import initialize_schema
-    initialize_schema(session)
+    session.execute(ddl)
 ```
 
 ### Example
@@ -100,32 +98,33 @@ import kuzualchemy as ka
 from pathlib import Path
 
 # Define your graph models
-@ka.node("Person")
+@ka.kuzu_node("Person")
 class Person(ka.KuzuBaseModel):
-    name: str = ka.Field(primary_key=True)
-    age: int
-    email: str
+    name: str = ka.kuzu_field(kuzu_type=ka.KuzuDataType.STRING, primary_key=True)
+    age: int = ka.kuzu_field(kuzu_type=ka.KuzuDataType.INT32)
+    email: str = ka.kuzu_field(kuzu_type=ka.KuzuDataType.STRING)
 
-@ka.relationship("KNOWS")
-class Knows(ka.KuzuBaseModel):
-    since: int
-    strength: float = 1.0
+@ka.kuzu_relationship("KNOWS", pairs=[(Person, Person)])
+class Knows(ka.KuzuRelationshipBase):
+    since: int = ka.kuzu_field(kuzu_type=ka.KuzuDataType.INT32)
+    strength: float = ka.kuzu_field(kuzu_type=ka.KuzuDataType.DOUBLE, default=1.0)
 
 # Create database and session
 db_path = Path("my_graph.db")
 session = ka.KuzuSession(db_path)
 
 # Create schema
-session.execute_ddl(ka.get_all_ddl())
+session.execute(ka.get_all_ddl())
 
 # Insert data
 alice = Person(name="Alice", age=30, email="alice@example.com")
 bob = Person(name="Bob", age=25, email="bob@example.com")
-knows = Knows(since=2020, strength=0.9)
+knows = Knows(from_node=alice, to_node=bob, since=2020, strength=0.9)
 
+# Or, you could do `session.add_all([alice, bob, knows])`
 session.add(alice)
 session.add(bob)
-session.add_relationship(alice, knows, bob)
+session.add(knows)
 session.commit()
 
 # Query data
@@ -140,350 +139,431 @@ print(f"Found {len(results)} people over 25")
 
 ## Function Reference
 
-KuzuAlchemy implements Kuzu functions across multiple categories. Each function is available both as a standalone callable and as a QueryField method for fluent API usage.
+KuzuAlchemy implements Kuzu functions across multiple categories. Each function returns a `FunctionExpression` object that can be used in queries and expressions.
 
 ### Text Functions
 
 String manipulation and text processing functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `concat(str1, str2, ...)` | Concatenate strings | `kuzu_functions.py:15` |
-| `upper(string)` | Convert to uppercase | `kuzu_functions.py:20` |
-| `lower(string)` | Convert to lowercase | `kuzu_functions.py:25` |
-| `substring(string, start, length)` | Extract substring | `kuzu_functions.py:30` |
-| `trim(string)` | Remove whitespace | `kuzu_functions.py:35` |
-| `ltrim(string)` | Remove left whitespace | `kuzu_functions.py:40` |
-| `rtrim(string)` | Remove right whitespace | `kuzu_functions.py:45` |
-| `lpad(string, length, fill)` | Left pad string | `kuzu_functions.py:50` |
-| `rpad(string, length, fill)` | Right pad string | `kuzu_functions.py:55` |
-| `repeat(string, count)` | Repeat string | `kuzu_functions.py:60` |
-| `reverse(string)` | Reverse string | `kuzu_functions.py:65` |
-| `replace(string, search, replace)` | Replace substring | `kuzu_functions.py:70` |
-| `split(string, delimiter)` | Split string | `kuzu_functions.py:75` |
-| `array_to_string(array, delimiter)` | Join array to string | `kuzu_functions.py:80` |
-| `string_to_array(string, delimiter)` | Split string to array | `kuzu_functions.py:85` |
-| `starts_with(string, prefix)` | Check prefix | `kuzu_functions.py:90` |
-| `ends_with(string, suffix)` | Check suffix | `kuzu_functions.py:95` |
-| `contains(string, substring)` | Check contains | `kuzu_functions.py:100` |
-| `length(string)` | String length | `kuzu_functions.py:105` |
-| `char_length(string)` | Character length | `kuzu_functions.py:110` |
-| `bit_length(string)` | Bit length | `kuzu_functions.py:115` |
-| `octet_length(string)` | Byte length | `kuzu_functions.py:120` |
-| `left(string, length)` | Left substring | `kuzu_functions.py:125` |
-| `right(string, length)` | Right substring | `kuzu_functions.py:130` |
-| `ascii(string)` | ASCII value | `kuzu_functions.py:135` |
-| `chr(code)` | Character from code | `kuzu_functions.py:140` |
-| `initcap(string)` | Initial caps | `kuzu_functions.py:145` |
-| `title(string)` | Title case | `kuzu_functions.py:150` |
-| `position(substring, string)` | Find position | `kuzu_functions.py:155` |
-| `strpos(string, substring)` | Find position | `kuzu_functions.py:160` |
-| `encode(string, format)` | Encode string | `kuzu_functions.py:165` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `concat(*args)` | Concatenate multiple strings | ✓ | ✓ |
+| `ws_concat(separator, *args)` | Concatenate strings with separator | ✓ | — |
+| `array_extract(string_or_list, index)` | Extract element at 1-based index from string or list | ✓ | — |
+| `array_slice(string_or_list, begin, end)` | Slice string or list (1-based) | ✓ | — |
+| `list_element(list_value, index)` | Extract list element at index | ✓ | ✓ |
+| `list_extract(list_value, index)` | Extract list element at index (alias) | ✓ | ✓ |
+| `contains(string1, string2)` | Substring test | ✓ | ✓ |
+| `ends_with(string1, string2)` | Ends-with test (alias of suffix) | ✓ | ✓ |
+| `lower(string)` | Lowercase | ✓ | ✓ |
+| `lcase(string)` | Lowercase (alias) | ✓ | ✓ |
+| `left(string, count)` | Left substring | ✓ | ✓ |
+| `levenshtein(s1, s2)` | Edit distance | ✓ | ✓ |
+| `lpad(string, count, character)` | Left pad | ✓ | ✓ |
+| `ltrim(string)` | Trim left | ✓ | ✓ |
+| `prefix(string, search_string)` | Starts-with test | ✓ | — |
+| `repeat(string, count)` | Repeat string | ✓ | ✓ |
+| `reverse(string)` | Reverse string | ✓ | ✓ |
+| `right(string, count)` | Right substring | ✓ | ✓ |
+| `rpad(string, count, character)` | Right pad | ✓ | ✓ |
+| `rtrim(string)` | Trim right | ✓ | ✓ |
+| `starts_with(string1, string2)` | Starts-with test (alias of prefix) | ✓ | ✓ |
+| `substring(string, start, length)` | Substring by 1-based start/length | ✓ | ✓ |
+| `substr(string, start, length)` | Substring (alias) | ✓ | ✓ |
+| `suffix(string, search_string)` | Ends-with test | ✓ | — |
+| `trim(string)` | Trim both sides | ✓ | ✓ |
+| `upper(string)` | Uppercase | ✓ | ✓ |
+| `ucase(string)` | Uppercase (alias) | ✓ | ✓ |
+| `initcap(string)` | Capitalize first letter | ✓ | ✓ |
+| `string_split(string, separator)` | Split to array | ✓ | ✓ |
+| `split_part(string, separator, index)` | Part at 1-based index | ✓ | ✓ |
+
+### Pattern Matching Functions
+
+Regular expression utilities:
+
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `regexp_matches(string, pattern)` | Regex test | ✓ | ✓ |
+| `regexp_replace(string, pattern, replacement[, options])` | Regex replace | ✓ | ✓ |
+| `regexp_extract(string, pattern[, group])` | Extract first match/group | ✓ | ✓ |
+| `regexp_extract_all(string, pattern[, group])` | Extract all matches/groups | ✓ | ✓ |
+| `regexp_split_to_array(string, pattern[, options])` | Split by regex | ✓ | ✓ |
+
 
 ### List Functions
 
 Array and list manipulation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `list_creation(...)` | Create list | `kuzu_functions.py:274` |
-| `list_extract(list, index)` | Extract element | `kuzu_functions.py:279` |
-| `list_element(list, index)` | Get element | `kuzu_functions.py:284` |
-| `array_extract(array, index)` | Extract from array | `kuzu_functions.py:289` |
-| `list_len(list)` | List length | `kuzu_functions.py:294` |
-| `array_length(array)` | Array length | `kuzu_functions.py:299` |
-| `size(list)` | Collection size | `kuzu_functions.py:304` |
-| `list_concat(list1, list2)` | Concatenate lists | `kuzu_functions.py:309` |
-| `array_concat(array1, array2)` | Concatenate arrays | `kuzu_functions.py:314` |
-| `list_cat(list1, list2)` | Concatenate lists | `kuzu_functions.py:319` |
-| `array_cat(array1, array2)` | Concatenate arrays | `kuzu_functions.py:324` |
-| `list_append(list, element)` | Append element | `kuzu_functions.py:329` |
-| `array_append(array, element)` | Append to array | `kuzu_functions.py:334` |
-| `list_prepend(element, list)` | Prepend element | `kuzu_functions.py:339` |
-| `array_prepend(element, array)` | Prepend to array | `kuzu_functions.py:344` |
-| `list_position(list, element)` | Find position | `kuzu_functions.py:349` |
-| `array_position(array, element)` | Find in array | `kuzu_functions.py:354` |
-| `list_contains(list, element)` | Check contains | `kuzu_functions.py:359` |
-| `array_contains(array, element)` | Check array contains | `kuzu_functions.py:364` |
-| `list_slice(list, start, end)` | Slice list | `kuzu_functions.py:369` |
-| `array_slice(array, start, end)` | Slice array | `kuzu_functions.py:374` |
-| `list_sort(list)` | Sort list | `kuzu_functions.py:379` |
-| `array_sort(array)` | Sort array | `kuzu_functions.py:384` |
-| `list_reverse_sort(list)` | Reverse sort | `kuzu_functions.py:389` |
-| `list_sum(list)` | Sum elements | `kuzu_functions.py:394` |
-| `list_product(list)` | Product elements | `kuzu_functions.py:399` |
-| `list_min(list)` | Minimum element | `kuzu_functions.py:404` |
-| `list_max(list)` | Maximum element | `kuzu_functions.py:409` |
-| `list_avg(list)` | Average elements | `kuzu_functions.py:414` |
-| `list_distinct(list)` | Distinct elements | `kuzu_functions.py:419` |
-| `list_unique(list)` | Unique elements | `kuzu_functions.py:424` |
-| `list_any_value(list)` | Any element | `kuzu_functions.py:429` |
-| `list_reduce(list, initial, func)` | Reduce list | `kuzu_functions.py:434` |
-| `range(start, end)` | Generate range | `kuzu_functions.py:439` |
-| `list_has_any(list1, list2)` | Check overlap | `kuzu_functions.py:444` |
-| `list_has_all(list1, list2)` | Check contains all | `kuzu_functions.py:449` |
-| `list_zip(list1, list2)` | Zip lists | `kuzu_functions.py:454` |
-| `list_transform(list, func)` | Transform elements | `kuzu_functions.py:459` |
-| `list_filter(list, predicate)` | Filter elements | `kuzu_functions.py:464` |
-| `list_aggregate(list, func)` | Aggregate list | `kuzu_functions.py:469` |
-| `flatten(list)` | Flatten nested | `kuzu_functions.py:474` |
-| `unnest(list)` | Unnest list | `kuzu_functions.py:479` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `list_creation(...)` | Create a list containing the argument values | ✓ | — |
+| `size(value)` | Return size of string or list | ✓ | ✓ |
+| `list_concat(list1, list2)` | Concatenate two lists | ✓ | ✓ |
+| `range(start, stop, [step])` | Return list from start to stop with step | ✓ | — |
+| `list_cat(list1, list2)` | Alias of list_concat | ✓ | ✓ |
+| `array_concat(list1, list2)` | Alias of list_concat | ✓ | ✓ |
+| `array_cat(list1, list2)` | Alias of list_concat | ✓ | ✓ |
+| `list_append(list, element)` | Append element to list | ✓ | ✓ |
+| `array_append(list, element)` | Alias of list_append | ✓ | ✓ |
+| `array_push_back(list, element)` | Alias of list_append | ✓ | ✓ |
+| `list_prepend(list, element)` | Prepend element to list | ✓ | ✓ |
+| `array_prepend(list, element)` | Alias of list_prepend | ✓ | ✓ |
+| `array_push_front(list, element)` | Alias of list_prepend | ✓ | ✓ |
+| `list_position(list, element)` | Position of element in list | ✓ | ✓ |
+| `list_indexof(list, element)` | Alias of list_position | ✓ | ✓ |
+| `array_position(list, element)` | Alias of list_position | ✓ | ✓ |
+| `array_indexof(list, element)` | Alias of list_position | ✓ | ✓ |
+| `list_contains(list, element)` | Check if list contains element | ✓ | ✓ |
+| `list_has(list, element)` | Alias of list_contains | ✓ | ✓ |
+| `array_contains(list, element)` | Alias of list_contains | ✓ | ✓ |
+| `array_has(list, element)` | Alias of list_contains | ✓ | ✓ |
+| `list_slice(list, begin, end)` | Extract sub-list | ✓ | ✓ |
+
+### Advanced List Functions
+
+Higher-order and quantifier list functions (order matches kuzu_functions.py):
+
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `list_reverse(list)` | Reverse list elements | ✓ | ✓ |
+| `list_sort(list[, order, nulls])` | Sort elements of list | ✓ | ✓ |
+| `list_reverse_sort(list)` | Sort elements of list in DESC | ✓ | ✓ |
+| `list_sum(list)` | Sum elements | ✓ | ✓ |
+| `list_product(list)` | Multiply elements | ✓ | ✓ |
+| `list_distinct(list)` | Remove NULLs and duplicates | ✓ | ✓ |
+| `list_unique(list)` | Count unique elements | ✓ | ✓ |
+| `list_any_value(list)` | First non-NULL value | ✓ | ✓ |
+| `list_to_string(sep, list)` | Join elements with separator | ✓ | ✓ |
+| `list_transform(list, lambda)` | Transform elements using lambda expression | ✓ | ✓ |
+| `list_filter(list, lambda)` | Filter elements using lambda expression | ✓ | ✓ |
+| `list_reduce(list, lambda)` | Reduce list using lambda expression | ✓ | ✓ |
+| `list_has_all(list, sub_list)` | Contains all elements from sub-list | ✓ | ✓ |
+| `all_func(var, list, predicate)` | All elements satisfy predicate | ✓ | ✓ |
+| `any_func(var, list, predicate)` | Any element satisfies predicate | ✓ | ✓ |
+| `none_func(var, list, predicate)` | No elements satisfy predicate | ✓ | ✓ |
+| `single_func(var, list, predicate)` | Exactly one element satisfies predicate | ✓ | ✓ |
+
+| `array_slice(array, start, end)` | Slice array | `ka.array_slice(field, 1, 5)` |
+| `list_reverse(list)` | Reverse list | `ka.list_reverse(field)` |
+| `list_sort(list)` | Sort list | `ka.list_sort(field)` |
+| `list_reverse_sort(list)` | Reverse sort | `ka.list_reverse_sort(field)` |
+| `list_sum(list)` | Sum elements | `ka.list_sum(field)` |
+| `list_product(list)` | Product elements | `ka.list_product(field)` |
+| `list_distinct(list)` | Distinct elements | `ka.list_distinct(field)` |
+| `list_unique(list)` | Unique elements | `ka.list_unique(field)` |
+| `list_any_value(list)` | Any element | `ka.list_any_value(field)` |
+| `list_to_string(sep, list)` | Join elements | `ka.list_to_string(",", field)` |
+| `list_extract(list, index)` | Extract element | `ka.list_extract(field, 1)` |
+| `list_element(list, index)` | Get element | `ka.list_element(field, 1)` |
+| `range(start, end, [step])` | Generate range | `ka.range(1, 10)` |
 
 ### Numeric Functions
 
 Mathematical and numeric computation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `abs(number)` | Absolute value | `kuzu_functions.py:173` |
-| `acos(number)` | Arc cosine | `kuzu_functions.py:178` |
-| `asin(number)` | Arc sine | `kuzu_functions.py:183` |
-| `atan(number)` | Arc tangent | `kuzu_functions.py:188` |
-| `atan2(y, x)` | Arc tangent of y/x | `kuzu_functions.py:193` |
-| `ceil(number)` | Ceiling | `kuzu_functions.py:198` |
-| `ceiling(number)` | Ceiling | `kuzu_functions.py:203` |
-| `cos(number)` | Cosine | `kuzu_functions.py:208` |
-| `cot(number)` | Cotangent | `kuzu_functions.py:213` |
-| `degrees(radians)` | Convert to degrees | `kuzu_functions.py:218` |
-| `even(number)` | Check if even | `kuzu_functions.py:223` |
-| `exp(number)` | Exponential | `kuzu_functions.py:228` |
-| `factorial(number)` | Factorial | `kuzu_functions.py:233` |
-| `floor(number)` | Floor | `kuzu_functions.py:238` |
-| `gamma(number)` | Gamma function | `kuzu_functions.py:243` |
-| `lgamma(number)` | Log gamma | `kuzu_functions.py:248` |
-| `ln(number)` | Natural log | `kuzu_functions.py:253` |
-| `log(number)` | Logarithm | `kuzu_functions.py:258` |
-| `log10(number)` | Base 10 log | `kuzu_functions.py:263` |
-| `log2(number)` | Base 2 log | `kuzu_functions.py:268` |
-| `pi()` | Pi constant | `kuzu_functions.py:273` |
-| `pow(base, exponent)` | Power | `kuzu_functions.py:278` |
-| `power(base, exponent)` | Power | `kuzu_functions.py:283` |
-| `radians(degrees)` | Convert to radians | `kuzu_functions.py:288` |
-| `round(number, precision)` | Round number | `kuzu_functions.py:293` |
-| `sign(number)` | Sign of number | `kuzu_functions.py:298` |
-| `sin(number)` | Sine | `kuzu_functions.py:303` |
-| `sqrt(number)` | Square root | `kuzu_functions.py:308` |
-| `tan(number)` | Tangent | `kuzu_functions.py:313` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `pi()` | Return value of pi | ✓ | — |
+| `abs(value)` | Absolute value | ✓ | ✓ |
+| `ceil(value)` | Ceiling | ✓ | ✓ |
+| `ceiling(value)` | Ceiling (alias) | ✓ | ✓ |
+| `floor(value)` | Floor | ✓ | ✓ |
+| `round(value, precision=0)` | Round to precision | ✓ | ✓ |
+| `sqrt(value)` | Square root | ✓ | ✓ |
+| `pow(base, exponent)` | Power | ✓ | ✓ |
+| `sin(value)` | Sine | ✓ | ✓ |
+| `cos(value)` | Cosine | ✓ | ✓ |
+| `tan(value)` | Tangent | ✓ | ✓ |
+| `asin(value)` | Arcsine | ✓ | ✓ |
+| `acos(value)` | Arccosine | ✓ | ✓ |
+| `atan(value)` | Arctangent | ✓ | ✓ |
+| `atan2(x, y)` | Arctangent of x,y | ✓ | ✓ |
+| `ln(value)` | Natural log | ✓ | ✓ |
+| `log(value)` | Logarithm | ✓ | ✓ |
+| `log2(value)` | Base-2 logarithm | ✓ | ✓ |
+| `log10(value)` | Base-10 logarithm | ✓ | ✓ |
+| `negate(value)` | Negation | ✓ | ✓ |
+| `sign(value)` | Sign (-1,0,1) | ✓ | ✓ |
+| `even(value)` | Round to next even | ✓ | ✓ |
+| `factorial(value)` | Factorial | ✓ | ✓ |
+| `gamma(value)` | Gamma function | ✓ | ✓ |
+| `lgamma(value)` | Log Gamma | ✓ | ✓ |
+| `bitwise_xor(x, y)` | Bitwise XOR | ✓ | ✓ |
+| `cot(value)` | Cotangent | ✓ | ✓ |
+| `degrees(value)` | Radians to degrees | ✓ | ✓ |
+| `radians(value)` | Degrees to radians | ✓ | ✓ |
 
 ### Date Functions
 
 Date manipulation and extraction functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `date_part(part, date)` | Extract date part | `kuzu_functions.py:467` |
-| `datepart(part, date)` | Extract date part | `kuzu_functions.py:472` |
-| `date_trunc(part, date)` | Truncate date | `kuzu_functions.py:477` |
-| `datetrunc(part, date)` | Truncate date | `kuzu_functions.py:482` |
-| `dayname(date)` | Day name | `kuzu_functions.py:487` |
-| `monthname(date)` | Month name | `kuzu_functions.py:492` |
-| `last_day(date)` | Last day of month | `kuzu_functions.py:497` |
-| `make_date(year, month, day)` | Create date | `kuzu_functions.py:502` |
-| `greatest(date1, date2, ...)` | Latest date | `kuzu_functions.py:507` |
-| `least(date1, date2, ...)` | Earliest date | `kuzu_functions.py:512` |
-| `date_diff(part, start, end)` | Date difference | `kuzu_functions.py:517` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `current_date()` | Current date | ✓ | — |
+| `current_timestamp()` | Current timestamp | ✓ | — |
+| `date_part(part, date)` | Extract date part | ✓ | ✓ |
+| `date_trunc(part, date)` | Truncate date | ✓ | ✓ |
+| `datepart(part, date)` | Extract date part (alias) | ✓ | ✓ |
+| `datetrunc(part, date)` | Truncate date (alias) | ✓ | ✓ |
+| `dayname(date)` | Day name | ✓ | ✓ |
+| `monthname(date)` | Month name | ✓ | ✓ |
+| `last_day(date)` | Last day of month | ✓ | ✓ |
+| `greatest(...)` | Greatest of values | ✓ | ✓ |
+| `least(...)` | Least of values | ✓ | ✓ |
+| `make_date(year, month, day)` | Create date | ✓ | ✓ |
 
 ### Timestamp Functions
 
 Timestamp manipulation and extraction functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `century(timestamp)` | Extract century | `kuzu_functions.py:527` |
-| `epoch_ms(timestamp)` | Milliseconds since epoch | `kuzu_functions.py:532` |
-| `to_timestamp(seconds)` | Convert to timestamp | `kuzu_functions.py:537` |
-| `date_part(part, timestamp)` | Extract timestamp part | `kuzu_functions.py:542` |
-| `date_trunc(part, timestamp)` | Truncate timestamp | `kuzu_functions.py:547` |
-| `make_timestamp(y, m, d, h, min, s)` | Create timestamp | `kuzu_functions.py:552` |
-| `timestamp_diff(part, start, end)` | Timestamp difference | `kuzu_functions.py:557` |
-| `timestamp_trunc(part, timestamp)` | Truncate timestamp | `kuzu_functions.py:562` |
-| `extract(part FROM timestamp)` | Extract part | `kuzu_functions.py:567` |
-| `age(timestamp1, timestamp2)` | Age between timestamps | `kuzu_functions.py:572` |
-| `clock_timestamp()` | Current timestamp | `kuzu_functions.py:577` |
-| `current_timestamp()` | Current timestamp | `kuzu_functions.py:582` |
-| `now()` | Current timestamp | `kuzu_functions.py:587` |
-| `transaction_timestamp()` | Transaction timestamp | `kuzu_functions.py:592` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `century(timestamp)` | Extract century | ✓ | ✓ |
+| `epoch_ms(ms)` | Convert milliseconds to timestamp | ✓ | — |
+| `to_epoch_ms(timestamp)` | Convert timestamp to milliseconds | ✓ | ✓ |
+
 
 ### Interval Functions
 
 Interval manipulation and conversion functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `to_years(interval)` | Convert to years | `kuzu_functions.py:624` |
-| `to_months(interval)` | Convert to months | `kuzu_functions.py:629` |
-| `to_days(interval)` | Convert to days | `kuzu_functions.py:634` |
-| `to_hours(interval)` | Convert to hours | `kuzu_functions.py:639` |
-| `to_minutes(interval)` | Convert to minutes | `kuzu_functions.py:644` |
-| `to_seconds(interval)` | Convert to seconds | `kuzu_functions.py:649` |
-| `to_milliseconds(interval)` | Convert to milliseconds | `kuzu_functions.py:654` |
-| `to_microseconds(interval)` | Convert to microseconds | `kuzu_functions.py:659` |
-| `date_part(part, interval)` | Extract interval part | `kuzu_functions.py:664` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `to_years(value)` | Convert integer to year interval | ✓ | ✓ |
+| `to_months(value)` | Convert integer to month interval | ✓ | ✓ |
+| `to_days(value)` | Convert integer to day interval | ✓ | ✓ |
+| `to_hours(value)` | Convert integer to hour interval | ✓ | ✓ |
+| `to_minutes(value)` | Convert integer to minute interval | ✓ | ✓ |
+| `to_seconds(value)` | Convert integer to second interval | ✓ | ✓ |
+| `to_milliseconds(value)` | Convert integer to millisecond interval | ✓ | ✓ |
+| `to_microseconds(value)` | Convert integer to microsecond interval | ✓ | ✓ |
 
-### Array Functions
 
-Array-specific mathematical and similarity functions:
+### Timestamp Functions
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `array_distance(array1, array2)` | Euclidean distance | `kuzu_functions.py:668` |
-| `array_inner_product(array1, array2)` | Inner product | `kuzu_functions.py:673` |
-| `array_cosine_similarity(array1, array2)` | Cosine similarity | `kuzu_functions.py:678` |
-| `array_dot_product(array1, array2)` | Dot product | `kuzu_functions.py:683` |
-| `list_distance(list1, list2)` | List distance | `kuzu_functions.py:688` |
-| `list_inner_product(list1, list2)` | List inner product | `kuzu_functions.py:693` |
-| `list_cosine_similarity(list1, list2)` | List cosine similarity | `kuzu_functions.py:698` |
+Timestamp manipulation and extraction functions (order matches kuzu_functions.py):
 
-### Struct Functions
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `century(timestamp)` | Extract century | ✓ | ✓ |
+| `epoch_ms(ms)` | Convert milliseconds to timestamp | ✓ | — |
+| `to_epoch_ms(timestamp)` | Convert timestamp to milliseconds | ✓ | ✓ |
 
-Struct manipulation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `struct_extract(struct, field)` | Extract struct field | `kuzu_functions.py:752` |
+
+### Interval Functions
+
+Interval manipulation and conversion functions:
+
 
 ### Map Functions
 
 Map manipulation and access functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `map(keys, values)` | Create map | `kuzu_functions.py:761` |
-| `map_extract(map, key)` | Extract map value | `kuzu_functions.py:766` |
-| `element_at(map, key)` | Get element at key | `kuzu_functions.py:771` |
-| `cardinality(map)` | Map size | `kuzu_functions.py:776` |
-| `map_keys(map)` | Get all keys | `kuzu_functions.py:781` |
-| `map_values(map)` | Get all values | `kuzu_functions.py:786` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `map_func(keys, values)` | Create map from keys and values | ✓ | — |
+| `map_extract(map, key)` | Extract value for key | ✓ | ✓ |
+| `element_at(map, key)` | Extract value (alias) | ✓ | ✓ |
+| `cardinality(map)` | Map size | ✓ | ✓ |
+| `map_keys(map)` | Get all keys | ✓ | ✓ |
+| `map_values(map)` | Get all values | ✓ | ✓ |
 
 ### Union Functions
 
 Union type manipulation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `union_value(tag := value)` | Create union | `kuzu_functions.py:795` |
-| `union_tag(union)` | Get union tag | `kuzu_functions.py:800` |
-| `union_extract(union, tag)` | Extract union value | `kuzu_functions.py:805` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `union_value(tag := value)` | Create union with tag/value | ✓ | — |
+| `union_tag(union)` | Get union tag | ✓ | ✓ |
+| `union_extract(union, tag)` | Extract value for tag | ✓ | ✓ |
 
-### Node/Rel Functions
+### Node/Relationship Functions
 
 Node and relationship introspection functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `ID(node_or_rel)` | Get internal ID | `kuzu_functions.py:814` |
-| `LABEL(node_or_rel)` | Get label name | `kuzu_functions.py:819` |
-| `LABELS(node_or_rel)` | Get label name (alias) | `kuzu_functions.py:824` |
-| `OFFSET(node_or_rel)` | Get ID offset | `kuzu_functions.py:829` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `id_func(node_or_rel)` | Internal ID | ✓ | ✓ |
+| `label(node_or_rel)` | Label name | ✓ | ✓ |
+| `labels(node_or_rel)` | Label name (alias) | ✓ | ✓ |
+| `offset(node_or_rel)` | ID offset | ✓ | ✓ |
 
-### Recursive Rel Functions
+### Recursive Relationship Functions
 
 Recursive path and traversal functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `NODES(path)` | Get all nodes from path | `kuzu_query_fields.py:921` |
-| `RELS(path)` | Get all relationships from path | `kuzu_query_fields.py:926` |
-| `PROPERTIES(nodes_or_rels, property)` | Get property from collection | `kuzu_query_fields.py:931` |
-| `IS_TRAIL(path)` | Check if path is trail | `kuzu_query_fields.py:936` |
-| `IS_ACYCLIC(path)` | Check if path is acyclic | `kuzu_query_fields.py:941` |
-| `LENGTH(path)` | Get path length | `kuzu_query_fields.py:946` |
-| `COST(path)` | Get weighted path cost | `kuzu_query_fields.py:951` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `nodes(path)` | Get nodes from path | ✓ | ✓ |
+| `rels(path)` | Get relationships from path | ✓ | ✓ |
+| `properties(path, property)` | Get property from collection | ✓ | ✓ |
+| `is_trail(path)` | Path is trail (repeated rels) | ✓ | ✓ |
+| `is_acyclic(path)` | Path is acyclic (no repeated nodes) | ✓ | ✓ |
+| `length(path)` | Path length (number of rels) | ✓ | ✓ |
+| `cost(path)` | Weighted path cost | ✓ | ✓ |
+
+### Array Functions
+
+Array-specific mathematical and similarity functions:
+
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `array_value(...)` | Construct array | ✓ | — |
+| `array_distance(array1, array2)` | Euclidean distance | ✓ | ✓ |
+| `array_squared_distance(array1, array2)` | Squared distance | ✓ | ✓ |
+| `array_dot_product(array1, array2)` | Dot product | ✓ | ✓ |
+| `array_inner_product(array1, array2)` | Inner product | ✓ | ✓ |
+| `array_cross_product(array1, array2)` | Cross product | ✓ | ✓ |
+| `array_cosine_similarity(array1, array2)` | Cosine similarity | ✓ | ✓ |
+
 
 ### Blob Functions
 
 Binary data manipulation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `BLOB(data)` | Create blob | `kuzu_functions.py:728` |
-| `encode(data, format)` | Encode data | `kuzu_functions.py:733` |
-| `decode(blob, format)` | Decode blob | `kuzu_functions.py:738` |
-| `octet_length(blob)` | Get blob length | `kuzu_functions.py:743` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `blob(data)` | Create blob | ✓ | ✓ |
+| `encode(data)` | Encode string to blob | ✓ | ✓ |
+| `decode(blob)` | Decode blob to string | ✓ | ✓ |
+| `octet_length(blob)` | Blob byte length | ✓ | ✓ |
+
+### Struct Functions
+
+Struct manipulation functions:
+
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `struct_extract(struct, field)` | Extract struct field | ✓ | ✓ |
+
+| `to_int32(value)` | Cast to int32 | `ka.to_int32(field)` |
+| `to_int16(value)` | Cast to int16 | `ka.to_int16(field)` |
+| `to_float(value)` | Cast to float | `ka.to_float(field)` |
+| `to_date(value)` | Cast to date | `ka.to_date(field)` |
+| `to_timestamp(value)` | Cast to timestamp | `ka.to_timestamp(field)` |
+| `cast_as(value, type)` | Cast using AS syntax | `ka.cast_as(field, "INT64")` |
+| `case([input])` | CASE expression | `ka.case()` |
 
 ### Hash Functions
 
 Cryptographic hash functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `md5(data)` | MD5 hash | `kuzu_functions.py:548` |
-| `sha256(data)` | SHA256 hash | `kuzu_functions.py:553` |
-| `hash(data)` | Generic hash | `kuzu_functions.py:558` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `md5(data)` | MD5 hash | ✓ | ✓ |
+| `sha256(data)` | SHA256 hash | ✓ | ✓ |
+| `hash(data)` | Generic hash | ✓ | ✓ |
 
 ### UUID Functions
 
 UUID generation and manipulation functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `UUID()` | Parse UUID string | `kuzu_functions.py:567` |
-| `gen_random_uuid()` | Generate random UUID | `kuzu_functions.py:572` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `gen_random_uuid()` | Generate random UUID | ✓ | — |
+| `uuid(string)` | Parse UUID string | ✓ | ✓ |
 
 ### Utility Functions
 
 Utility and miscellaneous functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `coalesce(val1, val2, ...)` | First non-null value | `kuzu_functions.py:445` |
-| `ifnull(val1, val2)` | Replace null | `kuzu_functions.py:450` |
-| `nullif(val1, val2)` | Return null if equal | `kuzu_functions.py:455` |
-| `typeof(value)` | Get value type | `kuzu_functions.py:460` |
-| `size(collection)` | Collection size | `kuzu_functions.py:465` |
-| `range(start, end, step)` | Generate range | `kuzu_functions.py:470` |
-| `greatest(val1, val2, ...)` | Maximum value | `kuzu_functions.py:475` |
+| Function | Description | kuzu_functions | QueryField |
+|----------|-------------|----------------|------------|
+| `coalesce(val1, val2, ...)` | First non-NULL value | ✓ | ✓ |
+| `ifnull(value, replacement)` | Replace NULL with value | ✓ | ✓ |
+| `nullif(a, b)` | NULL if equal | ✓ | ✓ |
+| `typeof(value)` | Get value type | ✓ | ✓ |
+| `constant_or_null(constant, check)` | Constant if check non-NULL | ✓ | ✓ |
+| `count_if(condition)` | 1 if condition true else 0 | ✓ | ✓ |
+| `error(message)` | Raise runtime error | ✓ | ✓ |
+
 
 ### Casting Functions
 
 Type conversion and casting functions:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `CAST(value AS type)` | Cast to type | `kuzu_functions.py:931` |
-| `cast(value, type)` | Cast function | `kuzu_functions.py:936` |
+|----------|-------------|----------------|------------|
+| `to_int64(value)` | Cast to INT64 | ✓ | — |
+| `to_int32(value)` | Cast to INT32 | ✓ | — |
+| `to_int16(value)` | Cast to INT16 | ✓ | — |
+| `to_double(value)` | Cast to DOUBLE | ✓ | — |
+| `to_float(value)` | Cast to FLOAT | ✓ | — |
+| `to_string(value)` | Cast to STRING | ✓ | — |
+| `to_date(value)` | Cast to DATE | ✓ | — |
+| `to_timestamp(value)` | Cast to TIMESTAMP | ✓ | ✓ |
+| `cast(value, type)` | CAST function | ✓ | ✓ |
+| `cast_as(value, type)` | CAST AS syntax | ✓ | ✓ |
+| `case([input])` | Create CASE expression | ✓ | ✓ |
 
-### Case Expressions
 
-Conditional expression constructs:
 
-| Function | Description | Implementation |
-|----------|-------------|----------------|
-| `CASE WHEN ... THEN ... END` | General case | `kuzu_functions.py:943` |
-| `CASE value WHEN ... THEN ... END` | Simple case | `kuzu_functions.py:946` |
-
----
 
 ## Operator Reference
 
-KuzuAlchemy implements Kuzu operators with type safety and proper precedence handling.
+KuzuAlchemy operator support (exactly as implemented):
 
 ### Comparison Operators
 
-| Operator | Description | Implementation | Usage |
-|----------|-------------|----------------|-------|
-| `==` | Equal to | `kuzu_query_expressions.py:45` | `field == value` |
-| `!=` | Not equal to | `kuzu_query_expressions.py:50` | `field != value` |
-| `<` | Less than | `kuzu_query_expressions.py:55` | `field < value` |
-| `<=` | Less than or equal | `kuzu_query_expressions.py:60` | `field <= value` |
-| `>` | Greater than | `kuzu_query_expressions.py:65` | `field > value` |
-| `>=` | Greater than or equal | `kuzu_query_expressions.py:70` | `field >= value` |
+| Operator/Method | Description | Backing Enum/Method |
+|-----------------|-------------|---------------------|
+| `==` | Equal to | QueryField.__eq__ -> ComparisonOperator.EQ |
+| `!=` | Not equal | QueryField.__ne__ -> ComparisonOperator.NEQ |
+| `<` | Less than | QueryField.__lt__ -> ComparisonOperator.LT |
+| `<=` | Less than or equal | QueryField.__le__ -> ComparisonOperator.LTE |
+| `>` | Greater than | QueryField.__gt__ -> ComparisonOperator.GT |
+| `>=` | Greater than or equal | QueryField.__ge__ -> ComparisonOperator.GTE |
+| `in_(values)` | Membership | QueryField.in_ -> ComparisonOperator.IN |
+| `not_in(values)` | Not in | QueryField.not_in -> ComparisonOperator.NOT_IN |
+| `between(a,b, inclusive=True)` | Range test | QueryField.between -> BetweenExpression |
 
-### Logical Operators
+### Pattern/Regex Operators
 
-| Operator | Description | Implementation | Usage |
-|----------|-------------|----------------|-------|
-| `AND` | Logical AND | `kuzu_query_expressions.py:75` | `expr1 & expr2` |
-| `OR` | Logical OR | `kuzu_query_expressions.py:80` | `expr1 \| expr2` |
-| `XOR` | Logical XOR | `kuzu_query_expressions.py:85` | `expr1 ^ expr2` |
-| `NOT` | Logical NOT | `kuzu_query_expressions.py:90` | `~expr` |
+| Operator/Method | Description | Backing Enum |
+|-----------------|-------------|--------------|
+| `like(pattern, case_sensitive=True)` | Regex-like match | ComparisonOperator.LIKE |
+| `not_like(pattern, case_sensitive=True)` | Negative match | ComparisonOperator.NOT_LIKE |
+| `regex_match(pattern)` | `=~` regex match | ComparisonOperator.REGEX_MATCH |
+| `not_regex_match(pattern)` | `!~` negative regex | ComparisonOperator.NOT_REGEX_MATCH |
 
-### Null Operators
+### Contains/Prefix/Suffix Filters
 
-| Operator | Description | Implementation | Usage |
-|----------|-------------|----------------|-------|
-| `IS NULL` | Check if null | `kuzu_query_expressions.py:95` | `field.is_null()` |
-| `IS NOT NULL` | Check if not null | `kuzu_query_expressions.py:100` | `field.is_not_null()` |
+| Method | Description | Backing Enum |
+|--------|-------------|--------------|
+| `contains_filter(value)` | Contains element/substr | ComparisonOperator.CONTAINS |
+| `starts_with_filter(value, case_sensitive=True)` | Prefix match | ComparisonOperator.STARTS_WITH |
+| `ends_with_filter(value, case_sensitive=True)` | Suffix match | ComparisonOperator.ENDS_WITH |
+| `is_null()` | Field is NULL | ComparisonOperator.IS_NULL |
+| `is_not_null()` | Field is NOT NULL | ComparisonOperator.IS_NOT_NULL |
+
+### Logical Operators (on FilterExpression)
+
+| Operator | Description | Backing |
+|----------|-------------|---------|
+| `&` | Logical AND | FilterExpression.__and__ -> LogicalOperator.AND |
+| `|` | Logical OR | FilterExpression.__or__ -> LogicalOperator.OR |
+| `^` | Logical XOR | FilterExpression.__xor__ -> LogicalOperator.XOR |
+| `~` | Logical NOT | FilterExpression.__invert__ -> NotFilterExpression |
+
+### Arithmetic Operators (on QueryField)
+
+| Operator | Description | Backing |
+|----------|-------------|---------|
+| `+` | Addition / list concatenation | QueryField.__add__/__radd__ -> ArithmeticOperator.ADD |
+| `-` | Subtraction | QueryField.__sub__/__rsub__ -> ArithmeticOperator.SUB |
+| `*` | Multiplication | QueryField.__mul__/__rmul__ -> ArithmeticOperator.MUL |
+| `/` | Division | QueryField.__truediv__/__rtruediv__ -> ArithmeticOperator.DIV |
+| `%` | Modulo | QueryField.__mod__/__rmod__ -> ArithmeticOperator.MOD |
+| `^` | Power | QueryField.__pow__/__rpow__ -> ArithmeticOperator.POW |
+
+### Indexing/Slicing (on QueryField)
+
+| Operator | Description | Backing Function |
+|----------|-------------|------------------|
+| `field[idx]` | 1-based index extract | FunctionExpression("array_extract") |
+| `field[a:b]` | 1-based slice | FunctionExpression("array_slice") |
 
 ---
 
@@ -492,31 +572,31 @@ KuzuAlchemy implements Kuzu operators with type safety and proper precedence han
 ### Node Models
 
 ```python
-from kuzualchemy import node, KuzuBaseModel, Field, KuzuDataType
+from kuzualchemy import kuzu_node, KuzuBaseModel, kuzu_field, KuzuDataType
 from typing import Optional, List
 from datetime import datetime
 
-@node("User")  # Table name in Kuzu
+@kuzu_node("User")  # Table name in Kuzu
 class User(KuzuBaseModel):
     # Primary key
-    id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
 
     # Basic fields
-    name: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-    email: Optional[str] = Field(kuzu_type=KuzuDataType.STRING, unique=True, default=None)
-    age: int = Field(kuzu_type=KuzuDataType.INT32, default=0)
+    name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+    email: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True, default=None)
+    age: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
 
     # Boolean fields
-    is_active: bool = Field(kuzu_type=KuzuDataType.BOOL, default=True)
+    is_active: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL, default=True)
 
     # Timestamp fields
-    created_at: datetime = Field(
+    created_at: datetime = kuzu_field(
         kuzu_type=KuzuDataType.TIMESTAMP,
         default=KuzuDefaultFunction.CURRENT_TIMESTAMP
     )
 
     # Array fields
-    tags: Optional[List[str]] = Field(
+    tags: Optional[List[str]] = kuzu_field(
         kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.STRING),
         default=None
     )
@@ -525,12 +605,12 @@ class User(KuzuBaseModel):
 ### Relationship Models
 
 ```python
-from kuzualchemy import relationship, KuzuRelationshipBase
+from kuzualchemy import kuzu_relationship, KuzuRelationshipBase
 
-@relationship("KNOWS", pairs=[(User, User)])
+@kuzu_relationship("KNOWS", pairs=[(User, User)])
 class Knows(KuzuRelationshipBase):
-    since: datetime = Field(kuzu_type=KuzuDataType.TIMESTAMP)
-    strength: float = Field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
+    since: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP)
+    strength: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
 ```
 
 ### Model Methods
@@ -600,7 +680,7 @@ KuzuDataType.STRUCT, KuzuDataType.MAP, KuzuDataType.UNION
 
 ```python
 # Field definition
-field = Field(
+field = kuzu_field(
     # Basic properties
     kuzu_type=KuzuDataType.STRING,
     primary_key=False,
@@ -616,7 +696,7 @@ field = Field(
     check_constraint="LENGTH(field_name) > 0",
 
     # Foreign keys
-    foreign_key=foreign_key(
+    foreign_key=ForeignKeyMetadata(
         target_model=TargetModel,
         target_field="id",
         on_delete=CascadeAction.CASCADE,
@@ -637,7 +717,7 @@ from kuzualchemy.kuzu_orm import ArrayTypeSpecification
 
 class User(KuzuBaseModel):
     # Array field definition
-    tags: List[str] = Field(
+    tags: List[str] = kuzu_field(
         kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.STRING),
         default=None
     )
@@ -650,16 +730,16 @@ from kuzualchemy.constants import KuzuDefaultFunction
 
 class User(KuzuBaseModel):
     # Static defaults
-    status: str = Field(kuzu_type=KuzuDataType.STRING, default="active")
+    status: str = kuzu_field(kuzu_type=KuzuDataType.STRING, default="active")
 
     # Function defaults
-    created_at: datetime = Field(
+    created_at: datetime = kuzu_field(
         kuzu_type=KuzuDataType.TIMESTAMP,
         default=KuzuDefaultFunction.CURRENT_TIMESTAMP
     )
 
     # Factory defaults
-    uuid_field: str = Field(
+    uuid_field: str = kuzu_field(
         kuzu_type=KuzuDataType.UUID,
         default_factory=lambda: str(uuid.uuid4())
     )
@@ -672,26 +752,25 @@ class User(KuzuBaseModel):
 ### Basic Relationships
 
 ```python
-from kuzualchemy import relationship, KuzuRelationshipBase
+from kuzualchemy import kuzu_relationship, KuzuRelationshipBase
 
-@relationship("FOLLOWS", pairs=[(User, User)])
+@kuzu_relationship("FOLLOWS", pairs=[(User, User)])
 class Follows(KuzuRelationshipBase):
-    since: datetime = Field(kuzu_type=KuzuDataType.TIMESTAMP)
-    weight: float = Field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
+    since: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP)
+    weight: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
 ```
 
 ### Multi-Pair Relationships
 
 ```python
 # Multiple relationship pairs
-@relationship("AUTHORED", pairs=[
-    (User, Post),
-    (User, Comment),
+@kuzu_relationship("AUTHORED", pairs=[
+    (User, {Post, Comment}),
     (Organization, Post)
 ])
 class Authored(KuzuRelationshipBase):
-    created_at: datetime = Field(kuzu_type=KuzuDataType.TIMESTAMP)
-    role: str = Field(kuzu_type=KuzuDataType.STRING, default="author")
+    created_at: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP)
+    role: str = kuzu_field(kuzu_type=KuzuDataType.STRING, default="author")
 ```
 
 ### Relationship Usage
@@ -724,9 +803,9 @@ results = filtered.all()
 
 # Method chaining
 results = (Query(User, session=session)
-    .where(query.fields.name.starts_with("A"))
-    .where(query.fields.age.between(20, 40))
-    .order_by(query.fields.name.asc())
+    .where(Query(User, session=session).fields.name.starts_with("A"))
+    .where(Query(User, session=session).fields.age.between(20, 40))
+    .order_by(Query(User, session=session).fields.name.asc())
     .limit(10)
     .all())
 ```
@@ -734,18 +813,22 @@ results = (Query(User, session=session)
 ### Advanced Queries
 
 ```python
-# Aggregation
-query = Query(User, session=session)
-count_query = query.group_by(query.fields.age).having(count() > 1)
+# Aggregation with HAVING: count users by age > 1
+q = Query(User, session=session)
+agg = q.count()  # COUNT(*) AS count
+count_by_age = (
+    q.group_by(q.fields.age)
+     .having(ka.to_int64("count") > 1)  # compare aggregated alias post-WITH using cast
+)
 
-# Joins (relationships)
-query = Query(User, session=session)
-joined = query.join(Follows, User.id == Follows.from_node_id)
+# Relationship join (pattern: join(TargetModel, RelationshipClass, ...))
+q = Query(User, session=session)
+joined = q.join(User, Follows, target_alias="u2")
 
-# Subqueries
-subquery = Query(User, session=session).where(query.fields.age > 30)
+# Subquery: authors older than 30
+subq = Query(User, session=session).where(Query(User, session=session).fields.age > 30)
 main_query = Query(Post, session=session).where(
-    Post.author_id.in_(subquery.select(User.id))
+    Query(Post, session=session).fields.author_id.in_(subq.select("id"))
 )
 ```
 
@@ -795,7 +878,8 @@ one_or_none = query.one_or_none()  # ModelType | None
 exists = query.exists()  # bool
 
 # Count results
-count = query.count()  # int
+count_query = query.count()         # Query with COUNT(*) AS count aggregation
+count = count_query._execute()[0]["count"] if count_query._execute() else 0
 ```
 
 ---
@@ -828,17 +912,15 @@ session.close()
 ### Transaction Management
 
 ```python
-# Manual transactions
-session.begin()
-try:
+# Manual transactions using KuzuTransaction
+from kuzualchemy import KuzuTransaction
+
+with KuzuTransaction(session):
     user = User(id=1, name="Alice")
     session.add(user)
-    session.commit()
-except Exception:
-    session.rollback()
-    raise
+    # Automatic commit on success, rollback on exception
 
-# Context manager
+# Or using session.begin() context manager
 with session.begin():
     user = User(id=1, name="Alice")
     session.add(user)
@@ -919,9 +1001,9 @@ class Status(Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
 
-@node("Account")
+@kuzu_node("Account")
 class Account(BaseModel):  # Automatic enum conversion
-    status: Status = Field(kuzu_type=KuzuDataType.STRING)
+    status: Status = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
     # BaseModel automatically converts enums to/from string values
 ```
@@ -929,15 +1011,15 @@ class Account(BaseModel):  # Automatic enum conversion
 ### Foreign Key Support
 
 ```python
-from kuzualchemy import foreign_key, CascadeAction
+from kuzualchemy import ForeignKeyMetadata, CascadeAction
 
-@node("Post")
+@kuzu_node("Post")
 class Post(KuzuBaseModel):
-    id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-    title: str = Field(kuzu_type=KuzuDataType.STRING)
-    author_id: int = Field(
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    title: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+    author_id: int = kuzu_field(
         kuzu_type=KuzuDataType.INT64,
-        foreign_key=foreign_key(
+        foreign_key=ForeignKeyMetadata(
             target_model=User,
             target_field="id",
             on_delete=CascadeAction.CASCADE
@@ -996,8 +1078,8 @@ Base class for relationship models.
 
 **Methods:**
 - Same as KuzuBaseModel plus relationship-specific functionality
-- `get_from_node_field() -> str`: Get from node field name
-- `get_to_node_field() -> str`: Get to node field name
+- `create_between(from_node, to_node, **properties) -> KuzuRelationshipBase`: Factory to instantiate relationship between nodes
+- `from_node_pk`/`to_node_pk` properties for node primary keys
 
 #### KuzuSession
 Main session class for database operations.
@@ -1034,11 +1116,11 @@ Type-safe query builder.
 
 ### Field Definition
 
-#### Field Function
+#### kuzu_field Function
 Field definition with options:
 
 ```python
-Field(
+kuzu_field(
     default: Any = ...,                                    # Default value
     kuzu_type: Union[KuzuDataType, str, ArrayTypeSpecification], # Kuzu data type
     primary_key: bool = False,                            # Primary key flag
@@ -1056,11 +1138,11 @@ Field(
 
 ### Decorators
 
-#### @node() / @kuzu_node()
+#### @kuzu_node()
 Mark class as Kuzu node:
 
 ```python
-@node(
+@kuzu_node(
     name: str = None,                                    # Node name (defaults to class name)
     abstract: bool = False,                              # Abstract node flag
     compound_indexes: List[CompoundIndex] = None,        # Compound indexes
@@ -1069,11 +1151,11 @@ Mark class as Kuzu node:
 )
 ```
 
-#### @relationship() / @kuzu_relationship()
+#### @kuzu_relationship()
 Mark class as Kuzu relationship:
 
 ```python
-@relationship(
+@kuzu_relationship(
     name: str = None,                                    # Relationship name
     pairs: List[Tuple[Type, Type]] = None,              # Valid node pairs
     multiplicity: RelationshipMultiplicity = MANY_TO_MANY, # Relationship multiplicity

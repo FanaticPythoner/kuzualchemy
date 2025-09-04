@@ -16,19 +16,37 @@ from typing import Any
 
 class DefaultFunctionBase:
     """Base class for all default function types."""
-    
+
     def __init__(self, value: str):
         """
         Initialize a default function.
-        
+
         :param value: The function string value
         :type value: str
         """
         self.value = value
-    
+
     def __str__(self) -> str:
         """Return the function string."""
         return self.value
+
+    def __deepcopy__(self, memo):
+        """Support for deepcopy operations."""
+        return self.__class__(self.value)
+
+    def __copy__(self):
+        """Support for copy operations."""
+        return self.__class__(self.value)
+
+    def __eq__(self, other):
+        """Equality comparison."""
+        if not isinstance(other, self.__class__):
+            return False
+        return self.value == other.value
+
+    def __hash__(self):
+        """Hash support for use in sets and as dict keys."""
+        return hash((self.__class__.__name__, self.value))
 
 
 # ============================================================================

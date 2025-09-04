@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType
 )
-from .kuzu_orm import RelationshipDirection, RelationshipPair
-from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirectionConstants, CypherConstants
+from .kuzu_orm import RelationshipPair
+from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +64,13 @@ class JoinClause:
         
         if self.direction:
             # Handle both enum and string direction values
-            if (self.direction == RelationshipDirectionConstants.OUTGOING or
+            if (self.direction == RelationshipDirection.OUTGOING or
                 (hasattr(self.direction, 'name') and self.direction.name == 'FORWARD')):
                 pattern = JoinPatternConstants.OUTGOING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-            elif (self.direction == RelationshipDirectionConstants.INCOMING or
+            elif (self.direction == RelationshipDirection.INCOMING or
                   (hasattr(self.direction, 'name') and self.direction.name == 'BACKWARD')):
                 pattern = JoinPatternConstants.INCOMING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-            elif self.direction == RelationshipDirectionConstants.BOTH:
+            elif self.direction == RelationshipDirection.BOTH:
                 pattern = JoinPatternConstants.BOTH_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
             else:
                 # Default to outgoing for unknown directions
@@ -330,12 +330,15 @@ class CypherQueryBuilder:
             
             # @@ STEP 3: Build pattern based on direction
             if direction:
-                if direction == RelationshipDirection.FORWARD:
+                if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
                     pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
-                elif direction == RelationshipDirection.BACKWARD:
+                elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
                     pattern = f"({from_alias}:{from_name})<-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
-                else:
+                elif direction == RelationshipDirection.BOTH:
                     pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                else:
+                    # Default to forward direction for unknown directions
+                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
             else:
                 # || S.S.8: Default to forward direction if not specified
                 pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"

@@ -4,10 +4,10 @@ Pytest configuration and shared fixtures for KuzuAlchemy tests.
 
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
 import uuid
+import gc
 from pathlib import Path
 from typing import Generator, Any, Dict, List
 from unittest.mock import Mock, patch
@@ -15,20 +15,45 @@ from unittest.mock import Mock, patch
 import pytest
 
 from kuzualchemy import (
-    node,
-    relationship,
+    kuzu_node,
+    kuzu_relationship,
     KuzuBaseModel,
-    Field,
+    kuzu_field,
     KuzuDataType,
-    foreign_key,
     KuzuSession,
     SessionFactory,
-    get_all_ddl,
-    get_ddl_for_node,
-    get_ddl_for_relationship,
 )
 from kuzualchemy.constants import KuzuDefaultFunction
 from kuzualchemy.test_utilities import initialize_schema
+
+
+@pytest.fixture(autouse=True)
+def global_registry_cleanup():
+    """
+    CRITICAL: Clean up global registry before EVERY test to prevent access violations.
+
+    This prevents registry pollution that causes Windows fatal exceptions.
+    """
+    # Global registry cleanup before every test
+    from kuzualchemy import clear_registry
+    clear_registry()
+    gc.collect()  # Force garbage collection
+
+    yield
+
+    # Also cleanup after test
+    from kuzualchemy import clear_registry
+    clear_registry()
+    gc.collect()
+
+@pytest.fixture(autouse=True)
+def cleanup_connection_pool():
+    """Automatically clean up connection pool after each test to ensure isolation."""
+    yield
+    # Clean up after each test
+    from src.kuzualchemy.connection_pool import close_all_databases
+    close_all_databases()
+
 
 
 @pytest.fixture(scope="session")
@@ -49,6 +74,10 @@ def kuzu_connection(test_db_path: Path) -> Generator[KuzuSession, None, None]:
         yield conn
     finally:
         conn.close()
+        # Clean up connection pool to prevent test isolation issues
+        from src.kuzualchemy.connection_pool import close_all_databases
+        close_all_databases()
+
 
 
 @pytest.fixture(scope="function")
@@ -68,36 +97,36 @@ def session_factory(test_db_path: Path) -> SessionFactory:
 
 
 # Test model definitions
-@node("TestUser")
+@kuzu_node("TestUser")
 class TestUser(KuzuBaseModel):
     """Test user model."""
-    id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-    name: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-    email: str = Field(kuzu_type=KuzuDataType.STRING, unique=True)
-    age: int = Field(kuzu_type=KuzuDataType.INT32, default=0)
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+    email: str = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True)
+    age: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
 
 
-@node("TestPost")
+@kuzu_node("TestPost")
 class TestPost(KuzuBaseModel):
     """Test post model."""
-    id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-    title: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-    content: str = Field(kuzu_type=KuzuDataType.STRING)
-    author_id: int = Field(kuzu_type=KuzuDataType.INT64)
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    title: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+    content: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+    author_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64)
 
 
-@relationship("AUTHORED", pairs=[(TestUser, TestPost)])
+@kuzu_relationship("AUTHORED", pairs=[(TestUser, TestPost)])
 class AuthoredRelationship(KuzuBaseModel):
     """Test authored relationship."""
-    created_at: str = Field(kuzu_type=KuzuDataType.TIMESTAMP, default=KuzuDefaultFunction.CURRENT_TIMESTAMP)
-    is_published: bool = Field(kuzu_type=KuzuDataType.BOOL, default=False)
+    created_at: str = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP, default=KuzuDefaultFunction.CURRENT_TIMESTAMP)
+    is_published: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL, default=False)
 
 
-@relationship("FOLLOWS", pairs=[(TestUser, TestUser)])
+@kuzu_relationship("FOLLOWS", pairs=[(TestUser, TestUser)])
 class FollowsRelationship(KuzuBaseModel):
     """Test follows relationship."""
-    followed_at: str = Field(kuzu_type=KuzuDataType.TIMESTAMP, default=KuzuDefaultFunction.CURRENT_TIMESTAMP)
-    notification_enabled: bool = Field(kuzu_type=KuzuDataType.BOOL, default=True)
+    followed_at: str = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP, default=KuzuDefaultFunction.CURRENT_TIMESTAMP)
+    notification_enabled: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL, default=True)
 
 
 @pytest.fixture(scope="function")

@@ -22,10 +22,12 @@ from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
 
 class DatabaseConstants:
     """Database-related constants."""
-    
+
     DEFAULT_DB_NAME: Final[str] = "kuzu.db"
     MEMORY_DB_PATH: Final[str] = ":memory:"
-    DEFAULT_BUFFER_POOL_SIZE: Final[int] = 1024 * 1024 * 512  # 512MB
+    DEFAULT_BUFFER_POOL_SIZE: Final[int] = 64 * 1024 * 1024   # 64MB (bytes) moderate default
+    DEFAULT_MAX_DB_SIZE: Final[int] = 512 * 1024 * 1024       # 512MB (bytes) — avoid huge VirtualAlloc on Windows
+    PAGE_SIZE_BYTES: Final[int] = 16 * 1024  # 16KB Kuzu buffer manager page size
     DEFAULT_MAX_THREADS: Final[int] = 8
     DEFAULT_CHECKPOINT_THRESHOLD: Final[int] = 1000000
     DEFAULT_COMPRESSION: Final[bool] = True
@@ -79,6 +81,20 @@ class CascadeAction(Enum):
     SET_DEFAULT = "SET DEFAULT"  # Set foreign key to default value
     RESTRICT = "RESTRICT"    # Prevent deletion/update if referenced
     NO_ACTION = "NO ACTION"  # Similar to RESTRICT but deferred
+
+
+class RelationshipMultiplicity(Enum):
+    """
+    Relationship multiplicity types.
+    
+    :class: RelationshipMultiplicity
+    :synopsis: Enumeration of relationship multiplicity constraints
+    """
+    
+    MANY_TO_MANY = "MANY_MANY"
+    MANY_TO_ONE = "MANY_ONE"
+    ONE_TO_MANY = "ONE_MANY"
+    ONE_TO_ONE = "ONE_ONE"
 
 
 # ============================================================================
@@ -595,7 +611,7 @@ class DefaultValueConstants:
 # RELATIONSHIP DIRECTION CONSTANTS
 # ============================================================================
 
-class RelationshipDirectionConstants:
+class RelationshipDirection:
     """Constants for relationship directions."""
 
     # @@ STEP 1: Define direction symbols
@@ -607,13 +623,17 @@ class RelationshipDirectionConstants:
     OUTGOING: Final[str] = "outgoing"
     INCOMING: Final[str] = "incoming"
     BOTH: Final[str] = "both"
+    
+    # @@ STEP 3: Define direction aliases
+    FORWARD: Final[str] = "forward"
+    BACKWARD: Final[str] = "backward"
 
 
 # ============================================================================
 # KUZU DATA TYPE CONSTANTS
 # ============================================================================
 
-class KuzuDataTypeConstants:
+class KuzuDataType:
     """Constants for Kuzu data types."""
 
     # @@ STEP 1: Define integer types
@@ -666,6 +686,7 @@ class KuzuDataTypeConstants:
     # @@ STEP 10: Define node/relationship references
     NODE: Final[str] = "NODE"
     REL: Final[str] = "REL"
+
 
 
 # ============================================================================
@@ -769,6 +790,42 @@ class JoinPatternConstants:
 
 
 # ============================================================================
+# REGISTRY RESOLUTION CONSTANTS
+# ============================================================================
+
+class RegistryResolutionConstants:
+    """Constants for the deferred registry resolution system."""
+
+    # @@ STEP 1: Define resolution states
+    RESOLUTION_STATE_UNRESOLVED: Final[str] = "unresolved"
+    RESOLUTION_STATE_RESOLVING: Final[str] = "resolving"
+    RESOLUTION_STATE_RESOLVED: Final[str] = "resolved"
+    RESOLUTION_STATE_ERROR: Final[str] = "error"
+
+    # @@ STEP 2: Define resolution phases
+    PHASE_REGISTRATION: Final[str] = "registration"
+    PHASE_STRING_RESOLUTION: Final[str] = "string_resolution"
+    PHASE_DEPENDENCY_ANALYSIS: Final[str] = "dependency_analysis"
+    PHASE_TOPOLOGICAL_SORT: Final[str] = "topological_sort"
+    PHASE_FINALIZED: Final[str] = "finalized"
+
+    # @@ STEP 3: Define target model resolution types
+    TARGET_TYPE_STRING: Final[str] = "string"
+    TARGET_TYPE_CLASS: Final[str] = "class"
+    TARGET_TYPE_CALLABLE: Final[str] = "callable"
+
+    # @@ STEP 4: Define circular dependency handling
+    CIRCULAR_DEPENDENCY_DETECTED: Final[str] = "circular_dependency_detected"
+    SELF_REFERENCE_ALLOWED: Final[str] = "self_reference_allowed"
+
+    # @@ STEP 5: Define resolution error types
+    ERROR_TARGET_NOT_FOUND: Final[str] = "target_model_not_found"
+    ERROR_CIRCULAR_DEPENDENCY: Final[str] = "circular_dependency_error"
+    ERROR_INVALID_TARGET_TYPE: Final[str] = "invalid_target_type"
+    ERROR_RESOLUTION_TIMEOUT: Final[str] = "resolution_timeout"
+
+
+# ============================================================================
 # VALIDATION MESSAGE CONSTANTS
 # ============================================================================
 
@@ -815,8 +872,8 @@ __all__ = [
     "EnumCacheConstants",
     "FunctionTypeConstants",
     "DefaultValueConstants",
-    "RelationshipDirectionConstants",
-    "KuzuDataTypeConstants",
+    "RelationshipDirection",
+    "KuzuDataType",
     "ConstraintConstants",
     "ArrayTypeConstants",
     "QueryFieldConstants",

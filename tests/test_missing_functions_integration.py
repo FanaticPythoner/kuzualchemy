@@ -17,10 +17,10 @@ from datetime import datetime, date
 import pytest
 
 from kuzualchemy import (
-    node,
-    relationship,
+    kuzu_node,
+    kuzu_relationship,
     KuzuBaseModel,
-    Field,
+    kuzu_field,
     KuzuDataType,
     KuzuSession,
     get_all_ddl,
@@ -72,11 +72,11 @@ class TestIntervalFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("IntervalTestNode")
+        @kuzu_node("IntervalTestNode")
         class IntervalTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            duration_value: int = Field(kuzu_type=KuzuDataType.INT32)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            duration_value: int = kuzu_field(kuzu_type=KuzuDataType.INT32)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.IntervalTestNode = IntervalTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -85,12 +85,17 @@ class TestIntervalFunctionsIntegration:
     def teardown_method(self):
         """Clean up test database."""
         if Path(self.temp_db).exists():
-            shutil.rmtree(self.temp_db, ignore_errors=True)
+            shutil.rmtree(path=self.temp_db, ignore_errors=True)
 
     def test_interval_functions_real_execution(self):
         """Test ALL interval functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.IntervalTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.IntervalTestNode(id=1, duration_value=5, name="test")
@@ -151,7 +156,12 @@ class TestIntervalFunctionsIntegration:
     def test_interval_functions_with_field_values(self):
         """Test interval functions using actual field values from database."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.IntervalTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with different duration values
         for i in range(1, 6):
@@ -184,13 +194,13 @@ class TestArrayFunctionsIntegration:
     def setup_method(self):
         """Set up real database for testing."""
         # For now, let's test with LIST types and cast them to ARRAY in the query
-        @node("ArrayTestNode")
+        @kuzu_node("ArrayTestNode")
         class ArrayTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             # Use LIST types and cast to ARRAY in queries
-            vector1: List[float] = Field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.DOUBLE))
-            vector2: List[float] = Field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.DOUBLE))
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            vector1: List[float] = kuzu_field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.DOUBLE))
+            vector2: List[float] = kuzu_field(kuzu_type=ArrayTypeSpecification(element_type=KuzuDataType.DOUBLE))
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.ArrayTestNode = ArrayTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -204,7 +214,12 @@ class TestArrayFunctionsIntegration:
     def test_array_functions_real_execution(self):
         """Test ALL array functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.ArrayTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with actual arrays
         test_node = self.ArrayTestNode(
@@ -277,7 +292,12 @@ class TestArrayFunctionsIntegration:
     def test_array_cross_product_real_execution(self):
         """Test array cross product with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.ArrayTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with 3D vectors for cross product
         test_node = self.ArrayTestNode(
@@ -307,13 +327,13 @@ class TestUtilityFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("UtilityTestNode")
+        @kuzu_node("UtilityTestNode")
         class UtilityTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            nullable_field: Optional[str] = Field(kuzu_type=KuzuDataType.STRING, default=None)
-            non_null_field: str = Field(kuzu_type=KuzuDataType.STRING, not_null=True)
-            numeric_field: int = Field(kuzu_type=KuzuDataType.INT32)
-            boolean_field: bool = Field(kuzu_type=KuzuDataType.BOOL)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            nullable_field: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
+            non_null_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+            numeric_field: int = kuzu_field(kuzu_type=KuzuDataType.INT32)
+            boolean_field: bool = kuzu_field(kuzu_type=KuzuDataType.BOOL)
 
         self.UtilityTestNode = UtilityTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -327,7 +347,12 @@ class TestUtilityFunctionsIntegration:
     def test_coalesce_function_real_execution(self):
         """Test COALESCE function with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UtilityTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with NULL and non-NULL values
         test_node1 = self.UtilityTestNode(
@@ -374,7 +399,12 @@ class TestUtilityFunctionsIntegration:
     def test_ifnull_function_real_execution(self):
         """Test IFNULL function with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UtilityTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.UtilityTestNode(
@@ -404,7 +434,12 @@ class TestUtilityFunctionsIntegration:
     def test_typeof_function_real_execution(self):
         """Test TYPEOF function with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UtilityTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.UtilityTestNode(
@@ -446,7 +481,12 @@ class TestUtilityFunctionsIntegration:
     def test_count_if_function_real_execution(self):
         """Test COUNT_IF function with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UtilityTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with different boolean values
         for i in range(1, 6):
@@ -479,10 +519,10 @@ class TestHashFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("HashTestNode")
+        @kuzu_node("HashTestNode")
         class HashTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            text_data: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            text_data: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.HashTestNode = HashTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -496,7 +536,12 @@ class TestHashFunctionsIntegration:
     def test_hash_functions_real_execution(self):
         """Test ALL hash functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.HashTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.HashTestNode(
@@ -540,10 +585,10 @@ class TestUUIDFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("UUIDTestNode")
+        @kuzu_node("UUIDTestNode")
         class UUIDTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            uuid_string: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            uuid_string: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.UUIDTestNode = UUIDTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -557,7 +602,12 @@ class TestUUIDFunctionsIntegration:
     def test_uuid_functions_real_execution(self):
         """Test ALL UUID functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UUIDTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with valid UUID string
         test_uuid_string = "550e8400-e29b-41d4-a716-446655440000"
@@ -597,12 +647,12 @@ class TestCastExpressionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("CastTestNode")
+        @kuzu_node("CastTestNode")
         class CastTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            string_number: str = Field(kuzu_type=KuzuDataType.STRING)
-            integer_value: int = Field(kuzu_type=KuzuDataType.INT32)
-            float_value: float = Field(kuzu_type=KuzuDataType.DOUBLE)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            string_number: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+            integer_value: int = kuzu_field(kuzu_type=KuzuDataType.INT32)
+            float_value: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE)
 
         self.CastTestNode = CastTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -616,7 +666,12 @@ class TestCastExpressionsIntegration:
     def test_cast_expressions_real_execution(self):
         """Test ALL CAST expressions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.CastTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.CastTestNode(
@@ -666,10 +721,10 @@ class TestMapFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("MapTestNode")
+        @kuzu_node("MapTestNode")
         class MapTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.MapTestNode = MapTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -683,7 +738,12 @@ class TestMapFunctionsIntegration:
     def test_map_functions_real_execution(self):
         """Test ALL map functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.MapTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.MapTestNode(id=1, name="map_test")
@@ -745,10 +805,10 @@ class TestUnionFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("UnionTestNode")
+        @kuzu_node("UnionTestNode")
         class UnionTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.UnionTestNode = UnionTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -762,7 +822,12 @@ class TestUnionFunctionsIntegration:
     def test_union_functions_real_execution(self):
         """Test ALL union functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.UnionTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.UnionTestNode(id=1, name="union_test")
@@ -798,10 +863,10 @@ class TestStructFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("StructTestNode")
+        @kuzu_node("StructTestNode")
         class StructTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.StructTestNode = StructTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -815,7 +880,12 @@ class TestStructFunctionsIntegration:
     def test_struct_functions_real_execution(self):
         """Test ALL struct functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.StructTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_node = self.StructTestNode(id=1, name="struct_test")
@@ -852,14 +922,14 @@ class TestNodeRelFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("NodeTestNode")
+        @kuzu_node("NodeTestNode")
         class NodeTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
-        @relationship("TEST_REL", pairs=[(NodeTestNode, NodeTestNode)])
+        @kuzu_relationship("TEST_REL", pairs=[(NodeTestNode, NodeTestNode)])
         class TestRel(KuzuBaseModel):
-            weight: float = Field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
+            weight: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
 
         self.NodeTestNode = NodeTestNode
         self.TestRel = TestRel
@@ -874,7 +944,14 @@ class TestNodeRelFunctionsIntegration:
     def test_node_rel_functions_real_execution(self):
         """Test ALL node/rel functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+        ddl_statements.append(get_ddl_for_node(self.NodeTestNode))
+        ddl_statements.append(get_ddl_for_relationship(self.TestRel))
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         node1 = self.NodeTestNode(id=1, name="Node1")
@@ -940,14 +1017,14 @@ class TestRecursiveRelFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("PathTestNode")
+        @kuzu_node("PathTestNode")
         class PathTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            name: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
-        @relationship("PATH_REL", pairs=[(PathTestNode, PathTestNode)])
+        @kuzu_relationship("PATH_REL", pairs=[(PathTestNode, PathTestNode)])
         class PathRel(KuzuBaseModel):
-            weight: float = Field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
+            weight: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=1.0)
 
         self.PathTestNode = PathTestNode
         self.PathRel = PathRel
@@ -962,7 +1039,14 @@ class TestRecursiveRelFunctionsIntegration:
     def test_recursive_rel_functions_real_execution(self):
         """Test ALL recursive rel functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+        ddl_statements = []
+        ddl_statements.append(get_ddl_for_node(self.PathTestNode))
+        ddl_statements.append(get_ddl_for_relationship(self.PathRel))
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data - create a path A -> B -> C
         node_a = self.PathTestNode(id=1, name="A")
@@ -1027,12 +1111,12 @@ class TestBlobFunctionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("BlobTestNode")
+        @kuzu_node("BlobTestNode")
         class BlobTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            text_data: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            text_data: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
             # Remove default value for blob to avoid handler issue
-            blob_data: Optional[bytes] = Field(kuzu_type=KuzuDataType.BLOB, default=None)
+            blob_data: Optional[bytes] = kuzu_field(kuzu_type=KuzuDataType.BLOB, default=None)
 
         self.BlobTestNode = BlobTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -1046,7 +1130,12 @@ class TestBlobFunctionsIntegration:
     def test_blob_functions_real_execution(self):
         """Test ALL blob functions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.BlobTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data
         test_string = "Hello, Blob World!"
@@ -1109,12 +1198,12 @@ class TestCaseExpressionsIntegration:
 
     def setup_method(self):
         """Set up real database for testing."""
-        @node("CaseTestNode")
+        @kuzu_node("CaseTestNode")
         class CaseTestNode(KuzuBaseModel):
-            id: int = Field(kuzu_type=KuzuDataType.INT64, primary_key=True)
-            status: str = Field(kuzu_type=KuzuDataType.STRING)
-            score: int = Field(kuzu_type=KuzuDataType.INT32)
-            category: str = Field(kuzu_type=KuzuDataType.STRING)
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+            status: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+            score: int = kuzu_field(kuzu_type=KuzuDataType.INT32)
+            category: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
         self.CaseTestNode = CaseTestNode
         self.temp_db = tempfile.mkdtemp()
@@ -1128,7 +1217,12 @@ class TestCaseExpressionsIntegration:
     def test_case_expressions_real_execution(self):
         """Test ALL CASE expressions with REAL database execution."""
         session = KuzuSession(db_path=self.db_path)
-        initialize_schema(session)
+
+        # Generate DDL only for models defined in this test class
+        from kuzualchemy.kuzu_orm import get_ddl_for_node
+        ddl_statements = [get_ddl_for_node(self.CaseTestNode)]
+        specific_ddl = "\n".join(ddl_statements)
+        initialize_schema(session, ddl=specific_ddl)
 
         # Insert test data with different statuses and scores
         test_nodes = [

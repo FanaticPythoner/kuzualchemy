@@ -5,7 +5,8 @@ Field descriptors and query field helpers for Kuzu query system.
 from typing import Any, Type, Optional, List, Tuple
 from .kuzu_query_expressions import (
     ArithmeticExpression, FilterExpression, FieldFilterExpression, BetweenExpression,
-    ComparisonOperator, FunctionExpression, OrderDirection, TemporalExpression, CastExpression, CaseExpression
+    ComparisonOperator, FunctionExpression, OrderDirection, TemporalExpression,
+    CastExpression, CaseExpression
 )
 from .constants import QueryFieldConstants, ValidationMessageConstants
 
@@ -255,7 +256,9 @@ class QueryField:
         from .kuzu_query_expressions import FunctionExpression
         return FunctionExpression("regexp_matches", [self, pattern])
 
-    def regexp_replace(self, pattern: str, replacement: str, options: str | None = None) -> 'FunctionExpression':
+    def regexp_replace(
+        self, pattern: str, replacement: str, options: Optional[str] = None
+    ) -> 'FunctionExpression':
         """Replace the matching part of this field with replacement.
 
         Args:
@@ -286,7 +289,9 @@ class QueryField:
         from .kuzu_query_expressions import FunctionExpression
         return FunctionExpression("regexp_extract_all", [self, pattern, group])
 
-    def regexp_split_to_array(self, pattern: str, options: str | None = None) -> 'FunctionExpression':
+    def regexp_split_to_array(
+        self, pattern: str, options: Optional[str] = None
+    ) -> 'FunctionExpression':
         """Split this field along the regex and extract all occurrences between regex.
 
         Args:

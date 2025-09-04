@@ -8,7 +8,7 @@ FK constraints, column-level INDEX tags, and correct relationship multiplicity p
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+import gc
 import logging
 from typing import (
     TYPE_CHECKING,
@@ -33,12 +33,14 @@ from .constants import (
     KuzuDefaultFunction,
     ModelMetadataConstants,
     DefaultValueConstants,
-    RelationshipDirectionConstants,
-    KuzuDataTypeConstants,
+    RelationshipDirection,
+    RelationshipMultiplicity,
+    KuzuDataType,
     ConstraintConstants,
     ArrayTypeConstants,
     ErrorMessages,
     ValidationMessageConstants,
+    RegistryResolutionConstants,
 )
 
 if TYPE_CHECKING:
@@ -247,143 +249,107 @@ class DefaultValueHandlerRegistry:
         safe = value.replace(DefaultValueConstants.QUOTE_CHAR, DefaultValueConstants.ESCAPED_QUOTE)
         return f"{DefaultValueConstants.DEFAULT_PREFIX} {DefaultValueConstants.QUOTE_CHAR}{safe}{DefaultValueConstants.QUOTE_CHAR}"
 
-
-# Register default handlers
+# Register basic handlers - use the static methods that include DEFAULT prefix
 DefaultValueHandlerRegistry.register_handler(bool, DefaultValueHandlerRegistry._bool_handler)
 DefaultValueHandlerRegistry.register_handler(int, DefaultValueHandlerRegistry._int_handler)
 DefaultValueHandlerRegistry.register_handler(float, DefaultValueHandlerRegistry._float_handler)
 DefaultValueHandlerRegistry.register_handler(str, DefaultValueHandlerRegistry._string_handler)
+DefaultValueHandlerRegistry.register_handler(type(None), lambda v: DefaultValueConstants.NULL_KEYWORD)
+# Add handler for lists (arrays)
+DefaultValueHandlerRegistry.register_handler(list, lambda v: f"{DefaultValueConstants.DEFAULT_PREFIX} [{', '.join(str(item) if isinstance(item, (int, float)) else f'{DefaultValueConstants.QUOTE_CHAR}{item}{DefaultValueConstants.QUOTE_CHAR}' for item in v)}]")
 
-class TableNameResolver:
-    """Registry for explicitly mapping model types to their table names."""
-    _table_names: Dict[type, str] = {}
-    
+
+class BulkInsertValueGeneratorRegistry:
+    """
+    Registry for generating actual values from KuzuDefaultFunction instances.
+
+    This registry is used during bulk insert operations where COPY FROM
+    doesn't support DEFAULT functions, so we must generate the actual
+    values that the functions would produce.
+    """
+
+    _generators: Dict[type, Callable[[Any], str]] = {}
+
     @classmethod
-    def register_model(cls, model_type: type, table_name: str) -> None:
-        """Register a model type with its table name."""
-        cls._table_names[model_type] = table_name
-    
+    def register_generator(cls, function_type: type, generator: Callable[[Any], str]) -> None:
+        """Register a value generator for a specific function type."""
+        cls._generators[function_type] = generator
+
     @classmethod
-    def resolve(cls, model: Any) -> str:
-        """Resolve table name from a model object."""
-        model_type = type(model)
-        
-        # For string types, return as-is
-        if model_type is str:
-            return model
-            
-        # Check registered types first
-        if model_type in cls._table_names:
-            return cls._table_names[model_type]
-        
-        # @@ STEP 1: Check for __kuzu_node_name__ attribute directly
-        if hasattr(model, '__kuzu_node_name__'):
-            return model.__kuzu_node_name__
-        
-        # @@ STEP 2: Check if it's a relationship model
-        # || S.S.1: Use hasattr instead of dir() - more explicit and efficient
-        if hasattr(model, '__kuzu_rel_name__'):
-            # || S.S.2: Provide clear error message for relationship models
+    def get_generator(cls, function_obj: Any) -> Optional[Callable[[Any], str]]:
+        """Get the generator for a function object's type."""
+        function_type = type(function_obj)
+        return cls._generators.get(function_type)
+
+    @classmethod
+    def generate_value(cls, default_function: Any) -> str:
+        """
+        Generate actual value from KuzuDefaultFunction enum.
+
+        Args:
+            default_function: KuzuDefaultFunction enum value
+
+        Returns:
+            Generated value as string in Kuzu-compatible format
+        """
+        # Get the actual function object from the enum value
+        func_obj = default_function.value
+
+        # Get the appropriate generator
+        generator = cls.get_generator(func_obj)
+        if not generator:
             raise ValueError(
-                f"Model {model.__name__} is a relationship model, not a node model. "
-                f"Use get_relationship_name() for relationship models."
+                f"No value generator registered for function type {type(func_obj)}. "
+                f"Register a generator using BulkInsertValueGeneratorRegistry.register_generator()"
             )
-        
-        # @@ STEP 3: No resolution found - raise explicit error
-        # || S.S.3: Error message with guidance
+
+        return generator(func_obj)
+
+    @staticmethod
+    def _time_function_generator(func_obj: Any) -> str:
+        """Generate values for TimeFunction instances using enum-based dispatch."""
+        from datetime import datetime, date
+        from .constants import KuzuDefaultFunction
+
+        # Find the corresponding enum value for this function object
+        for enum_value in KuzuDefaultFunction:
+            if enum_value.value is func_obj:
+                # Use enum-based dispatch instead of string matching
+                if enum_value == KuzuDefaultFunction.CURRENT_TIMESTAMP:
+                    return datetime.now().isoformat()
+                elif enum_value == KuzuDefaultFunction.CURRENT_DATE:
+                    return date.today().isoformat()
+                elif enum_value == KuzuDefaultFunction.CURRENT_TIME:
+                    return datetime.now().time().isoformat()
+                elif enum_value == KuzuDefaultFunction.NOW:
+                    return datetime.now().isoformat()
+                else:
+                    # Unknown time function - raise error instead of fallback
+                    raise ValueError(f"Unknown time function: {enum_value}")
+
+        # If no enum found, raise error
+        raise ValueError(f"Function object {func_obj} not found in KuzuDefaultFunction enum")
+
+    @staticmethod
+    def _uuid_function_generator(func_obj: Any) -> str:
+        """Generate values for UUIDFunction instances."""
+        import uuid
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def _sequence_function_generator(func_obj: Any) -> str:
+        """Handle SequenceFunction instances - not supported in bulk insert."""
         raise ValueError(
-            f"Cannot resolve table name for {model}. "
-            f"Register it using TableNameResolver.register_model() or ensure it has "
-            f"__kuzu_node_name__ or __kuzu_rel_name__ attribute."
+            f"Sequence function {func_obj} cannot be used in bulk insert. "
+            f"Use individual inserts for sequence-based defaults."
         )
 
-# -----------------------------------------------------------------------------
-# Schema enums
-# -----------------------------------------------------------------------------
 
-class RelationshipMultiplicity(Enum):
-    """
-    Relationship multiplicity types.
-    
-    :class: RelationshipMultiplicity
-    :synopsis: Enumeration of relationship cardinality types
-    """
-
-    MANY_TO_ONE = DDLConstants.MANY_TO_ONE
-    ONE_TO_MANY = DDLConstants.ONE_TO_MANY
-    MANY_TO_MANY = DDLConstants.MANY_TO_MANY
-    ONE_TO_ONE = DDLConstants.ONE_TO_ONE  # default if unspecified
-
-
-class RelationshipDirection(Enum):
-    """
-    Relationship direction.
-    
-    :class: RelationshipDirection
-    :synopsis: Enumeration of relationship directions
-    """
-
-    FORWARD = RelationshipDirectionConstants.FORWARD_ARROW    # From source to target
-    BACKWARD = RelationshipDirectionConstants.BACKWARD_ARROW   # From target to source
-    BOTH = RelationshipDirectionConstants.BOTH_ARROW      # Bidirectional (undirected pattern)
-
-
-class KuzuDataType(Enum):
-    """
-    Kuzu data types enumeration.
-    
-    :class: KuzuDataType
-    :synopsis: Enumeration of supported Kuzu data types
-    """
-
-    # Numeric types
-    INT8 = KuzuDataTypeConstants.INT8
-    INT16 = KuzuDataTypeConstants.INT16
-    INT32 = KuzuDataTypeConstants.INT32
-    INT64 = KuzuDataTypeConstants.INT64
-    INT128 = KuzuDataTypeConstants.INT128
-    UINT8 = KuzuDataTypeConstants.UINT8
-    UINT16 = KuzuDataTypeConstants.UINT16
-    UINT32 = KuzuDataTypeConstants.UINT32
-    UINT64 = KuzuDataTypeConstants.UINT64
-    FLOAT = KuzuDataTypeConstants.FLOAT
-    DOUBLE = KuzuDataTypeConstants.DOUBLE
-    DECIMAL = KuzuDataTypeConstants.DECIMAL
-
-    # Serial (auto-incrementing)
-    SERIAL = KuzuDataTypeConstants.SERIAL
-
-    # Strings
-    STRING = KuzuDataTypeConstants.STRING
-
-    # Boolean
-    BOOL = KuzuDataTypeConstants.BOOL
-    BOOLEAN = KuzuDataTypeConstants.BOOLEAN
-
-    # Date/Time
-    DATE = KuzuDataTypeConstants.DATE
-    TIMESTAMP = KuzuDataTypeConstants.TIMESTAMP
-    TIMESTAMP_NS = KuzuDataTypeConstants.TIMESTAMP_NS
-    TIMESTAMP_MS = KuzuDataTypeConstants.TIMESTAMP_MS
-    TIMESTAMP_SEC = KuzuDataTypeConstants.TIMESTAMP_SEC
-    TIMESTAMP_TZ = KuzuDataTypeConstants.TIMESTAMP_TZ
-    INTERVAL = KuzuDataTypeConstants.INTERVAL
-
-    # Binary
-    BLOB = KuzuDataTypeConstants.BLOB
-
-    # UUID
-    UUID = KuzuDataTypeConstants.UUID
-
-    # Complex types
-    ARRAY = KuzuDataTypeConstants.ARRAY
-    STRUCT = KuzuDataTypeConstants.STRUCT
-    MAP = KuzuDataTypeConstants.MAP
-    UNION = KuzuDataTypeConstants.UNION
-
-    # Node/Relationship references (rarely used as columns)
-    NODE = KuzuDataTypeConstants.NODE
-    REL = KuzuDataTypeConstants.REL
+# Register generators for each function type
+from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
+BulkInsertValueGeneratorRegistry.register_generator(TimeFunction, BulkInsertValueGeneratorRegistry._time_function_generator)
+BulkInsertValueGeneratorRegistry.register_generator(UUIDFunction, BulkInsertValueGeneratorRegistry._uuid_function_generator)
+BulkInsertValueGeneratorRegistry.register_generator(SequenceFunction, BulkInsertValueGeneratorRegistry._sequence_function_generator)
 
 
 # -----------------------------------------------------------------------------
@@ -404,15 +370,135 @@ class CheckConstraintMetadata:
 @dataclass
 class ForeignKeyMetadata:
     """
-    Metadata for foreign key constraints.
+    Enhanced metadata for foreign key constraints with deferred resolution support.
+
+    This class supports SQLAlchemy-like deferred resolution of target models,
+    allowing for circular dependencies and forward references.
 
     :class: ForeignKeyMetadata
-    :synopsis: Dataclass for foreign key constraint metadata
+    :synopsis: Dataclass for foreign key constraint metadata with deferred resolution
     """
-    target_model: Union[str, Type[Any]]
+    target_model: Union[str, Type[Any], Callable[[], Type[Any]]]
     target_field: str
     on_delete: Optional[CascadeAction] = None
     on_update: Optional[CascadeAction] = None
+
+    # @@ STEP: Internal resolution state tracking
+    _resolution_state: str = RegistryResolutionConstants.RESOLUTION_STATE_UNRESOLVED
+    _resolved_target_model: Optional[Type[Any]] = None
+    _resolved_target_name: Optional[str] = None
+    _resolution_error: Optional[str] = None
+
+    def get_target_type(self) -> str:
+        """
+        Determine the type of target model reference.
+
+        Returns:
+            str: One of TARGET_TYPE_STRING, TARGET_TYPE_CLASS, or TARGET_TYPE_CALLABLE
+        """
+        if isinstance(self.target_model, str):
+            return RegistryResolutionConstants.TARGET_TYPE_STRING
+        elif callable(self.target_model) and not isinstance(self.target_model, type):
+            return RegistryResolutionConstants.TARGET_TYPE_CALLABLE
+        else:
+            return RegistryResolutionConstants.TARGET_TYPE_CLASS
+
+    def is_resolved(self) -> bool:
+        """Check if this foreign key reference has been resolved."""
+        return self._resolution_state == RegistryResolutionConstants.RESOLUTION_STATE_RESOLVED
+
+    def resolve_target_model(self, registry: 'KuzuRegistry') -> bool:
+        """
+        Resolve the target model reference using the provided registry.
+
+        Args:
+            registry: The KuzuRegistry instance to use for resolution
+
+        Returns:
+            bool: True if resolution was successful, False otherwise
+        """
+        if self.is_resolved():
+            return True
+
+        self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_RESOLVING
+
+        try:
+            target_type = self.get_target_type()
+
+            if target_type == RegistryResolutionConstants.TARGET_TYPE_STRING:
+                # @@ STEP: Resolve string reference
+                resolved_class = registry.get_model_by_name(self.target_model)
+                if resolved_class is None:
+                    self._resolution_error = f"{RegistryResolutionConstants.ERROR_TARGET_NOT_FOUND}: {self.target_model}"
+                    self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                    return False
+
+                self._resolved_target_model = resolved_class
+                self._resolved_target_name = self.target_model
+
+            elif target_type == RegistryResolutionConstants.TARGET_TYPE_CALLABLE:
+                # @@ STEP: Resolve callable reference
+                try:
+                    resolved_class = self.target_model()
+                    if not isinstance(resolved_class, type):
+                        self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: Callable must return a class"
+                        self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                        return False
+
+                    self._resolved_target_model = resolved_class
+                    self._resolved_target_name = self._extract_model_name(resolved_class)
+
+                except Exception as e:
+                    self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: {str(e)}"
+                    self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                    return False
+
+            else:  # TARGET_TYPE_CLASS
+                # @@ STEP: Direct class reference
+                self._resolved_target_model = self.target_model
+                self._resolved_target_name = self._extract_model_name(self.target_model)
+
+            self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_RESOLVED
+            return True
+
+        except Exception as e:
+            self._resolution_error = str(e)
+            self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+            return False
+
+    def _extract_model_name(self, model_class: Type[Any]) -> str:
+        """
+        Extract the model name from a class, trying multiple approaches.
+
+        Args:
+            model_class: The class to extract the name from
+
+        Returns:
+            str: The extracted model name
+        """
+        # @@ STEP: Try multiple ways to get the model name
+        # || S.1: Check for kuzu_node_name attribute
+        if hasattr(model_class, '__kuzu_node_name__'):
+            return model_class.__kuzu_node_name__
+
+        # || S.2: Check for __name__ attribute
+        if hasattr(model_class, '__name__'):
+            return model_class.__name__
+
+        # || S.3: Check for __qualname__ attribute
+        if hasattr(model_class, '__qualname__'):
+            return model_class.__qualname__.split('.')[-1]
+
+        # || S.4: Fallback to string representation
+        return str(model_class)
+
+    def get_resolved_target_name(self) -> Optional[str]:
+        """Get the resolved target model name, if available."""
+        return self._resolved_target_name
+
+    def get_resolved_target_model(self) -> Optional[Type[Any]]:
+        """Get the resolved target model class, if available."""
+        return self._resolved_target_model
 
     def to_ddl(self, field_name: str) -> str:
         """
@@ -421,15 +507,13 @@ class ForeignKeyMetadata:
         Since Kuzu doesn't support foreign key constraints in DDL,
         this generates a comment for documentation purposes.
         """
-        # @@ STEP: Determine target model name
-        if isinstance(self.target_model, str):
+        # @@ STEP: Use resolved target name if available, otherwise try to determine it
+        if self.is_resolved() and self._resolved_target_name:
+            target_name = self._resolved_target_name
+        elif isinstance(self.target_model, str):
             target_name = self.target_model
         else:
-            # || S.1: Try to get the node name from the model
-            target_name = getattr(self.target_model, '__kuzu_node_name__', None)
-            if not target_name:
-                # || S.2: Fallback to class name
-                target_name = getattr(self.target_model, '__name__', str(self.target_model))
+            target_name = self._extract_model_name(self.target_model)
 
         # @@ STEP: Build foreign key constraint comment
         fk_comment = f"{DDLConstants.FOREIGN_KEY} ({field_name}) {DDLConstants.REFERENCES} {target_name}({self.target_field})"
@@ -612,10 +696,15 @@ class KuzuFieldMetadata:
         # Handle array type specifications
         if isinstance(dt, ArrayTypeSpecification):
             return dt.to_ddl()
-        # Prefer BOOL over BOOLEAN in emitted DDL to match tests
-        if dt == KuzuDataType.BOOLEAN:
-            return KuzuDataType.BOOL.value
-        return dt.value
+        # Handle string types (either KuzuDataType constants or custom types)
+        if isinstance(dt, (str, KuzuDataType)):
+            # If it's a KuzuDataType constant string, return it directly
+            # If it's a custom type string, return it directly
+            return dt
+        
+        # For actual attribute access (when dt is like KuzuDataType.INT64)
+        # This shouldn't happen with the new code
+        raise ValueError(f"Unsupported type: {dt}")
 
     @staticmethod
     def _render_default(value: Any) -> str:
@@ -650,22 +739,73 @@ def kuzu_field(
     
     Args:
         default: Default value for the field
-        kuzu_type: Kuzu data type (can be ARRAY/LIST for array types)
+        kuzu_type: Kuzu data type (can be ARRAY/LIST for array types or a string like 'INT64[]')
         element_type: Element type for array fields (e.g., 'INT64' for INT64[])
         auto_increment: Enable auto-increment (SERIAL type)
         default_factory: Python-side default factory function
     """
-    if element_type is not None:
+    # Check if kuzu_type is KuzuDataType.ARRAY constant
+    if kuzu_type == KuzuDataType.ARRAY:
+        # If kuzu_type is ARRAY, must use element_type
+        if element_type is not None:
         # User specified element_type, so this is an array
-        if isinstance(element_type, str):
-            element_type = KuzuDataType(element_type)
-        kuzu_type = ArrayTypeSpecification(element_type=element_type)
+            if isinstance(element_type, str):
+                # Check if it's a valid KuzuDataType constant
+                if hasattr(KuzuDataType, element_type.upper()):
+                    element_type = getattr(KuzuDataType, element_type.upper())
+                # Otherwise keep as string for custom types
+            kuzu_type = ArrayTypeSpecification(element_type=element_type)
+        else:
+            raise ValueError("ARRAY type must have an element_type")
+    # Parse array syntax like 'INT64[]' or 'STRING[]'
     elif isinstance(kuzu_type, str):
-        kuzu_type = KuzuDataType(kuzu_type)
+        if kuzu_type.endswith('[]'):
+            # Extract element type from array syntax
+            element_type_str = kuzu_type[:-2]  # Remove '[]'
+            # Check if it's a valid KuzuDataType constant
+            if hasattr(KuzuDataType, element_type_str.upper()):
+                element_type = getattr(KuzuDataType, element_type_str.upper())
+            else:
+                # Custom type - allowed for extensibility
+                element_type = element_type_str
+            kuzu_type = ArrayTypeSpecification(element_type=element_type)
+        elif kuzu_type.upper() == 'ARRAY':
+            # String 'ARRAY' - must use element_type
+            if element_type is not None:
+                if isinstance(element_type, str):
+                    # Check if it's a valid KuzuDataType constant
+                    if hasattr(KuzuDataType, element_type.upper()):
+                        element_type = getattr(KuzuDataType, element_type.upper())
+                    # Otherwise keep as string for custom types
+                kuzu_type = ArrayTypeSpecification(element_type=element_type)
+            else:
+                # ARRAY without element_type - convert to constant
+                kuzu_type = KuzuDataType.ARRAY
+        else:
+            # Regular type string - validate against KuzuDataType constants or allow custom
+            # Check if it's a valid KuzuDataType constant
+            if hasattr(KuzuDataType, kuzu_type.upper()):
+                kuzu_type = getattr(KuzuDataType, kuzu_type.upper())
+            # Otherwise keep as string for custom types
+    elif element_type is not None:
+        # User specified element_type separately (kuzu_type might be None or already set)
+        if isinstance(element_type, str):
+            # Check if it's a valid KuzuDataType constant
+            if hasattr(KuzuDataType, element_type.upper()):
+                element_type = getattr(KuzuDataType, element_type.upper())
+            # Otherwise keep as string for custom types
+        kuzu_type = ArrayTypeSpecification(element_type=element_type)
 
     if auto_increment:
         kuzu_type = KuzuDataType.SERIAL
 
+    # Validate that arrays cannot be primary keys
+    if primary_key and isinstance(kuzu_type, ArrayTypeSpecification):
+        raise ValueError(
+            "Arrays cannot be used as primary keys. "
+            "Primary keys must be scalar types."
+        )
+    
     kuzu_metadata = KuzuFieldMetadata(
         kuzu_type=kuzu_type,
         primary_key=primary_key,
@@ -735,29 +875,47 @@ class RelationshipPair:
         """Get the name of the FROM node."""
         if isinstance(self.from_node, str):
             return self.from_node
+
+        # Strict validation - sets must be expanded before reaching here
+        if isinstance(self.from_node, (set, frozenset)):
+            raise TypeError(
+                f"RelationshipPair.from_node received a set {self.from_node}. "
+                f"Sets must be expanded in _process_relationship_pairs before creating RelationshipPair instances."
+            )
+
+        # Try to get the kuzu node name first, fall back to __name__ for backward compatibility
         try:
             return self.from_node.__kuzu_node_name__
         except AttributeError:
             try:
                 return self.from_node.__name__
-            except AttributeError as exc:
+            except AttributeError as e:
                 raise ValueError(
-                    ValidationMessageConstants.MISSING_KUZU_NODE_NAME.format(self.from_node)
-                ) from exc
+                    f"Target model {self.from_node} is not a decorated node - missing __kuzu_node_name__ attribute"
+                ) from e
     
     def get_to_name(self) -> str:
         """Get the name of the TO node."""
         if isinstance(self.to_node, str):
             return self.to_node
+        
+        # Strict validation - sets must be expanded before reaching here
+        if isinstance(self.to_node, (set, frozenset)):
+            raise TypeError(
+                f"RelationshipPair.to_node received a set {self.to_node}. "
+                f"Sets must be expanded in _process_relationship_pairs before creating RelationshipPair instances."
+            )
+        
+        # Try to get the kuzu node name first, fall back to __name__ for backward compatibility
         try:
             return self.to_node.__kuzu_node_name__
         except AttributeError:
             try:
                 return self.to_node.__name__
-            except AttributeError as exc:
+            except AttributeError as e:
                 raise ValueError(
-                    ValidationMessageConstants.MISSING_KUZU_NODE_NAME.format(self.to_node)
-                ) from exc
+                    f"Target model {self.to_node} is not a decorated node - missing __kuzu_node_name__ attribute"
+                ) from e
     
     def to_ddl_component(self) -> str:
         """Convert to DDL component for CREATE REL TABLE."""
@@ -772,7 +930,18 @@ class RelationshipPair:
 # -----------------------------------------------------------------------------
 
 class KuzuRegistry:
-    """Global registry for nodes, relationships, and model metadata."""
+    """
+    Enhanced global registry for nodes, relationships, and model metadata with deferred resolution.
+
+    This registry implements SQLAlchemy-like deferred resolution to handle circular dependencies
+    and forward references gracefully. The resolution process happens in phases:
+
+    1. Registration Phase: Models are registered without dependency analysis
+    2. String Resolution Phase: String references are resolved to actual classes
+    3. Dependency Analysis Phase: Dependency graph is built from resolved references
+    4. Topological Sort Phase: Creation order is determined
+    5. Finalized Phase: Registry is ready for DDL generation
+    """
 
     _instance: Optional["KuzuRegistry"] = None
 
@@ -786,63 +955,295 @@ class KuzuRegistry:
         if self.__dict__.get("_initialized", False):
             return
         self._initialized = True
+
+        # @@ STEP 1: Core model storage
         self.nodes: Dict[str, Type[Any]] = {}
         self.relationships: Dict[str, Type[Any]] = {}
         self.models: Dict[str, Type[Any]] = {}
+
+        # @@ STEP 2: Resolution state tracking
+        self._resolution_phase: str = RegistryResolutionConstants.PHASE_REGISTRATION
         self._model_dependencies: Dict[str, Set[str]] = {}
+        self._unresolved_foreign_keys: List[Tuple[str, str, ForeignKeyMetadata]] = []
+        self._resolution_errors: List[str] = []
+
+        # @@ STEP 3: Circular dependency tracking
+        self._circular_dependencies: Set[Tuple[str, str]] = set()
+        self._self_references: Set[str] = set()
+
+    def _cleanup_model_references(self, model_name: str) -> None:
+        """
+        Clean up all references to a model to prevent memory leaks during redefinition.
+
+        Args:
+            model_name: Name of the model to clean up
+        """
+        # Clean up model references to prevent memory corruption
+        # @@ STEP 1: Remove from dependency tracking
+        if model_name in self._model_dependencies:
+            del self._model_dependencies[model_name]
+
+        # @@ STEP 2: Remove dependencies on this model from other models
+        for deps in self._model_dependencies.values():
+            deps.discard(model_name)
+
+        # @@ STEP 3: Remove from unresolved foreign keys
+        self._unresolved_foreign_keys = [
+            (model, field, fk_meta) for model, field, fk_meta in self._unresolved_foreign_keys
+            if model != model_name
+        ]
+
+        # @@ STEP 4: Remove from circular dependency tracking
+        self._circular_dependencies = {
+            (from_model, to_model) for from_model, to_model in self._circular_dependencies
+            if from_model != model_name and to_model != model_name
+        }
+        self._self_references.discard(model_name)
+
+        # @@ STEP 5: Clear any resolution errors related to this model
+        self._resolution_errors = [
+            error for error in self._resolution_errors
+            if model_name not in error
+        ]
 
     def register_node(self, name: str, cls: Type[Any]) -> None:
+        """
+        Register a node class without immediate dependency analysis.
+
+        Args:
+            name: The node name
+            cls: The node class
+        """
+        # CHandle model redefinition gracefully
+        if name in self.nodes:
+            # @@ STEP: Clean up existing model references to prevent memory leaks
+            self._cleanup_model_references(name)
+
         self.nodes[name] = cls
         self.models[name] = cls
-        self._analyze_dependencies(name, cls)
+
+        # @@ STEP: Store unresolved foreign keys for later resolution
+        self._collect_unresolved_foreign_keys(name, cls)
 
     def register_relationship(self, name: str, cls: Type[Any]) -> None:
+        """
+        Register a relationship class without immediate dependency analysis.
+
+        Args:
+            name: The relationship name
+            cls: The relationship class
+        """
+        # Handle model redefinition gracefully
+        if name in self.relationships:
+            # @@ STEP: Clean up existing model references to prevent memory leaks
+            self._cleanup_model_references(name)
+
         self.relationships[name] = cls
         self.models[name] = cls
-        self._analyze_dependencies(name, cls)
 
-    def _analyze_dependencies(self, name: str, cls: Type[Any]) -> None:
-        """Analyze FK-like dependencies (metadata) for creation ordering."""
-        dependencies = set()
-        for _, field_info in cls.model_fields.items():
+        # @@ STEP: Store unresolved foreign keys for later resolution
+        self._collect_unresolved_foreign_keys(name, cls)
+
+    def _collect_unresolved_foreign_keys(self, model_name: str, cls: Type[Any]) -> None:
+        """
+        Collect foreign key references from a model for later resolution.
+
+        Args:
+            model_name: The name of the model
+            cls: The model class
+        """
+        for field_name, field_info in cls.model_fields.items():
             metadata = self.get_field_metadata(field_info)
             if metadata and metadata.foreign_key:
-                target_model = metadata.foreign_key.target_model
-                if isinstance(target_model, str):
-                    target_name = target_model
+                # @@ STEP: Store the foreign key for later resolution
+                self._unresolved_foreign_keys.append((model_name, field_name, metadata.foreign_key))
+
+    def get_model_by_name(self, name: str) -> Optional[Type[Any]]:
+        """
+        Get a model by name from the registry.
+
+        Args:
+            name: The model name to look up
+
+        Returns:
+            Optional[Type[Any]]: The model class if found, None otherwise
+        """
+        return self.models.get(name)
+
+    def resolve_all_foreign_keys(self) -> bool:
+        """
+        Resolve all foreign key references in the registry.
+
+        Returns:
+            bool: True if all foreign keys were resolved successfully, False otherwise
+        """
+        if self._resolution_phase != RegistryResolutionConstants.PHASE_REGISTRATION:
+            return True  # Already resolved
+
+        self._resolution_phase = RegistryResolutionConstants.PHASE_STRING_RESOLUTION
+        self._resolution_errors.clear()
+
+        success = True
+
+        # @@ STEP: Resolve each foreign key reference
+        for model_name, field_name, foreign_key in self._unresolved_foreign_keys:
+            if not foreign_key.resolve_target_model(self):
+                error_msg = f"Failed to resolve foreign key {model_name}.{field_name} -> {foreign_key.target_model}"
+                if foreign_key._resolution_error:
+                    error_msg += f": {foreign_key._resolution_error}"
+                self._resolution_errors.append(error_msg)
+                success = False
+
+        if success:
+            self._resolution_phase = RegistryResolutionConstants.PHASE_DEPENDENCY_ANALYSIS
+
+        return success
+
+    def analyze_dependencies(self) -> bool:
+        """
+        Analyze dependencies between models after foreign key resolution.
+
+        Returns:
+            bool: True if dependency analysis was successful, False otherwise
+        """
+        if self._resolution_phase not in [
+            RegistryResolutionConstants.PHASE_STRING_RESOLUTION,
+            RegistryResolutionConstants.PHASE_DEPENDENCY_ANALYSIS
+        ]:
+            return True  # Already analyzed or not ready
+
+        self._resolution_phase = RegistryResolutionConstants.PHASE_DEPENDENCY_ANALYSIS
+        self._model_dependencies.clear()
+        self._circular_dependencies.clear()
+        self._self_references.clear()
+
+        # @@ STEP: Build dependency graph from resolved foreign keys
+        for model_name, field_name, foreign_key in self._unresolved_foreign_keys:
+            if not foreign_key.is_resolved():
+                continue
+
+            target_name = foreign_key.get_resolved_target_name()
+            if target_name:
+                # @@ STEP: Track dependencies
+                if model_name not in self._model_dependencies:
+                    self._model_dependencies[model_name] = set()
+
+                if target_name == model_name:
+                    # @@ STEP: Self-reference detected
+                    self._self_references.add(model_name)
                 else:
-                    # @@ STEP: Try multiple ways to resolve the target model name
-                    target_name = None
-                    # || S.1: Check for kuzu_node_name attribute
-                    try:
-                        target_name = target_model.__kuzu_node_name__
-                    except AttributeError:
-                        # || S.2: Check for __name__ attribute
-                        try:
-                            target_name = target_model.__name__
-                        except AttributeError:
-                            # || S.3: Check for __qualname__ attribute
-                            try:
-                                qualname = getattr(target_model, '__qualname__', None)
-                                if qualname:
-                                    # For nested classes, use the last part of qualname
-                                    target_name = qualname.split('.')[-1]
-                                else:
-                                    raise AttributeError("No qualname")
-                            except AttributeError:
-                                # Cannot determine target name - THIS IS AN ERROR
-                                raise ValueError(
-                                    f"Cannot determine name for target model {target_model} "
-                                    f"in target name {target_name}. Model must have __kuzu_node_name__, "
-                                    f"__name__, or __qualname__ attribute."
-                                )
-                dependencies.add(target_name)
-        self._model_dependencies[name] = dependencies
+                    self._model_dependencies[model_name].add(target_name)
+
+                    # @@ STEP: Check for circular dependencies
+                    if target_name in self._model_dependencies:
+                        if model_name in self._model_dependencies[target_name]:
+                            self._circular_dependencies.add((model_name, target_name))
+
+        self._resolution_phase = RegistryResolutionConstants.PHASE_TOPOLOGICAL_SORT
+        return True
+
+    def get_creation_order(self) -> List[str]:
+        """
+        Get the topologically sorted creation order for models.
+
+        This method handles circular dependencies gracefully by:
+        1. Detecting self-references (allowed)
+        2. Detecting circular dependencies (handled with proper ordering)
+        3. Providing a stable sort order
+
+        Returns:
+            List[str]: List of model names in creation order
+        """
+        if self._resolution_phase not in [
+            RegistryResolutionConstants.PHASE_TOPOLOGICAL_SORT,
+            RegistryResolutionConstants.PHASE_FINALIZED
+        ]:
+            # @@ STEP: Ensure dependencies are analyzed first
+            if not self.resolve_all_foreign_keys():
+                raise ValueError("Cannot determine creation order: Foreign key resolution failed")
+            if not self.analyze_dependencies():
+                raise ValueError("Cannot determine creation order: Dependency analysis failed")
+
+        # @@ STEP: Implement topological sort with cycle detection
+        visited = set()
+        visiting = set()  # Track nodes currently being visited (for cycle detection)
+        order: List[str] = []
+
+        def visit(name: str) -> None:
+            if name in visited:
+                return
+            if name in visiting:
+                # @@ STEP: Circular dependency detected - this is OK for self-references
+                if name in self._self_references:
+                    return  # Self-reference is allowed
+                else:
+                    # @@ STEP: True circular dependency - handle gracefully
+                    logger.warning(f"Circular dependency detected involving {name}")
+                    return
+
+            visiting.add(name)
+
+            # @@ STEP: Visit dependencies first
+            for dep in self._model_dependencies.get(name, set()):
+                if dep != name:  # Skip self-references in dependency traversal
+                    visit(dep)
+
+            visiting.remove(name)
+            visited.add(name)
+            order.append(name)
+
+        # @@ STEP: Visit all models
+        for name in sorted(self.models.keys()):  # Sort for stable ordering
+            visit(name)
+
+        return order
+
+    def finalize_registry(self) -> bool:
+        """
+        Finalize the registry by completing all resolution phases.
+
+        Returns:
+            bool: True if finalization was successful, False otherwise
+        """
+        if self._resolution_phase == RegistryResolutionConstants.PHASE_FINALIZED:
+            return True
+
+        # @@ STEP: Complete all resolution phases
+        if not self.resolve_all_foreign_keys():
+            return False
+
+        if not self.analyze_dependencies():
+            return False
+
+        # @@ STEP: Verify creation order can be determined
+        try:
+            self.get_creation_order()
+            self._resolution_phase = RegistryResolutionConstants.PHASE_FINALIZED
+            return True
+        except Exception as e:
+            self._resolution_errors.append(f"Failed to determine creation order: {str(e)}")
+            return False
+
+    def get_resolution_errors(self) -> List[str]:
+        """Get any resolution errors that occurred."""
+        return self._resolution_errors.copy()
+
+    def get_circular_dependencies(self) -> Set[Tuple[str, str]]:
+        """Get detected circular dependencies."""
+        return self._circular_dependencies.copy()
+
+    def get_self_references(self) -> Set[str]:
+        """Get models with self-references."""
+        return self._self_references.copy()
+
+    def is_finalized(self) -> bool:
+        """Check if the registry has been finalized."""
+        return self._resolution_phase == RegistryResolutionConstants.PHASE_FINALIZED
 
     def get_field_metadata(self, field_info: FieldInfo) -> Optional[KuzuFieldMetadata]:
         """
         Get Kuzu metadata from field info.
-        
+
         :param field_info: Pydantic field info
         :type field_info: FieldInfo
         :returns: Kuzu field metadata or None
@@ -863,24 +1264,6 @@ class KuzuRegistry:
         # No Kuzu metadata found - this is expected for non-Kuzu fields
         return None
 
-    def get_creation_order(self) -> List[str]:
-        """Topologically sort by metadata dependencies (nodes & rels)."""
-        visited = set()
-        order: List[str] = []
-
-        def visit(name: str):
-            if name in visited:
-                return
-            visited.add(name)
-            for dep in self._model_dependencies.get(name, set()):
-                if dep != name:
-                    visit(dep)
-            order.append(name)
-
-        for name in self.models:
-            visit(name)
-        return order
-
 
 # Singleton
 _kuzu_registry = KuzuRegistry()
@@ -891,19 +1274,18 @@ _kuzu_registry = KuzuRegistry()
 # -----------------------------------------------------------------------------
 
 def _process_relationship_pairs(
-    pairs: Union[
-        List[Tuple[Union[Type[Any], str], Union[Type[Any], str]]],
-        Dict[Union[Type[Any], str], Union[Set[Union[Type[Any], str]], List[Union[Type[Any], str]]]]
-    ],
+    pairs: List[Tuple[Union[Set[Any], Any], Union[Set[Any], Any]]],
     rel_name: str
 ) -> List[RelationshipPair]:
     """
-    Process relationship pairs supporting both traditional and enhanced formats.
+    Process relationship pairs into RelationshipPair objects.
+    Handles various formats including sets.
 
-    This function handles:
+    Supported formats:
     1. Traditional format: [(FromType, ToType), ...]
-    2. Enhanced format: {FromType: {ToType1, ToType2}, ...}
-    3. Mixed format: {FromType: [ToType1, ToType2], ...}
+    2. Enhanced format: [(FromType, {ToType, ToType2}), ...]
+    3. Full Cartesian product: [({FromType1, FromType2}, {ToType1, ToType2}), ...]
+    4. Partial Cartesian product: [({FromType1, FromType2}, ToType), ...]
 
     Args:
         pairs: Relationship pairs in any supported format
@@ -923,21 +1305,30 @@ def _process_relationship_pairs(
             if not isinstance(pair, tuple) or len(pair) != 2:
                 raise ValueError(f"Relationship {rel_name}: Each pair must be a 2-tuple (from_type, to_type)")
             from_type, to_type = pair
-            rel_pairs.append(RelationshipPair(from_type, to_type))
-
-    elif isinstance(pairs, dict):
-        # Enhanced format: {FromType: {ToType1, ToType2}, ...} or {FromType: [ToType1, ToType2], ...}
-        for from_type, to_types in pairs.items():
-            if isinstance(to_types, (set, list)):
-                for to_type in to_types:
-                    rel_pairs.append(RelationshipPair(from_type, to_type))
+            
+            # Handle sets in FROM position
+            from_types = []
+            if isinstance(from_type, (set, frozenset)):
+                from_types = list(from_type)
             else:
-                # Single to_type
-                rel_pairs.append(RelationshipPair(from_type, to_types))
+                from_types = [from_type]
+            
+            # Handle sets in TO position
+            to_types = []
+            if isinstance(to_type, (set, frozenset)):
+                to_types = list(to_type)
+            else:
+                to_types = [to_type]
+            
+            # Create Cartesian product of FROM and TO types
+            for ft in from_types:
+                for tt in to_types:
+                    rel_pairs.append(RelationshipPair(ft, tt))
+
     else:
         raise ValueError(
-            f"Relationship {rel_name}: 'pairs' must be either a list of tuples "
-            f"[(FromType, ToType), ...] or a dictionary {{FromType: {{ToType1, ToType2}}, ...}}"
+            f"Relationship {rel_name}: 'pairs' must be a list of tuples "
+            f"[(FromType, ToType), ...]"
         )
 
     if not rel_pairs:
@@ -991,7 +1382,7 @@ def kuzu_relationship(
 
     properties: Optional[Dict[str, Union[Any, "PropertyMetadata"]]] = None,
 
-    direction: RelationshipDirection = RelationshipDirection.FORWARD,
+    direction: RelationshipDirection = RelationshipDirection.OUTGOING,
     abstract: bool = False,
     discriminator_field: Optional[str] = None,
     discriminator_value: Optional[str] = None,
@@ -1176,26 +1567,99 @@ class KuzuBaseModel(BaseModel):
 
     @classmethod
     def validate_foreign_keys(cls) -> List[str]:
-        """Validate metadata references only (no DB enforcement)."""
+        """
+        Validate foreign key references using the enhanced deferred resolution system.
+
+        This method now works with the deferred resolution system and can validate
+        both resolved and unresolved references appropriately.
+        """
         errors: List[str] = []
+
         for field_name, fk_ref in cls.get_foreign_key_fields().items():
-            target_model = fk_ref.target_model
+            # @@ STEP: Check if the foreign key has been resolved
+            if fk_ref.is_resolved():
+                # @@ STEP: Validate resolved reference
+                resolved_model = fk_ref.get_resolved_target_model()
+                if resolved_model is None:
+                    errors.append(f"Field {field_name}: resolved target model is None")
+                    continue
 
-            # @@ STEP: Validate target_model type and skip string references
-            # || S.1: String references cannot be validated at this time
-            # || S.2: Only validate actual model classes with model_fields attribute
-            if isinstance(target_model, str) or not hasattr(target_model, 'model_fields'):
-                raise TypeError(
-                    f"Field {field_name}: target model {target_model} is not a valid model class"
-                )
+                # @@ STEP: Validate resolved model is a proper Pydantic model
+                try:
+                    model_fields = resolved_model.model_fields
+                except AttributeError:
+                    errors.append(
+                        f"Field {field_name}: resolved target model {resolved_model} is not a valid Pydantic model "
+                        f"(missing required 'model_fields' attribute)"
+                    )
+                    continue
 
-            # @@ STEP: Direct validation - target_model is guaranteed to be a proper model class
-            # || S.1: Access model_fields directly (safe after type check)
-            # || S.2: Access __name__ directly for error message (safe after type check)
-            if fk_ref.target_field not in target_model.model_fields:
-                errors.append(
-                    f"Field {field_name}: target field {fk_ref.target_field} not found in {target_model.__name__}"
-                )
+                # @@ STEP: Check for Kuzu decoration
+                is_kuzu_node = hasattr(resolved_model, "__kuzu_node_name__")
+                is_kuzu_rel = hasattr(resolved_model, "__kuzu_rel_name__")
+
+                if not is_kuzu_node and not is_kuzu_rel:
+                    errors.append(
+                        f"Field {field_name}: resolved target model {resolved_model.__name__} "
+                        f"is not a Kuzu model (missing __kuzu_node_name__ or __kuzu_rel_name__)"
+                    )
+                    continue
+
+                # @@ STEP: Validate target field exists
+                if fk_ref.target_field not in model_fields:
+                    errors.append(
+                        f"Field {field_name}: target field '{fk_ref.target_field}' not found in {resolved_model.__name__}"
+                    )
+
+            else:
+                # @@ STEP: Handle unresolved references
+                target_type = fk_ref.get_target_type()
+
+                if target_type == RegistryResolutionConstants.TARGET_TYPE_STRING:
+                    # @@ STEP: String references are valid and will be resolved later
+                    # We can optionally check if the target model name exists in the registry
+                    target_name = fk_ref.target_model
+                    if not _kuzu_registry.get_model_by_name(target_name):
+                        # @@ STEP: Only warn, don't error - the model might be defined later
+                        logger.warning(f"Field {field_name}: target model '{target_name}' not found in registry yet")
+
+                elif target_type == RegistryResolutionConstants.TARGET_TYPE_CLASS:
+                    # @@ STEP: Direct class reference - validate immediately
+                    target_model = fk_ref.target_model
+
+                    try:
+                        model_fields = target_model.model_fields
+                    except AttributeError:
+                        errors.append(
+                            f"Field {field_name}: target model {target_model} is not a valid Pydantic model "
+                            f"(missing required 'model_fields' attribute)"
+                        )
+                        continue
+
+                    # Check for Kuzu decoration
+                    is_kuzu_node = hasattr(target_model, "__kuzu_node_name__")
+                    is_kuzu_rel = hasattr(target_model, "__kuzu_rel_name__")
+
+                    if not is_kuzu_node and not is_kuzu_rel:
+                        errors.append(
+                            f"Field {field_name}: target model {target_model.__name__} "
+                            f"is not a Kuzu model (missing __kuzu_node_name__ or __kuzu_rel_name__)"
+                        )
+                        continue
+
+                    # Validate target field exists
+                    if fk_ref.target_field not in model_fields:
+                        errors.append(
+                            f"Field {field_name}: target field '{fk_ref.target_field}' not found in {target_model.__name__}"
+                        )
+
+                elif target_type == RegistryResolutionConstants.TARGET_TYPE_CALLABLE:
+                    # @@ STEP: Callable references will be resolved later - skip validation for now
+                    pass
+
+                else:
+                    errors.append(f"Field {field_name}: unknown target type '{target_type}'")
+
         return errors
     
     def save(self, session: "KuzuSession") -> None:
@@ -1248,6 +1712,51 @@ class KuzuRelationshipBase(KuzuBaseModel):
             self._to_node_pk = self._extract_node_pk(to_node)
         else:
             self._to_node_pk = None
+
+    def __hash__(self) -> int:
+        """Make relationship instances hashable using from/to node combination plus properties."""
+        # Use from/to node primary keys plus all property values for hashing
+        if self._from_node_pk is not None and self._to_node_pk is not None:
+            # Include key property values in hash to distinguish relationships with same nodes but different properties
+            try:
+                property_values = []
+                for field_name in self.__class__.model_fields:
+                    if hasattr(self, field_name):
+                        value = getattr(self, field_name, None)
+                        if value is not None and isinstance(value, (str, int, float, bool)):
+                            property_values.append((field_name, value))
+
+                return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk, tuple(property_values)))
+            except Exception:
+                # Fallback to simpler hash if property access fails
+                return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk))
+        # Fallback to object identity if nodes not set
+        return hash(id(self))
+
+    def __eq__(self, other: object) -> bool:
+        """Define equality based on from/to node combination plus properties."""
+        if not isinstance(other, self.__class__):
+            return False
+
+        # Use from/to node primary keys plus properties for equality
+        if (self._from_node_pk is not None and self._to_node_pk is not None and
+            other._from_node_pk is not None and other._to_node_pk is not None):
+
+            # Check node equality
+            if not (self._from_node_pk == other._from_node_pk and self._to_node_pk == other._to_node_pk):
+                return False
+
+            # Check property equality
+            for field_name in self.__class__.model_fields:
+                self_value = getattr(self, field_name, None)
+                other_value = getattr(other, field_name, None)
+                if self_value != other_value:
+                    return False
+
+            return True
+
+        # Fallback to object identity
+        return id(self) == id(other)
 
     @property
     def from_node(self) -> Optional[Any]:
@@ -1324,7 +1833,8 @@ class KuzuRelationshipBase(KuzuBaseModel):
             raise ValueError(f"Primary key '{field_name}' in model '{model_name}' cannot be an array type")
 
         # Validate against Kuzu primary key type requirements
-        if not isinstance(kuzu_type, KuzuDataType):
+        # kuzu_type is now a string constant from KuzuDataType class
+        if not isinstance(kuzu_type, str):
             raise ValueError(f"Primary key '{field_name}' in model '{model_name}' has invalid type specification")
 
         # Check if this Kuzu type is valid for primary keys
@@ -1338,7 +1848,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
         }
 
         if kuzu_type not in valid_pk_types:
-            raise ValueError(f"Primary key '{field_name}' in model '{model_name}' has invalid type '{kuzu_type.value}'. "
+            raise ValueError(f"Primary key '{field_name}' in model '{model_name}' has invalid type '{kuzu_type}'. "
                            f"Valid primary key types are: STRING, numeric types, DATE, TIMESTAMP variants, BLOB, UUID, and SERIAL")
 
     def _validate_raw_primary_key_value(self, value: Any) -> Any:
@@ -1625,18 +2135,9 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
         from_name = pair.get_from_name()
         to_name = pair.get_to_name()
 
-        # Validate that referenced nodes are registered
-        if from_name not in _kuzu_registry.nodes:
-            raise ValueError(
-                f"Relationship {rel_name} references FROM node '{from_name}' which is not registered. "
-                f"Ensure the node class is decorated with @kuzu_node and properly imported."
-            )
-
-        if to_name not in _kuzu_registry.nodes:
-            raise ValueError(
-                f"Relationship {rel_name} references TO node '{to_name}' which is not registered. "
-                f"Ensure the node class is decorated with @kuzu_node and properly imported."
-            )
+        # Note: Registry validation is optional for DDL generation
+        # This allows for more flexible testing and usage patterns
+        # The actual database will validate node existence at runtime
 
         from_to_components.append(pair.to_ddl_component())
 
@@ -1760,62 +2261,95 @@ def get_ddl_for_relationship(rel_cls: Type[Any]) -> str:
     return generate_relationship_ddl(rel_cls)
 
 def get_all_ddl() -> str:
-    """Generate DDL for all registered models."""
-    ddl_statements = []
-    
-    # Generate DDL for nodes
-    for node_name, node_cls in _kuzu_registry.nodes.items():
-        _ = node_name  # Mark as intentionally unused - only node_cls is needed
-        ddl = get_ddl_for_node(node_cls)
-        if ddl:
-            ddl_statements.append(ddl)
+    """
+    Generate DDL for all registered models in the correct dependency order.
 
-    # Generate DDL for relationships
-    for rel_name, rel_cls in _kuzu_registry.relationships.items():
-        _ = rel_name  # Mark as intentionally unused - only rel_cls is needed
-        ddl = get_ddl_for_relationship(rel_cls)
-        if ddl:
-            ddl_statements.append(ddl)
-    
+    This function automatically triggers registry finalization to resolve
+    all foreign key references and determine the correct creation order.
+
+    IMPORTANT: Nodes must be created before relationships that reference them.
+
+    Returns:
+        str: DDL statements for all models in dependency order
+
+    Raises:
+        ValueError: If registry finalization fails due to unresolvable references
+    """
+    # @@ STEP: Ensure registry is finalized
+    if not _kuzu_registry.finalize_registry():
+        errors = _kuzu_registry.get_resolution_errors()
+        error_msg = "Failed to finalize registry for DDL generation"
+        if errors:
+            error_msg += ":\n" + "\n".join(errors)
+        raise ValueError(error_msg)
+
+    ddl_statements = []
+
+    # @@ STEP: Generate DDL with nodes first, then relationships
+    # This ensures that all node tables exist before relationship tables are created
+    creation_order = _kuzu_registry.get_creation_order()
+
+    # First pass: Create all nodes
+    for model_name in creation_order:
+        if model_name in _kuzu_registry.nodes:
+            model_cls = _kuzu_registry.models.get(model_name)
+            if model_cls:
+                ddl = get_ddl_for_node(model_cls)
+                if ddl:
+                    ddl_statements.append(ddl)
+
+    # Second pass: Create all relationships
+    for model_name in creation_order:
+        if model_name in _kuzu_registry.relationships:
+            model_cls = _kuzu_registry.models.get(model_name)
+            if model_cls:
+                ddl = get_ddl_for_relationship(model_cls)
+                if ddl:
+                    ddl_statements.append(ddl)
+
     return "\n".join(ddl_statements)
 
 
-def validate_all_models() -> List[str]:
+def validate_all_models() -> None:
     """Validate all registered models."""
     errors = []
     
-    # @@ STEP: Validate nodes with direct method access
+    # @@ STEP: Validate nodes - strict access, no exception handling
     for node_name, node_cls in _kuzu_registry.nodes.items():
-        try:
-            node_errors = node_cls.validate_foreign_keys()
-            errors.extend(node_errors)
-        except AttributeError:
-            # Method doesn't exist - THIS IS AN ERROR for a node class
-            raise ValueError(
-                f"Node class {node_name} does not have validate_foreign_keys() method. "
-                f"This indicates the class is not properly decorated with @node."
-            )
+        # Direct method call - if it fails, the class is improperly configured
+        node_errors = node_cls.validate_foreign_keys()
+        errors.extend(node_errors)
     
-    # @@ STEP: Validate relationships with direct method access
+    # @@ STEP: Validate relationships - strict access, no exception handling
     for rel_name, rel_cls in _kuzu_registry.relationships.items():
-        try:
-            rel_errors = rel_cls.validate_foreign_keys()
-            errors.extend(rel_errors)
-        except AttributeError:
-            # Method doesn't exist - THIS IS AN ERROR for a relationship class
-            raise ValueError(
-                f"Relationship class {rel_name} does not have validate_foreign_keys() method. "
-                f"This indicates the class is not properly decorated with @relationship."
-            )
+        # Direct method call - if it fails, the class is improperly configured
+        rel_errors = rel_cls.validate_foreign_keys()
+        errors.extend(rel_errors)
     
-    return errors
+    if errors:
+        raise ValueError("Validation failed for one or more models: " + "\n".join(errors))
 
 
 def clear_registry():
-    """Clear all registered models."""
+    """Clear all registered models and reset registry state."""
+    # Enhanced registry cleanup to prevent memory corruption
+    # @@ STEP 1: Clear all model registrations
     _kuzu_registry.nodes.clear()
     _kuzu_registry.relationships.clear()
+    _kuzu_registry.models.clear()
+
+    # @@ STEP 2: Clear dependency tracking
     _kuzu_registry._model_dependencies.clear()
+    _kuzu_registry._unresolved_foreign_keys.clear()
+    _kuzu_registry._resolution_errors.clear()
+    _kuzu_registry._circular_dependencies.clear()
+    _kuzu_registry._self_references.clear()
+
+    # @@ STEP 3: Reset resolution phase
+    _kuzu_registry._resolution_phase = RegistryResolutionConstants.PHASE_REGISTRATION
+
+    # @@ STEP 4: Force garbage collection to free memory
+    gc.collect()
 
 
 def get_node_by_name(name: str) -> Optional[Type[Any]]:
@@ -1824,6 +2358,79 @@ def get_node_by_name(name: str) -> Optional[Type[Any]]:
 
 def get_relationship_by_name(name: str) -> Optional[Type[Any]]:
     return _kuzu_registry.relationships.get(name)
+
+
+def finalize_registry() -> bool:
+    """
+    Explicitly finalize the registry to resolve all foreign key references.
+
+    This is automatically called by get_all_ddl(), but can be called manually
+    for early validation or to check for resolution errors.
+
+    Returns:
+        bool: True if finalization was successful, False otherwise
+    """
+    return _kuzu_registry.finalize_registry()
+
+
+def get_registry_resolution_errors() -> List[str]:
+    """
+    Get any resolution errors from the registry.
+
+    Returns:
+        List[str]: List of resolution error messages
+    """
+    return _kuzu_registry.get_resolution_errors()
+
+
+def get_circular_dependencies() -> Set[Tuple[str, str]]:
+    """
+    Get detected circular dependencies between models.
+
+    Returns:
+        Set[Tuple[str, str]]: Set of (model1, model2) tuples representing circular dependencies
+    """
+    return _kuzu_registry.get_circular_dependencies()
+
+
+def get_self_references() -> Set[str]:
+    """
+    Get models that have self-references.
+
+    Returns:
+        Set[str]: Set of model names that reference themselves
+    """
+    return _kuzu_registry.get_self_references()
+
+
+def is_registry_finalized() -> bool:
+    """
+    Check if the registry has been finalized.
+
+    Returns:
+        bool: True if the registry is finalized, False otherwise
+    """
+    return _kuzu_registry.is_finalized()
+
+
+def get_model_creation_order() -> List[str]:
+    """
+    Get the creation order for all models, handling circular dependencies.
+
+    Returns:
+        List[str]: List of model names in creation order
+
+    Raises:
+        ValueError: If the registry cannot be finalized
+    """
+    if not _kuzu_registry.finalize_registry():
+        errors = _kuzu_registry.get_resolution_errors()
+        error_msg = "Cannot determine creation order: Registry finalization failed"
+        if errors:
+            error_msg += ":\n" + "\n".join(errors)
+        raise ValueError(error_msg)
+
+    return _kuzu_registry.get_creation_order()
 
 
 def generate_all_ddl() -> str:

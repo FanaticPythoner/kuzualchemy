@@ -50,14 +50,16 @@ from .kuzu_orm import (
     validate_all_models,
     clear_registry,
     KuzuRegistry,
+
+    # Enhanced registry functions
+    finalize_registry,
+    get_registry_resolution_errors,
+    get_circular_dependencies,
+    get_self_references,
+    is_registry_finalized,
+    get_model_creation_order,
 )
 
-# Create modern aliases
-node = kuzu_node
-relationship = kuzu_relationship
-Field = kuzu_field
-ForeignKey = foreign_key
-generate_all_ddl = get_all_ddl
 
 # Constants
 from .constants import (
@@ -194,15 +196,10 @@ __all__ = [
     # Base model
     "KuzuBaseModel",
     "BaseModel",
-    # Decorators and field
-    "node",
-    "relationship",
-    "Field",
-    # Legacy aliases
+    # Main Decorators
     "kuzu_node",
     "kuzu_relationship",
     "kuzu_field",
-    "generate_all_ddl",
     # Enums and metadata classes
     "KuzuDataType",
     "RelationshipDirection",
@@ -252,6 +249,13 @@ __all__ = [
     "validate_all_models",
     "clear_registry",
     "KuzuRegistry",
+    # Enhanced registry functions
+    "finalize_registry",
+    "get_registry_resolution_errors",
+    "get_circular_dependencies",
+    "get_self_references",
+    "is_registry_finalized",
+    "get_model_creation_order",
     # Constants
     "DatabaseConstants",
     "DDLConstants",

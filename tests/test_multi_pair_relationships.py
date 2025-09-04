@@ -235,9 +235,6 @@ class TestErrorCases:
         # This should work because InvalidNode has __name__ attribute
         assert pair.get_from_name() == "InvalidNode"
         assert pair.get_to_name() == "User"
-
-        # The real validation should happen when DDL is generated or executed
-        # But we shouldn't create a globally registered relationship for this test
     
     def test_abstract_relationship_no_pairs_allowed(self):
         """Test that abstract relationships don't require pairs."""

@@ -4,32 +4,35 @@ from typing import Any, Union, get_origin, get_args, Type, Dict
 from enum import Enum
 from pydantic import model_validator
 
-from .constants import ErrorMessages, EnumCacheConstants
 from .kuzu_orm import KuzuBaseModel
 
-# Module-level cache for enum lookups: {EnumClass: {name->member, value->member}}
-_ENUM_CACHE: Dict[Type[Enum], Dict[str, Dict[Any, Enum]]] = {}
+# Module-level cache for enum lookups: {EnumClass: (names_dict, values_dict)}
+_ENUM_CACHE: Dict[Type[Enum], tuple[Dict[str, Enum], Dict[Any, Enum]]] = {}
+
+# Sentinel object to distinguish missing fields from None values
+_MISSING = object()
 
 
 class BaseModel(KuzuBaseModel):
     """
-    Base model with automatic enum conversion for Kuzu ORM
+    Base model with automatic enum conversion for Kuzu ORM.
     
-    :class:`BaseModel`
-    :synopsis: Base model with automatic enum conversion for Kuzu ORM
-    :platform: Any
-    :ivar _ENUM_CACHE: Module-level cache for enum lookups
+    Provides automatic conversion of string values to enum instances
+    for enum-typed fields during model validation.
     """
     
     @staticmethod
-    def _get_enum_lookups(enum_type: Type[Enum]) -> Dict[str, Dict[Any, Enum]]:
+    def _get_enum_lookups(enum_type: Type[Enum]) -> tuple[Dict[str, Enum], Dict[Any, Enum]]:
         """
         Get or create cached lookup dictionaries for an enum type.
-        
-        :param enum_type: The enum class to create lookups for
-        :type enum_type: Type[Enum]
-        :returns: Dictionary with 'names' and 'values' mappings for O(1) lookup
-        :rtype: Dict[str, Dict[Any, Enum]]
+
+        Creates O(1) lookup maps for enum member names and values.
+
+        Args:
+            enum_type: The enum class to create lookups for
+
+        Returns:
+            Tuple of (names_dict, values_dict) for O(1) lookup
         """
         global _ENUM_CACHE
         if enum_type not in _ENUM_CACHE:
@@ -37,141 +40,101 @@ class BaseModel(KuzuBaseModel):
             values = {}
             for member in enum_type:
                 names[member.name] = member
-                # Store value as string for consistent lookup
-                values[str(member.value)] = member
-                # Also store numeric values directly if applicable
-                if isinstance(member.value, (int, float)):
-                    values[member.value] = member
-            _ENUM_CACHE[enum_type] = {
-                EnumCacheConstants.NAMES_KEY: names,
-                EnumCacheConstants.VALUES_KEY: values
-            }
+                values[member.value] = member
+            _ENUM_CACHE[enum_type] = (names, values)
         return _ENUM_CACHE[enum_type]
     
     @model_validator(mode='before')
     @classmethod
     def convert_str_to_enum(cls: Type['BaseModel'], values: Any) -> Any:
         """
-        Convert string inputs to Enum types if the field is an Enum.
-        
-        :param cls: The model class
-        :type cls: Type['BaseModel']
-        :param values: Input values to validate
-        :type values: Any
-        :returns: Validated values with enums converted
-        :rtype: Any
-        :raises ValueError: If enum value is invalid
+        Convert string values to enum instances for enum-typed fields.
+
+        Single-pass O(n) algorithm with O(1) enum lookups using cached mappings.
+        No exception handling, no fallbacks, no call stack inspection.
+
+        Approach:
+        1. Get type annotations (resolved or raw strings)
+        2. For each field: extract enum type, perform cached lookup, convert value
+        3. Raise ValueError immediately on invalid conversion
+
+        Args:
+            values: Input values dictionary
+
+        Returns:
+            Modified values with enum conversions applied
+
+        Raises:
+            ValueError: If a string value cannot be converted to the target enum
         """
-        # @@ STEP 1: Check if values is a dictionary
-        # || S.1.1: Use type() instead of isinstance
-        if type(values) is not dict:
+        if not isinstance(values, dict):
             return values
-            
-        # Get model annotations
-        annotations = getattr(cls, '__annotations__', {})
-        
-        # Process each annotated field
-        for field_name, field_type in annotations.items():
-            # Skip if field not present in input
-            if field_name not in values:
+
+        # Single loop through Pydantic's resolved field information
+        for field_name, field_info in cls.model_fields.items():
+            # Optimization #1: Single dictionary lookup with sentinel for missing fields
+            value = values.get(field_name, _MISSING)
+            if value is _MISSING or isinstance(value, Enum):
                 continue
-                
-            value = values[field_name]
-            
-            # Skip None values
-            if value is None:
-                continue
-                
-            # @@ STEP 2: Process only string values
-            # || S.2.1: Use type() instead of isinstance
-            if type(value) is not str:
-                continue
-            
-            # Handle Union types (e.g., Optional[EnumType])
-            origin = get_origin(field_type)
-            if origin is Union:
-                # Find the Enum type in the Union args
-                args = get_args(field_type)
+
+            # Get resolved type from Pydantic's field info
+            field_type = field_info.annotation
+
+            # Optimization #2 & #3: Conditional assignment and type checking
+            if get_origin(field_type) is Union:
                 enum_type = None
-                for arg in args:
-                    # @@ STEP 4: Find Enum type in Union args
-                    # || S.4.1: Check without isinstance
-                    try:
-                        if type(arg) is type and issubclass(arg, Enum):
-                            enum_type = arg
-                            break
-                    except TypeError:
-                        # || S.4.2: Not a class type - SKIP this arg, not an error
-                        continue
-                if enum_type:
-                    field_type = enum_type
-                else:
+                union_args = get_args(field_type)
+                has_none_type = type(None) in union_args
+
+                for arg in union_args:
+                    if isinstance(arg, type) and issubclass(arg, Enum):
+                        enum_type = arg
+                        break
+                if enum_type is None:
                     continue
-            
-            # @@ STEP 3: Check if field_type is an Enum subclass
-            # || S.3.1: Check type and subclass without isinstance
-            try:
-                if not (type(field_type) is type and issubclass(field_type, Enum)):
+
+                # For Optional[Enum], skip None values (they should remain None)
+                if value is None and has_none_type:
                     continue
-            except TypeError:
-                # || S.3.2: Not a class type - SKIP this field, not an error
-                continue
-                
-            # Get cached lookups for O(1) access
-            lookups = BaseModel._get_enum_lookups(field_type)
-            names = lookups[EnumCacheConstants.NAMES_KEY]
-            value_map = lookups[EnumCacheConstants.VALUES_KEY]
-            
-            # Direct lookup - O(1) for all cases
-            # Try member name
-            member = names.get(value)
-            if member is not None:
+                # No need to re-verify enum_type - already checked in loop
+            else:
+                enum_type = field_type
+                if not (isinstance(enum_type, type) and issubclass(enum_type, Enum)):
+                    continue
+
+            # Optimization #4: Tuple unpacking for faster cache access
+            names, value_map = BaseModel._get_enum_lookups(enum_type)
+
+            # Direct value lookup (works for all types)
+            member = value_map.get(value, _MISSING)
+            if member is not _MISSING:
                 values[field_name] = member
                 continue
-                
-            # Try direct value
-            member = value_map.get(value)
-            if member is not None:
-                values[field_name] = member
-                continue
-                
-            # Try numeric conversion - only if string looks numeric
-            # Quick check for digits to avoid expensive conversion attempts
-            if value[0].isdigit() or (len(value) > 1 and value[0] == '-' and value[1].isdigit()):
-                # Try int
-                if '.' not in value and 'e' not in value.lower():
-                    numeric = int(value)
-                    member = value_map.get(numeric)
-                    if member is not None:
-                        values[field_name] = member
-                        continue
-                else:
-                    # Try float
-                    numeric = float(value)
-                    member = value_map.get(numeric)
-                    if member is not None:
-                        values[field_name] = member
-                        continue
-            
-            # @@ STEP 5: Invalid value - build error message
-            # || S.5.1: Filter values without isinstance
+
+            # String-specific conversions
+            if isinstance(value, str):
+                # Name lookup
+                member = names.get(value, _MISSING)
+                if member is not _MISSING:
+                    values[field_name] = member
+                    continue
+
+                # Optimization #5: Optimized numeric string conversion
+                if len(value) > 0:
+                    first_char = value[0]
+                    if first_char.isdigit() or (len(value) > 1 and first_char == '-' and value[1].isdigit()):
+                        numeric = int(value) if '.' not in value and 'e' not in value.lower() else float(value)
+                        member = value_map.get(numeric, _MISSING)
+                        if member is not _MISSING:
+                            values[field_name] = member
+                            continue
+
+            # Invalid value - immediate error
             valid_names = list(names.keys())
-            valid_values = []
-            for k in value_map.keys():
-                try:
-                    # || S.5.2: Check if k is an Enum member
-                    if not issubclass(type(k), Enum):
-                        valid_values.append(str(k))
-                except TypeError:
-                    # Not a class - just append as string
-                    valid_values.append(str(k))
-            
-            # || S.5.3: Use error message from constants
+            valid_values = [v for v in value_map.keys() if v is not None]
             raise ValueError(
-                ErrorMessages.INVALID_FIELD_VALUE.format(
-                    field_name=field_name, 
-                    value=value
-                ) + f" Valid names: {valid_names}, valid values: {valid_values}"
+                f"Invalid value for field {field_name}: {value} "
+                f"Valid names: {valid_names}, valid values: {valid_values}"
             )
-        
+
         return values
