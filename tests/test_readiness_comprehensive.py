@@ -20,7 +20,7 @@ import tempfile
 import shutil
 import time
 import threading
-import psutil
+import sys
 import gc
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -202,6 +202,10 @@ class TestReadinessComprehensive:
     with precision and rigorous validation.
     """
 
+    def get_memory_usage(self):
+        """Get current memory usage in MB"""
+        return sys.getsizeof(gc.get_objects()) / 1024 / 1024
+
     def setup_method(self):
         """Set up test environment with configuration."""
         # Clear registry at start of each test to prevent memory corruption
@@ -212,8 +216,7 @@ class TestReadinessComprehensive:
         self.db_path = Path(self.temp_db) / "readiness_test.db"
 
         # Track memory usage
-        self.process = psutil.Process()
-        self.initial_memory = self.process.memory_info().rss / 1024 / 1024  # MB
+        self.initial_memory = self.get_memory_usage()
 
         # Performance tracking
         self.performance_metrics = {
@@ -249,7 +252,7 @@ class TestReadinessComprehensive:
             avg_query = sum(self.performance_metrics['query_times']) / len(self.performance_metrics['query_times'])
             print(f"Average Query Time: {avg_query:.4f}s")
         
-        final_memory = self.process.memory_info().rss / 1024 / 1024  # MB
+        final_memory = self.get_memory_usage()
         memory_increase = final_memory - self.initial_memory
         print(f"Memory Usage Increase: {memory_increase:.2f} MB")
 
@@ -286,7 +289,7 @@ class TestReadinessComprehensive:
 
     def _track_memory(self):
         """Track current memory usage."""
-        current_memory = self.process.memory_info().rss / 1024 / 1024  # MB
+        current_memory = self.get_memory_usage()
         self.performance_metrics['memory_usage'].append(current_memory)
         return current_memory
 
