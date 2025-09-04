@@ -13,7 +13,7 @@ authors = [
 ]
 keywords = ["kuzu", "graph", "database", "orm", "sqlalchemy", "cypher", "graph-database"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
