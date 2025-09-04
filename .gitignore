@@ -207,3 +207,4 @@ marimo/_lsp/
 __marimo__/
 .vscode/settings.json
 pytest_output.txt
+.github/workflows/test.yml.backup
