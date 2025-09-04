@@ -1,6 +1,7 @@
 # KuzuAlchemy
 
 A SQLAlchemy-like ORM for Kuzu graph database
+
 # Version: 0.1.1
 **Status**: Alpha
 
