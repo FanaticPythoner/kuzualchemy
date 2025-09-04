@@ -17,6 +17,7 @@ jobs:
       test-failed: ${{ steps.pytest.outputs.failed }}
       test-error: ${{ steps.pytest.outputs.error }}
       test-total: ${{ steps.pytest.outputs.total }}
+      test-summary: ${{ steps.pytest.outputs.summary }}
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
@@ -52,7 +53,7 @@ jobs:
       run: |
         if [ "${{ matrix.python-version }}" = "3.11" ]; then
           # Run tests and capture results (only for Python 3.11 to avoid duplicate outputs)
-          python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json || true
+          python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json > pytest_output.txt 2>&1 || true
 
           # Parse test results
           if [ -f test-results.json ]; then
@@ -71,16 +72,33 @@ jobs:
             echo "failed=$FAILED" >> $GITHUB_OUTPUT
             echo "error=$ERROR" >> $GITHUB_OUTPUT
             echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+            # Extract the pytest summary line
+            if [ -f pytest_output.txt ]; then
+              # Find the summary line with passed and timing info, then clean it
+              SUMMARY_LINE=$(grep -E "=+ .* passed.* in .* =+" pytest_output.txt | tail -1)
+              if [ -n "$SUMMARY_LINE" ]; then
+                # Extract content between = signs and remove warnings
+                SUMMARY=$(echo "$SUMMARY_LINE" | sed 's/^=*[[:space:]]*//' | sed 's/[[:space:]]*=*$//' | sed 's/, [0-9]* warnings//')
+                echo "Test summary: $SUMMARY"
+                echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+              else
+                echo "summary=$PASSED passed" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "summary=$PASSED passed" >> $GITHUB_OUTPUT
+            fi
           else
             echo "No test results file found"
             echo "passed=0" >> $GITHUB_OUTPUT
             echo "failed=0" >> $GITHUB_OUTPUT
             echo "error=1" >> $GITHUB_OUTPUT
             echo "total=1" >> $GITHUB_OUTPUT
+            echo "summary=Tests failed" >> $GITHUB_OUTPUT
           fi
 
           # Clean up
-          rm -f test-results.json
+          rm -f test-results.json pytest_output.txt
         else
           # For other Python versions, just run tests normally
           python -m pytest tests/ -v --tb=short

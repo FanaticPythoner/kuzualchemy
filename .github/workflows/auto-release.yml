@@ -157,6 +157,7 @@ jobs:
           TEST_FAILED="${{ needs.test.outputs.test-failed }}"
           TEST_ERROR="${{ needs.test.outputs.test-error }}"
           TEST_TOTAL="${{ needs.test.outputs.test-total }}"
+          TEST_SUMMARY="${{ needs.test.outputs.test-summary }}"
 
           # Create Python script with persistent marker system
           cat > update_readme.py << 'EOF'
@@ -194,8 +195,13 @@ jobs:
               else:  # Stable Release
                   return "> **Note**: This software is stable and production-ready."
 
-          def format_test_results(passed, failed, error, total):
-              """Format test results with status indicators."""
+          def format_test_results(passed, failed, error, total, summary):
+              """Format test results using actual pytest summary."""
+              # If we have a summary from pytest, use it directly
+              if summary and summary.strip() and summary != "Tests failed":
+                  return summary.strip()
+
+              # Fallback to old format if no summary available
               if not passed and not failed and not error and not total:
                   return "⏳ Running tests..."
 
@@ -226,7 +232,8 @@ jobs:
           except (ValueError, TypeError):
               test_passed = test_failed = test_error = test_total = 0
 
-          test_results = format_test_results(test_passed, test_failed, test_error, test_total)
+          test_summary = os.environ.get('TEST_SUMMARY', '')
+          test_results = format_test_results(test_passed, test_failed, test_error, test_total, test_summary)
           timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
           # Read README.md
@@ -286,6 +293,7 @@ jobs:
           TEST_FAILED="$TEST_FAILED" \
           TEST_ERROR="$TEST_ERROR" \
           TEST_TOTAL="$TEST_TOTAL" \
+          TEST_SUMMARY="$TEST_SUMMARY" \
           python update_readme.py
 
           # Verify the update
