@@ -12,12 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     # Skip if commit is from auto-release workflow to avoid unnecessary test runs
     if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
-    outputs:
-      test-passed: ${{ steps.pytest.outputs.passed }}
-      test-failed: ${{ steps.pytest.outputs.failed }}
-      test-error: ${{ steps.pytest.outputs.error }}
-      test-total: ${{ steps.pytest.outputs.total }}
-      test-summary: ${{ steps.pytest.outputs.summary }}
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
@@ -109,3 +103,117 @@ jobs:
       run: |
         python -m pip install pytest-cov
         python -m pytest tests/ -v --tb=short --cov=src/kuzualchemy --cov-report=xml --cov-report=term
+
+  # Separate job to collect test results and provide outputs
+  collect-test-results:
+    runs-on: ubuntu-latest
+    needs: test
+    if: "always() && !contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
+    outputs:
+      test-passed: ${{ steps.results.outputs.passed }}
+      test-failed: ${{ steps.results.outputs.failed }}
+      test-error: ${{ steps.results.outputs.error }}
+      test-total: ${{ steps.results.outputs.total }}
+      test-summary: ${{ steps.results.outputs.summary }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e ".[test]"
+        python -m pip install pytest-json-report
+
+    - name: Create test result parser script
+      run: |
+        echo 'import json, sys, os' > parse_results.py
+        echo 'if not os.path.exists("test-results.json"): print("ERROR: test-results.json not found", file=sys.stderr); sys.exit(1)' >> parse_results.py
+        echo 'try:' >> parse_results.py
+        echo '    with open("test-results.json", "r") as f: data = json.load(f)' >> parse_results.py
+        echo 'except Exception as e: print(f"ERROR parsing JSON: {e}", file=sys.stderr); sys.exit(1)' >> parse_results.py
+        echo 'summary = data.get("summary", {})' >> parse_results.py
+        echo 'if not summary: print("ERROR: No summary section in JSON", file=sys.stderr); sys.exit(1)' >> parse_results.py
+        echo 'print(f"PASSED={summary.get(\"passed\", 0)}")' >> parse_results.py
+        echo 'print(f"FAILED={summary.get(\"failed\", 0)}")' >> parse_results.py
+        echo 'print(f"ERROR={summary.get(\"error\", 0)}")' >> parse_results.py
+        echo 'print(f"TOTAL={summary.get(\"total\", 0)}")' >> parse_results.py
+
+    - name: Run tests and collect results
+      id: results
+      run: |
+        # Run tests and capture results
+        python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json > pytest_output.txt 2>&1
+        TEST_EXIT_CODE=$?
+
+        echo "=== PYTEST EXIT CODE: $TEST_EXIT_CODE ==="
+        echo "=== PYTEST OUTPUT FILE EXISTS: $(test -f pytest_output.txt && echo 'YES' || echo 'NO') ==="
+        echo "=== JSON RESULTS FILE EXISTS: $(test -f test-results.json && echo 'YES' || echo 'NO') ==="
+
+        # Show the last few lines of pytest output for debugging
+        echo "=== LAST 10 LINES OF PYTEST OUTPUT ==="
+        tail -10 pytest_output.txt || echo "Could not read pytest output"
+
+        # Parse test results - FAIL FAST, NO FALLBACKS
+        if [ ! -f test-results.json ]; then
+          echo "ERROR: test-results.json not found"
+          exit 1
+        fi
+
+        # Extract test counts using the parser script
+        RESULT_OUTPUT=$(python parse_results.py)
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to parse test results"
+          exit 1
+        fi
+
+        # Parse the output
+        eval "$RESULT_OUTPUT"
+
+        echo "=== EXTRACTED TEST COUNTS ==="
+        echo "PASSED: $PASSED"
+        echo "FAILED: $FAILED"
+        echo "ERROR: $ERROR"
+        echo "TOTAL: $TOTAL"
+
+        # Extract the pytest summary line - FAIL FAST if not found
+        if [ ! -f pytest_output.txt ]; then
+          echo "ERROR: pytest_output.txt not found"
+          exit 1
+        fi
+
+        # Find the summary line with passed and timing info
+        SUMMARY_LINE=$(grep -E "=+ .* passed.* in .* =+" pytest_output.txt | tail -1)
+        if [ -z "$SUMMARY_LINE" ]; then
+          echo "ERROR: Could not find pytest summary line in output"
+          echo "=== FULL PYTEST OUTPUT FOR DEBUGGING ==="
+          cat pytest_output.txt
+          exit 1
+        fi
+
+        # Extract content between = signs and remove warnings
+        SUMMARY=$(echo "$SUMMARY_LINE" | sed 's/^=*[[:space:]]*//' | sed 's/[[:space:]]*=*$//' | sed 's/, [0-9]* warnings//')
+
+        echo "=== EXTRACTED SUMMARY ==="
+        echo "SUMMARY_LINE: $SUMMARY_LINE"
+        echo "SUMMARY: $SUMMARY"
+
+        # Set outputs - FAIL FAST if any value is empty
+        if [ -z "$PASSED" ] || [ -z "$FAILED" ] || [ -z "$ERROR" ] || [ -z "$TOTAL" ] || [ -z "$SUMMARY" ]; then
+          echo "ERROR: One or more extracted values is empty"
+          echo "PASSED='$PASSED' FAILED='$FAILED' ERROR='$ERROR' TOTAL='$TOTAL' SUMMARY='$SUMMARY'"
+          exit 1
+        fi
+
+        echo "passed=$PASSED" >> $GITHUB_OUTPUT
+        echo "failed=$FAILED" >> $GITHUB_OUTPUT
+        echo "error=$ERROR" >> $GITHUB_OUTPUT
+        echo "total=$TOTAL" >> $GITHUB_OUTPUT
+        echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+        echo "=== OUTPUTS SET SUCCESSFULLY ==="

@@ -12,7 +12,7 @@ jobs:
   auto-release:
     name: Automatic Versioning and Release
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, collect-test-results]
     # Skip if commit is from auto-release workflow to prevent infinite loop
     if: "!contains(github.event.head_commit.message, '[skip-workflow]') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
 
@@ -153,11 +153,11 @@ jobs:
       - name: Update README.md with dynamic version, status, and test results
         run: |
           FINAL_VERSION="${{ steps.calculate_version.outputs.final_version }}"
-          TEST_PASSED="${{ needs.test.outputs.test-passed }}"
-          TEST_FAILED="${{ needs.test.outputs.test-failed }}"
-          TEST_ERROR="${{ needs.test.outputs.test-error }}"
-          TEST_TOTAL="${{ needs.test.outputs.test-total }}"
-          TEST_SUMMARY="${{ needs.test.outputs.test-summary }}"
+          TEST_PASSED="${{ needs.collect-test-results.outputs.test-passed }}"
+          TEST_FAILED="${{ needs.collect-test-results.outputs.test-failed }}"
+          TEST_ERROR="${{ needs.collect-test-results.outputs.test-error }}"
+          TEST_TOTAL="${{ needs.collect-test-results.outputs.test-total }}"
+          TEST_SUMMARY="${{ needs.collect-test-results.outputs.test-summary }}"
 
           # Create Python script with persistent marker system
           cat > update_readme.py << 'EOF'
@@ -195,45 +195,51 @@ jobs:
               else:  # Stable Release
                   return "> **Note**: This software is stable and production-ready."
 
-          def format_test_results(passed, failed, error, total, summary):
-              """Format test results using actual pytest summary."""
-              # If we have a summary from pytest, use it directly
-              if summary and summary.strip() and summary != "Tests failed":
-                  return summary.strip()
+          def format_test_results(summary):
+              """Format test results using actual pytest summary - FAIL FAST, NO FALLBACKS."""
+              if not summary or not summary.strip():
+                  raise ValueError(f"TEST_SUMMARY is empty or invalid: '{summary}'")
 
-              # Fallback to old format if no summary available
-              if not passed and not failed and not error and not total:
-                  return "⏳ Running tests..."
+              summary = summary.strip()
+              if summary == "Tests failed":
+                  raise ValueError("Tests failed - cannot proceed with release")
 
-              parts = []
-              if passed > 0:
-                  parts.append(f"✅ {passed} passed")
-              if failed > 0:
-                  parts.append(f"❌ {failed} failed")
-              if error > 0:
-                  parts.append(f"⚠️ {error} error")
-
-              if not parts:
-                  return "⏳ No test results"
-
-              return ", ".join(parts)
+              return summary
 
           # Get values from environment
           final_version = os.environ['FINAL_VERSION']
           status = calculate_status(final_version)
           disclaimer = get_disclaimer_note(status)
 
-          # Get test results (with fallbacks)
-          try:
-              test_passed = int(os.environ.get('TEST_PASSED', '0'))
-              test_failed = int(os.environ.get('TEST_FAILED', '0'))
-              test_error = int(os.environ.get('TEST_ERROR', '0'))
-              test_total = int(os.environ.get('TEST_TOTAL', '0'))
-          except (ValueError, TypeError):
-              test_passed = test_failed = test_error = test_total = 0
+          # Get test results - FAIL FAST, NO FALLBACKS
+          print("=== ENVIRONMENT VARIABLES DEBUG ===")
+          print(f"TEST_PASSED: '{os.environ.get('TEST_PASSED', 'NOT_SET')}'")
+          print(f"TEST_FAILED: '{os.environ.get('TEST_FAILED', 'NOT_SET')}'")
+          print(f"TEST_ERROR: '{os.environ.get('TEST_ERROR', 'NOT_SET')}'")
+          print(f"TEST_TOTAL: '{os.environ.get('TEST_TOTAL', 'NOT_SET')}'")
+          print(f"TEST_SUMMARY: '{os.environ.get('TEST_SUMMARY', 'NOT_SET')}'")
 
-          test_summary = os.environ.get('TEST_SUMMARY', '')
-          test_results = format_test_results(test_passed, test_failed, test_error, test_total, test_summary)
+          # Validate all required environment variables are present
+          required_vars = ['TEST_PASSED', 'TEST_FAILED', 'TEST_ERROR', 'TEST_TOTAL', 'TEST_SUMMARY']
+          missing_vars = [var for var in required_vars if var not in os.environ]
+          if missing_vars:
+              raise ValueError(f"Missing required environment variables: {missing_vars}")
+
+          # Parse test counts - FAIL FAST if invalid
+          test_passed = int(os.environ['TEST_PASSED'])
+          test_failed = int(os.environ['TEST_FAILED'])
+          test_error = int(os.environ['TEST_ERROR'])
+          test_total = int(os.environ['TEST_TOTAL'])
+          test_summary = os.environ['TEST_SUMMARY']
+
+          print(f"=== PARSED VALUES ===")
+          print(f"test_passed: {test_passed}")
+          print(f"test_failed: {test_failed}")
+          print(f"test_error: {test_error}")
+          print(f"test_total: {test_total}")
+          print(f"test_summary: '{test_summary}'")
+
+          test_results = format_test_results(test_summary)
           timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
           # Read README.md
