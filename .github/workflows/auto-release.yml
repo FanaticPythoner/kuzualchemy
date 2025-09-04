@@ -243,8 +243,8 @@ jobs:
           # Create the replacement content
           replacement_content = (
               "<!-- KUZUALCHEMY-AUTO-UPDATE-START -->\n"
-              f"# Version: {final_version}\n"
-              f"**Status**: {status}\n"
+              f"# Version: {final_version}\n\n"
+              f"**Status**: {status}\n\n"
               f"**Tests**: {test_results} (Last updated: {timestamp})\n\n"
               "[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)\n"
               "[![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)\n"
