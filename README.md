@@ -7,7 +7,7 @@ A SQLAlchemy-like ORM for Kuzu graph database
 
 **Status**: Alpha
 
-**Tests**: ⏳ Running tests... (Last updated: 2025-09-04 18:54:07 UTC)
+**Tests**: ⏳ Running tests... (Last updated: 2025-09-04 20:25:00 UTC)
 
 [![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)
 [![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)
