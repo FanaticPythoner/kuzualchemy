@@ -139,10 +139,10 @@ jobs:
         echo 'except Exception as e: print(f"ERROR parsing JSON: {e}", file=sys.stderr); sys.exit(1)' >> parse_results.py
         echo 'summary = data.get("summary", {})' >> parse_results.py
         echo 'if not summary: print("ERROR: No summary section in JSON", file=sys.stderr); sys.exit(1)' >> parse_results.py
-        echo 'print(f"PASSED={summary.get(\"passed\", 0)}")' >> parse_results.py
-        echo 'print(f"FAILED={summary.get(\"failed\", 0)}")' >> parse_results.py
-        echo 'print(f"ERROR={summary.get(\"error\", 0)}")' >> parse_results.py
-        echo 'print(f"TOTAL={summary.get(\"total\", 0)}")' >> parse_results.py
+        echo 'print("PASSED=" + str(summary.get("passed", 0)))' >> parse_results.py
+        echo 'print("FAILED=" + str(summary.get("failed", 0)))' >> parse_results.py
+        echo 'print("ERROR=" + str(summary.get("error", 0)))' >> parse_results.py
+        echo 'print("TOTAL=" + str(summary.get("total", 0)))' >> parse_results.py
 
     - name: Run tests and collect results
       id: results
