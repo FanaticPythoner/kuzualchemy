@@ -13,6 +13,12 @@ Note: This software is currently in alpha development. APIs may change.
 
 from __future__ import annotations
 
+import sys
+if sys.version_info >= (3, 8):
+    from importlib import metadata
+else:
+    import importlib_metadata as metadata
+
 # Core ORM components
 from .kuzu_orm import (
     # Base models
@@ -75,7 +81,6 @@ from .constants import (
     TypeMappingConstants,
     PerformanceConstants,
     FileSystemConstants,
-    PackageConstants,
     CascadeAction,
 )
 
@@ -185,11 +190,11 @@ from .kuzu_functions import (
     nodes, rels, properties, is_trail, is_acyclic, length, cost,
 )
 
-# Version info
-__version__ = PackageConstants.VERSION
-__author__ = PackageConstants.AUTHOR
-__email__ = PackageConstants.EMAIL
-__license__ = PackageConstants.LICENSE
+# Package metadata - dynamically retrieved from package metadata (PEP 621 compliant)
+__version__ = metadata.version("kuzualchemy")
+__author__ = "FanaticPythoner"  # From pyproject.toml authors
+__email__ = "info@kuzualchemy.com"  # From pyproject.toml authors
+__license__ = "GPL-3.0"  # From pyproject.toml license
 
 # Public API
 __all__ = [
@@ -269,7 +274,6 @@ __all__ = [
     "TypeMappingConstants",
     "PerformanceConstants",
     "FileSystemConstants",
-    "PackageConstants",
     # Kuzu functions
     # Text functions
     "concat", "ws_concat", "array_extract", "array_slice", "list_element", "list_extract", "prefix", "suffix",

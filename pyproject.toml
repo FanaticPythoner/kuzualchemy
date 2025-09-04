@@ -9,7 +9,7 @@ description = "SQLAlchemy-like ORM for Kuzu graph database"
 readme = "README.md"
 license = {text = "GPL-3.0"}
 authors = [
-    {name = "KuzuAlchemy Contributors", email = "kuzualchemy@example.com"}
+    {name = "FanaticPythoner", email = "info@kuzualchemy.com"}
 ]
 keywords = ["kuzu", "graph", "database", "orm", "sqlalchemy", "cypher", "graph-database"]
 classifiers = [
@@ -34,7 +34,8 @@ dependencies = [
     "typing-extensions",
     "polars",
     "pyarrow",
-    "pyahocorasick"
+    "pyahocorasick",
+    "importlib-metadata>=1.0; python_version<'3.8'"
 ]
 
 [project.optional-dependencies]

@@ -5,10 +5,13 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_call:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Skip if commit is from auto-release workflow to avoid unnecessary test runs
+    if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']

@@ -535,20 +535,9 @@ class FileSystemConstants:
 # ============================================================================
 # PACKAGE METADATA CONSTANTS
 # ============================================================================
-
-class PackageConstants:
-    """Package metadata constants."""
-
-    # @@ STEP 1: Define version information
-    VERSION: Final[str] = "0.1.0"
-    AUTHOR: Final[str] = "FanaticPythoner"
-    EMAIL: Final[str] = "info@kuzualchemy"
-    LICENSE: Final[str] = "GPL-3.0"
-
-    # @@ STEP 2: Define package information
-    PACKAGE_NAME: Final[str] = "kuzualchemy"
-    DESCRIPTION: Final[str] = "A SQLAlchemy-like ORM for Kuzu graph database"
-    URL: Final[str] = "https://github.com/FanaticPythoner/kuzualchemy"
+# || S.S. Package metadata is now managed via pyproject.toml for PEP 621 compliance
+# || S.S. All package constants (version, author, email, license, etc.) are retrieved
+# || S.S. dynamically from package metadata in __init__.py using importlib.metadata
 
 
 # ============================================================================
@@ -868,7 +857,6 @@ __all__ = [
     "TypeMappingConstants",
     "PerformanceConstants",
     "FileSystemConstants",
-    "PackageConstants",
     "EnumCacheConstants",
     "FunctionTypeConstants",
     "DefaultValueConstants",

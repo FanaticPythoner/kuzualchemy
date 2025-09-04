@@ -1,8 +1,8 @@
 # KuzuAlchemy
 
 A SQLAlchemy-like ORM for Kuzu graph database
-# Version: 0.1.1
-**Status**: Alpha
+# Version: {{VERSION}}
+**Status**: {{STATUS}}
 
 [![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)
 [![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)
