@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     # Skip if commit is from auto-release workflow to prevent infinite loop
-    if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
+    if: "!contains(github.event.head_commit.message, '[skip-workflow]') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
 
     permissions:
       contents: write
@@ -75,22 +75,33 @@ jobs:
             echo "Using real release version: $FINAL_VERSION"
           else
             # Generate dev version
-            # Find when the current version was introduced
-            VERSION_COMMIT=$(git log --oneline -S "version = \"$CURRENT_VERSION\"" pyproject.toml | tail -1 | cut -d' ' -f1)
+            # Find the LAST commit where current version was set (most recent)
+            VERSION_COMMIT=$(git log --oneline -p -- pyproject.toml | grep -B1 "+version = \"$CURRENT_VERSION\"" | head -1 | grep "^[a-f0-9]" | cut -d' ' -f1)
 
             if [ -z "$VERSION_COMMIT" ]; then
-              # If we can't find when current version was introduced, count all commits
-              DEV_NUMBER=$(git rev-list --count HEAD)
-              echo "No version history found, counting all commits: $DEV_NUMBER"
-            else
-              # Count commits since the version was introduced (exclusive of version commit)
-              DEV_NUMBER=$(git rev-list --count ${VERSION_COMMIT}..HEAD)
-              echo "Found $DEV_NUMBER commits since version $CURRENT_VERSION was introduced ($VERSION_COMMIT)"
+              # Fallback: find any commit that mentions this version
+              VERSION_COMMIT=$(git log --oneline --grep="$CURRENT_VERSION" | head -1 | cut -d' ' -f1)
+            fi
 
-              # If no commits since version introduction, use 1
+            if [ -z "$VERSION_COMMIT" ]; then
+              # Ultimate fallback: count from first commit
+              DEV_NUMBER=$(git rev-list --count HEAD)
+              echo "[FALLBACK] No version history found, counting all commits: $DEV_NUMBER"
+            else
+              # Count commits AFTER the version was set (this is the key fix)
+              DEV_NUMBER=$(git rev-list --count ${VERSION_COMMIT}..HEAD)
+              echo "[INFO] Found $DEV_NUMBER commits since version $CURRENT_VERSION was last set ($VERSION_COMMIT)"
+
+              # If no commits since version was set, this means we're at the release commit
               if [ "$DEV_NUMBER" -eq 0 ]; then
-                DEV_NUMBER=1
-                echo "No commits since version introduction, using dev1"
+                # We're at the exact release commit, no dev version needed
+                FINAL_VERSION="$CURRENT_VERSION"
+                RELEASE_TYPE="release"
+                echo "[INFO] At release commit, using version as-is: $FINAL_VERSION"
+                echo "final_version=$FINAL_VERSION" >> $GITHUB_OUTPUT
+                echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+                echo "Final version: $FINAL_VERSION (type: $RELEASE_TYPE)"
+                exit 0
               fi
             fi
             
@@ -139,56 +150,147 @@ jobs:
           # Clean up
           rm update_version.py
 
-      - name: Update README.md with dynamic version and status
+      - name: Update README.md with dynamic version, status, and test results
         run: |
           FINAL_VERSION="${{ steps.calculate_version.outputs.final_version }}"
+          TEST_PASSED="${{ needs.test.outputs.test-passed }}"
+          TEST_FAILED="${{ needs.test.outputs.test-failed }}"
+          TEST_ERROR="${{ needs.test.outputs.test-error }}"
+          TEST_TOTAL="${{ needs.test.outputs.test-total }}"
 
-          # Create Python script to calculate status and update README
+          # Create Python script with persistent marker system
           cat > update_readme.py << 'EOF'
           import re
           import os
-          from packaging import version
+          from datetime import datetime
 
           def calculate_status(version_str: str) -> str:
               """Calculate status based on version ranges."""
               # Remove dev suffix for status calculation
               clean_version = re.sub(r'\.dev\d+$', '', version_str)
-              v = version.parse(clean_version)
 
-              if v < version.parse("0.5.0"):
+              # Parse version components
+              parts = clean_version.split('.')
+              major = int(parts[0]) if len(parts) > 0 else 0
+              minor = int(parts[1]) if len(parts) > 1 else 0
+
+              if major == 0 and minor < 5:
                   return "Alpha"
-              elif v < version.parse("1.0.0"):
+              elif major == 0 and minor < 10:
                   return "Beta"
-              elif v < version.parse("2.0.0"):
+              elif major < 1:
                   return "Release Candidate"
               else:
                   return "Stable Release"
 
-          # Get version from environment
+          def get_disclaimer_note(status: str) -> str:
+              """Generate appropriate disclaimer note based on status."""
+              if status == "Alpha":
+                  return "> **Note**: This software is currently in alpha development. APIs may change."
+              elif status == "Beta":
+                  return "> **Note**: This software is in beta. Some features may be unstable. APIs may change."
+              elif status == "Release Candidate":
+                  return "> **Note**: This software is a release candidate. Please report any issues."
+              else:  # Stable Release
+                  return "> **Note**: This software is stable and production-ready."
+
+          def format_test_results(passed, failed, error, total):
+              """Format test results with status indicators."""
+              if not passed and not failed and not error and not total:
+                  return "⏳ Running tests..."
+
+              parts = []
+              if passed > 0:
+                  parts.append(f"✅ {passed} passed")
+              if failed > 0:
+                  parts.append(f"❌ {failed} failed")
+              if error > 0:
+                  parts.append(f"⚠️ {error} error")
+
+              if not parts:
+                  return "⏳ No test results"
+
+              return ", ".join(parts)
+
+          # Get values from environment
           final_version = os.environ['FINAL_VERSION']
           status = calculate_status(final_version)
+          disclaimer = get_disclaimer_note(status)
+
+          # Get test results (with fallbacks)
+          try:
+              test_passed = int(os.environ.get('TEST_PASSED', '0'))
+              test_failed = int(os.environ.get('TEST_FAILED', '0'))
+              test_error = int(os.environ.get('TEST_ERROR', '0'))
+              test_total = int(os.environ.get('TEST_TOTAL', '0'))
+          except (ValueError, TypeError):
+              test_passed = test_failed = test_error = test_total = 0
+
+          test_results = format_test_results(test_passed, test_failed, test_error, test_total)
+          timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
           # Read README.md
           with open('README.md', 'r', encoding='utf-8') as f:
               content = f.read()
 
-          # Replace placeholders
-          content = content.replace('{{VERSION}}', final_version)
-          content = content.replace('{{STATUS}}', status)
+          # Create the replacement content
+          replacement_content = (
+              "<!-- KUZUALCHEMY-AUTO-UPDATE-START -->\n"
+              f"# Version: {final_version}\n"
+              f"**Status**: {status}\n"
+              f"**Tests**: {test_results} (Last updated: {timestamp})\n\n"
+              "[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)\n"
+              "[![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)\n"
+              "[![Python versions](https://img.shields.io/pypi/pyversions/kuzualchemy.svg)](https://pypi.org/project/kuzualchemy/)\n\n"
+              "KuzuAlchemy is an Object-Relational Mapping (ORM) library for the [Kuzu graph database](https://kuzudb.com/). It provides a SQLAlchemy-like interface for working with graph data.\n\n"
+              f"{disclaimer}\n"
+              "<!-- KUZUALCHEMY-AUTO-UPDATE-END -->"
+          )
+
+          # Use persistent marker system
+          marker_pattern = r'<!-- KUZUALCHEMY-AUTO-UPDATE-START -->.*?<!-- KUZUALCHEMY-AUTO-UPDATE-END -->'
+
+          if re.search(marker_pattern, content, re.DOTALL):
+              # Markers exist, replace content between them
+              content = re.sub(marker_pattern, replacement_content, content, flags=re.DOTALL)
+              print(f'Updated existing markers in README.md')
+          else:
+              # Markers don't exist, add them after the third line
+              lines = content.split('\n')
+              if len(lines) >= 3:
+                  lines.insert(4, '')  # Add blank line
+                  lines.insert(5, replacement_content)
+                  lines.insert(6, '')  # Add blank line
+                  content = '\n'.join(lines)
+                  print(f'Added new markers to README.md')
+              else:
+                  # Fallback: append at the end
+                  content += '\n\n' + replacement_content + '\n'
+                  print(f'Appended markers to end of README.md')
 
           # Write back to README.md
           with open('README.md', 'w', encoding='utf-8') as f:
               f.write(content)
 
-          print(f'Updated README.md: Version={final_version}, Status={status}')
+          print(f'README.md updated successfully:')
+          print(f'  Version: {final_version}')
+          print(f'  Status: {status}')
+          print(f'  Tests: {test_results}')
+          print(f'  Disclaimer: {disclaimer}')
+          print(f'  Timestamp: {timestamp}')
           EOF
 
           # Run the update script
-          FINAL_VERSION="$FINAL_VERSION" python update_readme.py
+          FINAL_VERSION="$FINAL_VERSION" \
+          TEST_PASSED="$TEST_PASSED" \
+          TEST_FAILED="$TEST_FAILED" \
+          TEST_ERROR="$TEST_ERROR" \
+          TEST_TOTAL="$TEST_TOTAL" \
+          python update_readme.py
 
           # Verify the update
-          echo "README.md updated with:"
-          head -10 README.md | grep -E "(Version|Status)"
+          echo "README.md updated with persistent markers:"
+          grep -A 5 -B 1 "KUZUALCHEMY-AUTO-UPDATE" README.md || echo "Markers not found"
 
           # Clean up
           rm update_readme.py
@@ -205,16 +307,23 @@ jobs:
           else
             echo "README.md changed, committing update"
             git add README.md
-            git commit -m "chore: update README.md with version ${{ steps.calculate_version.outputs.final_version }} and status [auto-release-skip]
+
+            # Use a commit message that will be excluded by the workflow trigger
+            git commit -m "chore: update README.md with version ${{ steps.calculate_version.outputs.final_version }} [skip-workflow]
 
             - Version: ${{ steps.calculate_version.outputs.final_version }}
             - Status: Auto-calculated based on version ranges
             - Updated by: GitHub Actions auto-release workflow"
 
-            # Push the commit
-            git push origin main
-            echo "README.md committed and pushed"
+            # Only push if not in local testing
+            if [[ "${{ github.actor }}" != "nektos/act" ]] && [[ -n "${{ secrets.GITHUB_TOKEN }}" ]]; then
+              git push origin main
+              echo "README.md committed and pushed"
+            else
+              echo "Skipping git push (local testing environment)"
+            fi
           fi
+
 
       - name: Build package
         run: |
@@ -226,31 +335,70 @@ jobs:
           ls -la dist/
           
       - name: Create GitHub Release
-        uses: actions/create-release@v1
+        run: |
+          # Skip release creation in local testing environment
+          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ secrets.GITHUB_TOKEN }}" ]]; then
+            echo "Skipping GitHub release creation (local testing or missing token)"
+            echo "Would create release: v${{ steps.calculate_version.outputs.final_version }}"
+            exit 0
+          fi
+
+          # Create release using GitHub CLI (modern approach)
+          RELEASE_TYPE="${{ steps.calculate_version.outputs.release_type }}"
+          VERSION="v${{ steps.calculate_version.outputs.final_version }}"
+
+          PRERELEASE_FLAG=""
+          if [[ "$RELEASE_TYPE" == "prerelease" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$VERSION" \
+            --title "Release $VERSION" \
+            --notes "Automatic release for version ${{ steps.calculate_version.outputs.final_version }}
+
+          **Release Type**: ${{ steps.calculate_version.outputs.release_type }}
+          **Commit**: ${{ github.sha }}
+          **Branch**: ${{ github.ref_name }}
+
+          This release was automatically generated from commit ${{ github.sha }}." \
+            $PRERELEASE_FLAG \
+            --repo ${{ github.repository }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.calculate_version.outputs.final_version }}
-          release_name: Release v${{ steps.calculate_version.outputs.final_version }}
-          body: |
-            Automatic release for version ${{ steps.calculate_version.outputs.final_version }}
-            
-            **Release Type**: ${{ steps.calculate_version.outputs.release_type }}
-            **Commit**: ${{ github.sha }}
-            **Branch**: ${{ github.ref_name }}
-            
-            This release was automatically generated from commit ${{ github.sha }}.
-          draft: false
-          prerelease: ${{ steps.calculate_version.outputs.release_type == 'prerelease' }}
           
       - name: Publish package to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          skip-existing: true
-          verbose: true
+        run: |
+          # Skip PyPI publishing in local testing environment
+          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ secrets.PYPI_API_TOKEN }}" ]]; then
+            echo "Skipping PyPI publishing (local testing or missing token)"
+            echo "Would publish: kuzualchemy==${{ steps.calculate_version.outputs.final_version }}"
+            echo "Built packages:"
+            ls -la dist/
+            exit 0
+          fi
+
+          # Publish to PyPI using twine (more reliable than action for complex cases)
+          python -m pip install --upgrade twine
+          python -m twine upload dist/* --verbose
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
           
-      - name: Upload build artifacts
+      - name: Upload build artifacts (local testing check)
+        run: |
+          # Skip artifact upload in local testing environment
+          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ env.ACTIONS_RUNTIME_TOKEN }}" ]]; then
+            echo "Skipping artifact upload (local testing environment)"
+            echo "Would upload artifacts:"
+            ls -la dist/
+            echo "Artifact name would be: dist-${{ steps.calculate_version.outputs.final_version }}"
+            exit 0
+          fi
+
+          echo "Production environment detected, artifacts will be uploaded by next step"
+
+      - name: Upload build artifacts (production only)
+        if: github.actor != 'nektos/act' && env.ACTIONS_RUNTIME_TOKEN != ''
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ steps.calculate_version.outputs.final_version }}

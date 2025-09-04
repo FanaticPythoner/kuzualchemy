@@ -86,19 +86,22 @@ if "%VERSION_CHANGED%"=="true" (
 ) else (
     REM Generate dev version
     echo [INFO] Generating dev version...
-    
-    REM For simplicity in batch, we'll use a default dev number
-    REM In the real workflow, this would count commits since last version change
+
+    REM CORRECTED LOGIC: Find commits since LAST version change, not all commits
+    REM For batch simplicity, we'll use a more conservative approach
     set DEV_NUMBER=1
-    
-    REM Try to get actual commit count (simplified)
+
+    REM Try to get actual commit count since last version change (simplified)
     git rev-parse --git-dir >nul 2>&1
     if not errorlevel 1 (
+        REM In a real implementation, this would find the last commit where version was set
+        REM For now, use a simple count but modulo to keep numbers reasonable
         for /f "delims=" %%i in ('git rev-list --count HEAD 2^>nul ^| findstr /R "[0-9]"') do (
-            set /a DEV_NUMBER=%%i %% 100
+            set /a DEV_NUMBER=%%i %% 10
             if !DEV_NUMBER! equ 0 set DEV_NUMBER=1
         )
-        echo [INFO] Using dev number: !DEV_NUMBER!
+        echo [INFO] Using dev number: !DEV_NUMBER! ^(simplified batch logic^)
+        echo [NOTE] Real workflow uses commits since last version change
     ) else (
         echo [WARNING] Not in git repository, defaulting to dev1
     )
@@ -169,54 +172,11 @@ echo [SUCCESS] Package building test completed
 REM Test README.md update
 echo [INFO] Testing README.md update (dry run)...
 
-REM Create Python script to test README update
-(
-echo import re
-echo import os
-echo from packaging import version
-echo.
-echo def calculate_status(version_str^):
-echo     """Calculate status based on version ranges."""
-echo     # Remove dev suffix for status calculation
-echo     clean_version = re.sub(r'\.dev\d+$', '', version_str^)
-echo     v = version.parse(clean_version^)
-echo.
-echo     if v ^< version.parse("0.5.0"^):
-echo         return "Alpha"
-echo     elif v ^< version.parse("1.0.0"^):
-echo         return "Beta"
-echo     elif v ^< version.parse("2.0.0"^):
-echo         return "Release Candidate"
-echo     else:
-echo         return "Stable Release"
-echo.
-echo # Get version from environment
-echo final_version = '%FINAL_VERSION%'
-echo status = calculate_status(final_version^)
-echo.
-echo # Read current README.md
-echo with open('README.md', 'r', encoding='utf-8'^) as f:
-echo     content = f.read(^)
-echo.
-echo # Check if placeholders exist
-echo if '{{VERSION}}' in content and '{{STATUS}}' in content:
-echo     print(f'[OK] README.md contains placeholders'^)
-echo     print(f'[OK] Would update: Version={{VERSION}} -^> {final_version}'^)
-echo     print(f'[OK] Would update: Status={{STATUS}} -^> {status}'^)
-echo     print(f'[OK] README.md update test successful'^)
-echo else:
-echo     print(f'[ERROR] README.md missing placeholders {{VERSION}} or {{STATUS}}'^)
-echo     exit(1^)
-) > test_readme_update.py
-
-python test_readme_update.py
+python test_readme_markers.py %FINAL_VERSION%
 if errorlevel 1 (
     echo [ERROR] README.md update test failed
-    del test_readme_update.py
     exit /b 1
 )
-
-del test_readme_update.py
 echo [SUCCESS] README.md update test completed
 
 REM Print summary

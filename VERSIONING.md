@@ -19,7 +19,7 @@
 - Counts commits since last version change (e.g., 3 commits)
 - Generates dev version: `0.1.0.dev3`
 - Updates `pyproject.toml` to `version = "0.1.0.dev3"`
-- Updates `README.md` with current version and calculated status
+- Updates `README.md` with current version, calculated status, and test results using persistent markers
 - Commits the updated files back to repository
 - Builds package with version `0.1.0.dev3`
 - Creates GitHub pre-release tagged `v0.1.0.dev3`
@@ -51,7 +51,7 @@
 **What the system does automatically**:
 - Detects that `pyproject.toml` version changed in this commit
 - Uses your specified version: `0.1.1`
-- Updates `README.md` with current version and calculated status
+- Updates `README.md` with current version, calculated status, and test results using persistent markers
 - Commits the updated files back to repository
 - Builds package with version `0.1.1`
 - Creates GitHub full release tagged `v0.1.1`

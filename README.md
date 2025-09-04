@@ -1,8 +1,11 @@
 # KuzuAlchemy
 
 A SQLAlchemy-like ORM for Kuzu graph database
+
+<!-- KUZUALCHEMY-AUTO-UPDATE-START -->
 # Version: 0.1.0.dev11
 **Status**: Alpha
+**Tests**: ⏳ Running tests... (Last updated: 2025-01-04 12:00:00 UTC)
 
 [![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)
 [![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)
@@ -11,6 +14,7 @@ A SQLAlchemy-like ORM for Kuzu graph database
 KuzuAlchemy is an Object-Relational Mapping (ORM) library for the [Kuzu graph database](https://kuzudb.com/). It provides a SQLAlchemy-like interface for working with graph data.
 
 > **Note**: This software is currently in alpha development. APIs may change.
+<!-- KUZUALCHEMY-AUTO-UPDATE-END -->
 
 ## Table of Contents
 

@@ -165,24 +165,33 @@ calculate_version() {
     else
         # Generate dev version
         print_status "Generating dev version..."
-        
-        # Find when the current version was introduced
+
+        # Find the LAST commit where current version was set (most recent)
         if git rev-parse --git-dir > /dev/null 2>&1; then
-            VERSION_COMMIT=$(git log --oneline -S "version = \"$CURRENT_VERSION\"" pyproject.toml 2>/dev/null | tail -1 | cut -d' ' -f1)
+            VERSION_COMMIT=$(git log --oneline -p -- pyproject.toml 2>/dev/null | grep -B1 "+version = \"$CURRENT_VERSION\"" | head -1 | grep "^[a-f0-9]" | cut -d' ' -f1)
 
             if [ -z "$VERSION_COMMIT" ]; then
-                # If we can't find when current version was introduced, count all commits
-                DEV_NUMBER=$(git rev-list --count HEAD 2>/dev/null || echo "1")
-                print_status "No version history found, counting all commits: $DEV_NUMBER"
-            else
-                # Count commits since the version was introduced (exclusive of version commit)
-                DEV_NUMBER=$(git rev-list --count ${VERSION_COMMIT}..HEAD 2>/dev/null || echo "1")
-                print_status "Found $DEV_NUMBER commits since version $CURRENT_VERSION was introduced ($VERSION_COMMIT)"
+                # Fallback: find any commit that mentions this version
+                VERSION_COMMIT=$(git log --oneline --grep="$CURRENT_VERSION" 2>/dev/null | head -1 | cut -d' ' -f1)
+            fi
 
-                # If no commits since version introduction, use 1
+            if [ -z "$VERSION_COMMIT" ]; then
+                # Ultimate fallback: count from first commit
+                DEV_NUMBER=$(git rev-list --count HEAD 2>/dev/null || echo "1")
+                print_status "[FALLBACK] No version history found, counting all commits: $DEV_NUMBER"
+            else
+                # Count commits AFTER the version was set (this is the key fix)
+                DEV_NUMBER=$(git rev-list --count ${VERSION_COMMIT}..HEAD 2>/dev/null || echo "1")
+                print_status "Found $DEV_NUMBER commits since version $CURRENT_VERSION was last set ($VERSION_COMMIT)"
+
+                # If no commits since version was set, this means we're at the release commit
                 if [ "$DEV_NUMBER" -eq 0 ]; then
-                    DEV_NUMBER=1
-                    print_status "No commits since version introduction, using dev1"
+                    # We're at the exact release commit, no dev version needed
+                    FINAL_VERSION="$CURRENT_VERSION"
+                    RELEASE_TYPE="release"
+                    print_success "At release commit, using version as-is: $FINAL_VERSION"
+                    print_success "Would create a RELEASE: $FINAL_VERSION"
+                    return 0
                 fi
             fi
         else
@@ -260,11 +269,12 @@ test_package_building() {
 test_readme_update() {
     print_status "Testing README.md update (dry run)..."
 
-    # Create Python script to test README update
+    # Create Python script to test README update with persistent markers
     cat > test_readme_update.py << 'EOF'
 import re
 import os
 from packaging import version
+from datetime import datetime
 
 def calculate_status(version_str: str) -> str:
     """Calculate status based on version ranges."""
@@ -281,23 +291,42 @@ def calculate_status(version_str: str) -> str:
     else:
         return "Stable Release"
 
+def get_disclaimer_note(status: str) -> str:
+    """Generate appropriate disclaimer note based on status."""
+    if status == "Alpha":
+        return "> **Note**: This software is currently in alpha development. APIs may change."
+    elif status == "Beta":
+        return "> **Note**: This software is in beta. Some features may be unstable."
+    elif status == "Release Candidate":
+        return "> **Note**: This software is a release candidate. Please report any issues."
+    else:  # Stable Release
+        return "> **Note**: This software is stable and production-ready."
+
 # Get version from environment
 final_version = os.environ.get('FINAL_VERSION', 'unknown')
 status = calculate_status(final_version)
+disclaimer = get_disclaimer_note(status)
+test_results = "[OK] 42 passed, [FAIL] 1 failed, [ERROR] 0 error"
+timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
 # Read current README.md
 try:
     with open('README.md', 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # Check if placeholders exist
-    if '{{VERSION}}' in content and '{{STATUS}}' in content:
-        print(f'[OK] README.md contains placeholders')
-        print(f'[OK] Would update: Version={{VERSION}} -> {final_version}')
-        print(f'[OK] Would update: Status={{STATUS}} -> {status}')
+    # Check for persistent markers
+    marker_pattern = r'<!-- KUZUALCHEMY-AUTO-UPDATE-START -->.*?<!-- KUZUALCHEMY-AUTO-UPDATE-END -->'
+
+    if re.search(marker_pattern, content, re.DOTALL):
+        print(f'[OK] README.md contains persistent markers')
+        print(f'[OK] Would update: Version -> {final_version}')
+        print(f'[OK] Would update: Status -> {status}')
+        print(f'[OK] Would update: Tests -> {test_results}')
+        print(f'[OK] Would update: Disclaimer -> {disclaimer}')
         print(f'[OK] README.md update test successful')
     else:
-        print(f'[ERROR] README.md missing placeholders {{VERSION}} or {{STATUS}}')
+        print(f'[ERROR] README.md missing persistent markers')
+        print(f'[INFO] Looking for: <!-- KUZUALCHEMY-AUTO-UPDATE-START -->')
         exit(1)
 except Exception as e:
     print(f'[ERROR] README.md update test failed: {e}')

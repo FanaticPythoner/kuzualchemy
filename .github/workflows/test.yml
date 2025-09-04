@@ -12,6 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     # Skip if commit is from auto-release workflow to avoid unnecessary test runs
     if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
+    outputs:
+      test-passed: ${{ steps.pytest.outputs.passed }}
+      test-failed: ${{ steps.pytest.outputs.failed }}
+      test-error: ${{ steps.pytest.outputs.error }}
+      test-total: ${{ steps.pytest.outputs.total }}
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12']
@@ -38,21 +43,51 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install -e ".[test]"
 
-    - name: Run tests with pytest
+    - name: Install pytest-json-report
       run: |
-        python -m pytest tests/ -v --tb=short
+        python -m pip install pytest-json-report
+
+    - name: Run tests with pytest
+      id: pytest
+      run: |
+        if [ "${{ matrix.python-version }}" = "3.11" ]; then
+          # Run tests and capture results (only for Python 3.11 to avoid duplicate outputs)
+          python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json || true
+
+          # Parse test results
+          if [ -f test-results.json ]; then
+            # Extract test counts using Python one-liner
+            PASSED=$(python -c "import json; data=json.load(open('test-results.json')); print(data.get('summary', {}).get('passed', 0))")
+            FAILED=$(python -c "import json; data=json.load(open('test-results.json')); print(data.get('summary', {}).get('failed', 0))")
+            ERROR=$(python -c "import json; data=json.load(open('test-results.json')); print(data.get('summary', {}).get('error', 0))")
+            TOTAL=$(python -c "import json; data=json.load(open('test-results.json')); print(data.get('summary', {}).get('total', 0))")
+
+            echo "PYTEST_PASSED=$PASSED"
+            echo "PYTEST_FAILED=$FAILED"
+            echo "PYTEST_ERROR=$ERROR"
+            echo "PYTEST_TOTAL=$TOTAL"
+
+            echo "passed=$PASSED" >> $GITHUB_OUTPUT
+            echo "failed=$FAILED" >> $GITHUB_OUTPUT
+            echo "error=$ERROR" >> $GITHUB_OUTPUT
+            echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          else
+            echo "No test results file found"
+            echo "passed=0" >> $GITHUB_OUTPUT
+            echo "failed=0" >> $GITHUB_OUTPUT
+            echo "error=1" >> $GITHUB_OUTPUT
+            echo "total=1" >> $GITHUB_OUTPUT
+          fi
+
+          # Clean up
+          rm -f test-results.json
+        else
+          # For other Python versions, just run tests normally
+          python -m pytest tests/ -v --tb=short
+        fi
 
     - name: Run tests with coverage
       if: matrix.python-version == '3.11'
       run: |
         python -m pip install pytest-cov
         python -m pytest tests/ -v --tb=short --cov=src/kuzualchemy --cov-report=xml --cov-report=term
-
-    - name: Upload coverage to Codecov
-      if: matrix.python-version == '3.11'
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
