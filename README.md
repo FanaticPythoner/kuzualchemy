@@ -4,11 +4,11 @@ A SQLAlchemy-like ORM for Kuzu graph database
 
 ## |▼▼▼ Automated Readme Data/Metrics (start) ▼▼▼|
 <!-- KUZUALCHEMY-AUTO-UPDATE-START -->
-**Version**: 0.2.0.dev22
+**Version**: 0.2.0.dev24
 
 **Status**: Alpha
 
-**Tests**: 496 passed in 40.35s (Last updated: 2025-09-05 20:49:39 UTC)
+**Tests**: 496 passed in 61.93s (0:01:01) (Last updated: 2025-09-05 21:14:07 UTC)
 
 [![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)
 [![PyPI version](https://badge.fury.io/py/kuzualchemy.svg)](https://badge.fury.io/py/kuzualchemy)
