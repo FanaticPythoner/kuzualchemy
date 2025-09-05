@@ -65,6 +65,8 @@ jobs:
       - name: Calculate dev version if needed
         id: calculate_version
         run: |
+          set -euo pipefail
+
           CURRENT_VERSION="${{ steps.extract_version.outputs.current_version }}"
           VERSION_CHANGED="${{ steps.version_changed.outputs.version_changed }}"
 
@@ -74,96 +76,52 @@ jobs:
             RELEASE_TYPE="release"
             echo "Using real release version: $FINAL_VERSION"
           else
-            # Generate dev version using MATHEMATICALLY ROBUST algorithm
-            echo "[ALGORITHM] Starting robust version commit detection..."
-
-            # STEP 1: Create comprehensive search patterns for version changes
-            # Handle multiple TOML formatting variations and git diff formats
-            SEARCH_PATTERNS=(
-              "^\\+.*version[[:space:]]*=[[:space:]]*[\"']${CURRENT_VERSION}[\"']"
-              "^\\+[[:space:]]*version[[:space:]]*=[[:space:]]*[\"']${CURRENT_VERSION}[\"']"
-              "^\\+version[[:space:]]*=[[:space:]]*[\"']${CURRENT_VERSION}[\"']"
-            )
+            # Find the commit where version was CHANGED TO the current version
+            echo "Searching for commit that changed version to $CURRENT_VERSION"
 
             VERSION_COMMIT=""
+            while IFS=' ' read -r commit_hash commit_msg; do
+              echo "Checking commit $commit_hash: $commit_msg"
 
-            # STEP 2: Use robust commit-by-commit search for maximum accuracy
-            echo "[SEARCH] Searching through commit history for version changes..."
+              # Get version changes in this commit
+              VERSION_DIFF=$(git show "$commit_hash" -- pyproject.toml | grep -E "^[+-].*version.*=" || true)
 
-            # Iterate through commits that modified pyproject.toml
-            git log --oneline -- pyproject.toml | while read commit_hash commit_msg; do
-              # Check if this commit added the current version
-              if git show $commit_hash -- pyproject.toml | grep -q "^\\+version = \"$CURRENT_VERSION\""; then
-                echo "$commit_hash"
-                break
+              if [ -n "$VERSION_DIFF" ]; then
+                # Extract added and removed versions
+                ADDED_VERSION=$(echo "$VERSION_DIFF" | grep "^+version = " | sed 's/^+version = "\(.*\)"/\1/' || true)
+                REMOVED_VERSION=$(echo "$VERSION_DIFF" | grep "^-version = " | sed 's/^-version = "\(.*\)"/\1/' || true)
+
+                echo "Version diff - Added: '$ADDED_VERSION', Removed: '$REMOVED_VERSION'"
+
+                # Check if this commit changed TO the current version (not just reformatted it)
+                if [ "$ADDED_VERSION" = "$CURRENT_VERSION" ] && [ "$REMOVED_VERSION" != "$CURRENT_VERSION" ] && [ -n "$REMOVED_VERSION" ]; then
+                  VERSION_COMMIT="$commit_hash"
+                  echo "FOUND version change commit: $VERSION_COMMIT (changed from $REMOVED_VERSION to $ADDED_VERSION)"
+                  break
+                fi
               fi
-            done > /tmp/version_commit.txt
+            done < <(git log --oneline -- pyproject.toml)
 
-            VERSION_COMMIT=$(cat /tmp/version_commit.txt 2>/dev/null || echo "")
-            rm -f /tmp/version_commit.txt
-
-            if [ -n "$VERSION_COMMIT" ]; then
-              echo "[FOUND] Version commit found: $VERSION_COMMIT"
+            if [ -z "$VERSION_COMMIT" ]; then
+              echo "ERROR: Could not find commit that changed version to $CURRENT_VERSION"
+              echo "This means the version history is corrupted or the algorithm is wrong"
+              exit 1
             fi
 
-            # STEP 3: Alternative search method using git log --follow for renamed files
-            if [ -z "$VERSION_COMMIT" ]; then
-              echo "[ALTERNATIVE] Searching with git log --follow..."
-              TEMP_COMMIT=$(git log --follow -p -- pyproject.toml | grep -E "^\\+.*version.*=.*[\"']${CURRENT_VERSION}[\"']" -B 10 | grep "^commit " | head -1 | cut -d' ' -f2)
-              if [ -n "$TEMP_COMMIT" ]; then
-                VERSION_COMMIT="$TEMP_COMMIT"
-                echo "[FOUND] Version commit found with --follow: $VERSION_COMMIT"
-              fi
-            fi
+            # Calculate commits since version change
+            DEV_NUMBER=$(git rev-list --count "${VERSION_COMMIT}..HEAD")
+            echo "Found $DEV_NUMBER commits since version $CURRENT_VERSION was set in $VERSION_COMMIT"
 
-            # STEP 4: Fallback to commit message search (less reliable but better than nothing)
-            if [ -z "$VERSION_COMMIT" ]; then
-              echo "[FALLBACK-1] Searching commit messages for version references..."
-              # Look for commits that mention version changes
-              VERSION_COMMIT=$(git log --oneline --grep="version.*${CURRENT_VERSION}" --grep="bump.*${CURRENT_VERSION}" --grep="release.*${CURRENT_VERSION}" | head -1 | cut -d' ' -f1)
-              if [ -n "$VERSION_COMMIT" ]; then
-                echo "[FOUND] Version commit found in messages: $VERSION_COMMIT"
-              fi
-            fi
-
-            # STEP 5: Calculate dev number based on findings
-            if [ -z "$VERSION_COMMIT" ]; then
-              # Ultimate fallback: use total commit count modulo reasonable number
-              TOTAL_COMMITS=$(git rev-list --count HEAD)
-              DEV_NUMBER=$((TOTAL_COMMITS % 100 + 1))  # Keep dev numbers reasonable
-              echo "[FALLBACK-FINAL] No version history found"
-              echo "[FALLBACK-FINAL] Total commits: $TOTAL_COMMITS"
-              echo "[FALLBACK-FINAL] Using modulo dev number: $DEV_NUMBER"
+            # If no commits since version was set, we're at the release commit
+            if [ "$DEV_NUMBER" -eq 0 ]; then
+              FINAL_VERSION="$CURRENT_VERSION"
+              RELEASE_TYPE="release"
+              echo "At release commit, using version as-is: $FINAL_VERSION"
             else
-              # Count commits AFTER the version was set
-              DEV_NUMBER=$(git rev-list --count ${VERSION_COMMIT}..HEAD)
-              echo "[SUCCESS] Found $DEV_NUMBER commits since version $CURRENT_VERSION was set"
-              echo "[SUCCESS] Base commit: $VERSION_COMMIT"
-
-              # Verify the commit count is reasonable
-              if [ "$DEV_NUMBER" -gt 1000 ]; then
-                echo "[WARNING] Dev number too high ($DEV_NUMBER), using modulo"
-                DEV_NUMBER=$((DEV_NUMBER % 100 + 1))
-              fi
-
-              # If no commits since version was set, this means we're at the release commit
-              if [ "$DEV_NUMBER" -eq 0 ]; then
-                # We're at the exact release commit, no dev version needed
-                FINAL_VERSION="$CURRENT_VERSION"
-                RELEASE_TYPE="release"
-                echo "[INFO] At release commit, using version as-is: $FINAL_VERSION"
-                echo "final_version=$FINAL_VERSION" >> $GITHUB_OUTPUT
-                echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
-                echo "Final version: $FINAL_VERSION (type: $RELEASE_TYPE)"
-                exit 0
-              fi
+              FINAL_VERSION="${CURRENT_VERSION}.dev${DEV_NUMBER}"
+              RELEASE_TYPE="prerelease"
+              echo "Generated dev version: $FINAL_VERSION"
             fi
-
-            FINAL_VERSION="${CURRENT_VERSION}.dev${DEV_NUMBER}"
-            RELEASE_TYPE="prerelease"
-            echo "[RESULT] Generated dev version: $FINAL_VERSION"
-            echo "[RESULT] Dev number: $DEV_NUMBER"
-            echo "[RESULT] Base version: $CURRENT_VERSION"
           fi
 
           echo "final_version=$FINAL_VERSION" >> $GITHUB_OUTPUT
@@ -507,15 +465,18 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
 
-          gh release create "$VERSION" \
-            --title "Release $VERSION" \
-            --notes "Automatic release for version ${{ steps.calculate_version.outputs.final_version }}
+          # Create release notes
+          RELEASE_NOTES="Automatic release for version ${{ steps.calculate_version.outputs.final_version }}
 
           **Release Type**: ${{ steps.calculate_version.outputs.release_type }}
           **Commit**: ${{ github.sha }}
           **Branch**: ${{ github.ref_name }}
 
-          This release was automatically generated from commit ${{ github.sha }}." \
+          This release was automatically generated from commit ${{ github.sha }}."
+
+          gh release create "$VERSION" \
+            --title "Release $VERSION" \
+            --notes "$RELEASE_NOTES" \
             $PRERELEASE_FLAG \
             --repo ${{ github.repository }}
         env:
