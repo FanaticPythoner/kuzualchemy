@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 This is the ultimate test that validates KuzuAlchemy.
 This test combines all critical aspects in a comprehensive validation that would

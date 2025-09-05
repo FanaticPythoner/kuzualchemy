@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for BaseModel enum conversion functionality.
 Tests the automatic enum conversion features in BaseModel.py.

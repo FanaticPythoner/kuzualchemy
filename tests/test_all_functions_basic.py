@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Basic test to verify all major function categories are working.
 """

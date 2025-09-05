@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for list functions in KuzuAlchemy.
 """
 
-import pytest
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_functions import list_creation, size, list_concat, range
 from kuzualchemy.kuzu_query_expressions import FunctionExpression

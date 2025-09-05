@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from typing import Any, Union, get_origin, get_args, Type, Dict

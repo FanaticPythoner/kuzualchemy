@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Function type classes for Kuzu default value functions.
 

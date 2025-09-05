@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Simple integration tests for KuzuAlchemy functions.
 """
 
-import pytest
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_query_expressions import FunctionExpression
 

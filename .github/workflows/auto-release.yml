@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 name: Auto Release on Main Push
 
 on:
@@ -348,7 +351,7 @@ jobs:
           # Create the replacement content
           replacement_content = (
               "<!-- KUZUALCHEMY-AUTO-UPDATE-START -->\n"
-              f"# Version: {final_version}\n\n"
+              f"**Version**: {final_version}\n\n"
               f"**Status**: {status}\n\n"
               f"**Tests**: {test_results} (Last updated: {timestamp})\n\n"
               "[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)\n"
@@ -438,15 +441,6 @@ jobs:
           fi
 
 
-      - name: Build package
-        run: |
-          python -m build
-          
-      - name: Verify built artifacts
-        run: |
-          twine check dist/*
-          ls -la dist/
-          
       - name: Create GitHub Release
         run: |
           # Skip release creation in local testing environment
@@ -481,46 +475,7 @@ jobs:
             --repo ${{ github.repository }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Publish package to PyPI
-        run: |
-          # Skip PyPI publishing in local testing environment
-          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ secrets.PYPI_API_TOKEN }}" ]]; then
-            echo "Skipping PyPI publishing (local testing or missing token)"
-            echo "Would publish: kuzualchemy==${{ steps.calculate_version.outputs.final_version }}"
-            echo "Built packages:"
-            ls -la dist/
-            exit 0
-          fi
 
-          # Publish to PyPI using twine (more reliable than action for complex cases)
-          python -m pip install --upgrade twine
-          python -m twine upload dist/* --verbose
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-          
-      - name: Upload build artifacts (local testing check)
-        run: |
-          # Skip artifact upload in local testing environment
-          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ env.ACTIONS_RUNTIME_TOKEN }}" ]]; then
-            echo "Skipping artifact upload (local testing environment)"
-            echo "Would upload artifacts:"
-            ls -la dist/
-            echo "Artifact name would be: dist-${{ steps.calculate_version.outputs.final_version }}"
-            exit 0
-          fi
-
-          echo "Production environment detected, artifacts will be uploaded by next step"
-
-      - name: Upload build artifacts (production only)
-        if: github.actor != 'nektos/act' && env.ACTIONS_RUNTIME_TOKEN != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ steps.calculate_version.outputs.final_version }}
-          path: dist/
-          retention-days: 30
-          
       - name: Summary
         run: |
           echo "## Release Summary" >> $GITHUB_STEP_SUMMARY

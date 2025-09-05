@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for text functions in KuzuAlchemy.
 """
 
-import pytest
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_functions import concat, ws_concat, array_extract, array_slice
 from kuzualchemy.kuzu_query_expressions import FunctionExpression

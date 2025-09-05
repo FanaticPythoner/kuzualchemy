@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 KuzuAlchemy - A SQLAlchemy-like ORM for Kuzu graph database.
 
@@ -195,16 +198,19 @@ __version__ = metadata.version("kuzualchemy")
 __author__ = "FanaticPythoner"  # From pyproject.toml authors
 __email__ = "info@kuzualchemy.com"  # From pyproject.toml authors
 __license__ = "GPL-3.0"  # From pyproject.toml license
+__url__ = "https://kuzualchemy.com"  # From pyproject.toml urls
 
 # Public API
 __all__ = [
     # Base model
     "KuzuBaseModel",
+    "KuzuRelationshipBase",
     "BaseModel",
     # Main Decorators
     "kuzu_node",
     "kuzu_relationship",
     "kuzu_field",
+    "foreign_key",
     # Enums and metadata classes
     "KuzuDataType",
     "RelationshipDirection",
@@ -243,6 +249,8 @@ __all__ = [
     # Session classes
     "KuzuSession",
     "SessionFactory",
+    "KuzuConnection",
+    "KuzuTransaction",
     "session_scope",
     # Registry functions
     "get_registered_nodes",

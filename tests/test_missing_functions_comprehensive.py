@@ -1,10 +1,12 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for all newly implemented missing functions in KuzuAlchemy.
 Tests interval, array, utility, hash, UUID, blob, struct, map, union, node/rel, 
 recursive rel functions, and CAST/CASE expressions.
 """
 
-import pytest
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_functions import (
     # Interval functions
@@ -36,7 +38,6 @@ from kuzualchemy.kuzu_functions import (
 )
 # Import uuid function with alias to avoid conflict
 from kuzualchemy.kuzu_functions import uuid as uuid_func
-from kuzualchemy.kuzu_query_expressions import CastExpression, CaseExpression
 
 
 class TestIntervalFunctions:

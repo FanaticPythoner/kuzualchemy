@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 name: Run Tests
 
 on:
@@ -30,6 +33,7 @@ jobs:
     if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
     strategy:
       matrix:
+        # || S.S. Python versions ORDERED from OLDEST to NEWEST
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
 
     steps:
@@ -63,7 +67,8 @@ jobs:
       run: |
         if [ "${{ matrix.python-version }}" = "3.11" ]; then
           # Run tests and capture results (only for Python 3.11 to avoid duplicate outputs)
-          python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json > pytest_output.txt 2>&1 || true
+          # EXCLUDE stress tests to prevent interference
+          python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json --ignore=tests/test_stress_and_reliability.py > pytest_output.txt 2>&1 || true
 
           # Parse test results
           if [ -f test-results.json ]; then
@@ -110,15 +115,16 @@ jobs:
           # Clean up
           rm -f test-results.json pytest_output.txt
         else
-          # For other Python versions, just run tests normally
-          python -m pytest tests/ -v --tb=short
+          # For other Python versions, just run tests normally (EXCLUDE stress tests)
+          python -m pytest tests/ -v --tb=short --ignore=tests/test_stress_and_reliability.py
         fi
 
     - name: Run tests with coverage
       if: matrix.python-version == '3.11'
       run: |
         python -m pip install pytest-cov
-        python -m pytest tests/ -v --tb=short --cov=src/kuzualchemy --cov-report=xml --cov-report=term
+        # EXCLUDE stress tests from coverage to prevent interference
+        python -m pytest tests/ -v --tb=short --cov=src/kuzualchemy --cov-report=xml --cov-report=term --ignore=tests/test_stress_and_reliability.py
 
   # Separate job to collect test results and provide outputs
   collect-test-results:
@@ -164,7 +170,8 @@ jobs:
       id: results
       run: |
         # Run tests and capture results (continue even if tests fail)
-        python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json > pytest_output.txt 2>&1 || true
+        # EXCLUDE stress tests from collection to prevent interference
+        python -m pytest tests/ -v --tb=short --json-report --json-report-file=test-results.json --ignore=tests/test_stress_and_reliability.py > pytest_output.txt 2>&1 || true
         TEST_EXIT_CODE=$?
 
         echo "=== PYTEST EXIT CODE: $TEST_EXIT_CODE ==="
@@ -265,3 +272,60 @@ jobs:
         echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
 
         echo "=== OUTPUTS SET SUCCESSFULLY ==="
+
+  # Isolated stress test job - runs independently to avoid database interference
+  stress-tests:
+    runs-on: ubuntu-latest
+    # Skip if commit is from auto-release workflow to avoid unnecessary test runs
+    if: "!contains(github.event.head_commit.message, 'chore: update README.md with version') && !contains(github.event.head_commit.message, '[auto-release-skip]')"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e ".[test]"
+
+    - name: Run stress tests in isolation
+      id: stress_tests
+      run: |
+        echo "Running stress and reliability tests in complete isolation..."
+
+        # Create a unique temporary directory for this test run
+        TEMP_DB_DIR=$(mktemp -d)
+        export KUZU_TEST_DB_PATH="$TEMP_DB_DIR/stress_test.db"
+
+        echo "Using isolated database: $KUZU_TEST_DB_PATH"
+
+        # Run ONLY the stress tests with verbose output
+        python -m pytest tests/test_stress_and_reliability.py -v --tb=long -s --no-header
+
+        # Clean up
+        rm -rf "$TEMP_DB_DIR"
+
+        echo "Stress tests completed successfully"
+
+    - name: Stress test summary
+      if: always()
+      run: |
+        if [ "${{ steps.stress_tests.outcome }}" = "success" ]; then
+          echo "✅ Stress and reliability tests PASSED"
+        else
+          echo "❌ Stress and reliability tests FAILED"
+          echo "Check the logs above for detailed failure information"
+        fi

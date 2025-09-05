@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 INTEGRATION TESTS for all missing KuzuAlchemy functions.
 These tests execute against a REAL Kuzu database and verify actual functionality.
@@ -11,10 +14,8 @@ from __future__ import annotations
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from datetime import datetime, date
+from typing import List, Optional
 
-import pytest
 
 from kuzualchemy import (
     kuzu_node,
@@ -23,36 +24,18 @@ from kuzualchemy import (
     kuzu_field,
     KuzuDataType,
     KuzuSession,
-    get_all_ddl,
 )
-from kuzualchemy.kuzu_orm import ArrayTypeSpecification, KuzuFieldMetadata
+from kuzualchemy.kuzu_orm import ArrayTypeSpecification
 from kuzualchemy.kuzu_functions import (
     # Interval functions
     to_years, to_months, to_days, to_hours, to_minutes, to_seconds,
     to_milliseconds, to_microseconds,
     # Array functions
-    array_value, array_distance, array_squared_distance, array_dot_product,
-    array_inner_product, array_cross_product, array_cosine_similarity,
-    # Utility functions
-    coalesce, ifnull, nullif, constant_or_null, count_if, typeof, error,
-    # Hash functions
-    md5, sha256, hash,
+    array_value, coalesce, ifnull, count_if, typeof, md5, sha256, hash,
     # UUID functions
     uuid, gen_random_uuid,
     # Blob functions
-    blob, encode, decode, octet_length,
-    # Struct functions
-    struct_extract,
-    # Map functions
-    map_func, map_extract, element_at, cardinality, map_keys, map_values,
-    # Union functions
-    union_value, union_tag, union_extract,
-    # Node/rel functions
-    id_func, label, labels, offset,
-    # Recursive rel functions
-    nodes, rels, properties, is_trail, is_acyclic, length, cost,
-    # CAST and CASE
-    cast, cast_as, case
+    cast
 )
 from kuzualchemy.test_utilities import initialize_schema
 

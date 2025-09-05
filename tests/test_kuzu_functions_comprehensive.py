@@ -1,17 +1,17 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for all Kuzu functions implemented in KuzuAlchemy.
 Tests both QueryField methods and standalone functions.
 """
 
 import pytest
-from datetime import datetime
-from typing import Any, Dict, List
 
 from kuzualchemy import (
     KuzuBaseModel, kuzu_node, kuzu_field, KuzuDataType, Query,
     # Standalone functions
-    pi, abs, ceil, floor, sqrt, sin, cos, tan, ln, log,
-    concat, current_date, current_timestamp, make_date, date_part,
+    pi, abs, sqrt, sin, cos, tan, concat, current_date, current_timestamp, make_date, date_part,
     to_years, to_months, to_days, to_hours, to_minutes, to_seconds,
     array_value, array_distance, array_dot_product, array_cosine_similarity,
     coalesce, ifnull, nullif, typeof, constant_or_null, count_if, error,

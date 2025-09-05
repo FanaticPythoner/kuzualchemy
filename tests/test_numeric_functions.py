@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for numeric functions in KuzuAlchemy.
 """
 
-import pytest
 from kuzualchemy.kuzu_query_fields import QueryField
 from kuzualchemy.kuzu_functions import pi, ceil, floor, sqrt, sin, cos, tan, ln, log, log2
 from kuzualchemy.kuzu_functions import abs as kuzu_abs, pow as kuzu_pow

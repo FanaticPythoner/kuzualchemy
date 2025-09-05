@@ -1,10 +1,11 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Comprehensive tests for sets and unions in relationship targets.
 Tests the handling of sets, lists, and unions in relationship pair definitions.
 """
 import pytest
-from typing import Set, List, Union, Type
-from pydantic import BaseModel
 
 from kuzualchemy.kuzu_orm import (
     kuzu_node,
@@ -15,8 +16,6 @@ from kuzualchemy.kuzu_orm import (
     RelationshipPair,
     _process_relationship_pairs,
     clear_registry,
-    get_registered_nodes,
-    get_registered_relationships,
     generate_relationship_ddl,
 )
 

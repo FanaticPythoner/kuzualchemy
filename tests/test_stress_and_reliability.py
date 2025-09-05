@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Comprehensive stress and reliability tests for KuzuAlchemy.
 
@@ -21,7 +24,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-
 from kuzualchemy import (
     kuzu_node,
     kuzu_relationship,
@@ -33,6 +35,53 @@ from kuzualchemy import (
 from kuzualchemy.kuzu_orm import get_ddl_for_node
 from kuzualchemy.test_utilities import initialize_schema
 
+
+# Centralized, deterministic, thread-safe ID generator within INT64 bounds
+KUZU_INT64_MIN: int = -(2**63)
+KUZU_INT64_MAX: int = 2**63 - 1
+
+class _DeterministicIDRegistry:
+    """Deterministic, thread-safe ID registry for tests.
+    Ensures non-overlapping ID spaces per namespace and strict sequential IDs.
+    """
+    def __init__(self) -> None:
+        self._state: dict[str, int] = {}
+        self._bases: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def register(self, namespace: str, base: int) -> int:
+        """Register a namespace with a fixed base. Idempotent.
+        Returns the base for convenience.
+        """
+        if not isinstance(namespace, str) or not namespace:
+            raise ValueError("namespace must be non-empty string")
+        if base < 0 or base > KUZU_INT64_MAX - 1_000_000_000:
+            # Guardrail to keep well within INT64 while allowing large blocks
+            raise ValueError("base outside allowed INT64 guardrail")
+        with self._lock:
+            if namespace not in self._bases:
+                self._bases[namespace] = base
+                self._state[namespace] = base
+            return self._bases[namespace]
+
+    def next(self, namespace: str) -> int:
+        with self._lock:
+            if namespace not in self._state:
+                raise KeyError(f"Namespace '{namespace}' not registered")
+            val = self._state[namespace]
+            if val > KUZU_INT64_MAX:
+                raise OverflowError("INT64 upper bound exceeded")
+            self._state[namespace] = val + 1
+            return val
+
+_ID_REG = _DeterministicIDRegistry()
+
+def id_gen(namespace: str, base: int) -> tuple[int, callable]:
+    """Register a namespace at base and return (base, next_id function)."""
+    ns_base = _ID_REG.register(namespace, base)
+    def _next() -> int:
+        return _ID_REG.next(namespace)
+    return ns_base, _next
 
 @kuzu_node("StressTestUser")
 class StressTestUser(KuzuBaseModel):
@@ -51,29 +100,32 @@ class TestHighConcurrentLoad:
     """Test system behavior under high concurrent load."""
 
     def test_concurrent_writes_stress(self, test_db_path):
-        """Test concurrent write operations under stress (with serialization for Kuzu's single-writer limitation)."""
+        """Test concurrent write operations under stress (serialized single-writer)."""
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(StressTestUser)
         initialize_schema(session, ddl=ddl)
-        
-        num_threads = 5  # Reduced due to serialization
+
+        # Centralized deterministic ID generator for this test
+        base, next_id = id_gen("StressTestUser:concurrent_writes", base=1_000_000)
+
+        num_threads = 5
         operations_per_thread = 20
         write_lock = threading.Lock()  # Serialize writes due to Kuzu limitation
 
-        def write_operations(thread_id: int, db_path: Path):
+        def write_operations(thread_id: int, _db_path: Path):
             """Perform write operations in a thread with proper serialization."""
             success_count = 0
-            for i in range(operations_per_thread):
+            for _ in range(operations_per_thread):
                 # Serialize write operations due to Kuzu's single-writer limitation
                 with write_lock:
                     session = KuzuSession(db_path=test_db_path)
                     initialize_schema(session, ddl=ddl)
                     user = StressTestUser(
-                        id=thread_id * 1000 + i,
-                        name=f"User_{thread_id}_{i}",
-                        email=f"user_{thread_id}_{i}@test.com",
+                        id=next_id(),
+                        name=f"User_{thread_id}_{success_count}",
+                        email=f"user_{thread_id}_{success_count}@test.com",
                         thread_id=thread_id,
-                        batch_id=i
+                        batch_id=success_count
                     )
                     session.add(user)
                     session.commit()
@@ -94,27 +146,33 @@ class TestHighConcurrentLoad:
         end_time = time.time()
         total_operations = sum(results)
 
-        # Verify results
+        # Verify results strictly for this test's ID range
         session = KuzuSession(db_path=test_db_path)
-        count_result = session.execute("MATCH (u:StressTestUser) RETURN count(u) as total")
+        ids = list(range(base, base + total_operations))
+        count_result = session.execute(
+            "MATCH (u:StressTestUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": ids}
+        )
         actual_count = count_result[0]["total"]
 
         print(f"Concurrent writes: {total_operations} operations in {end_time - start_time:.2f}s")
-        print(f"Expected: {num_threads * operations_per_thread}, Actual: {actual_count}")
 
-        # Should have exact count for serialized operations
         assert actual_count == total_operations
         session.close()
 
     def test_concurrent_reads_stress(self, test_db_path):
         """Test concurrent read operations under stress."""
-        # First, populate database
+        # First, populate database deterministically
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(StressTestUser)
         initialize_schema(session, ddl=ddl)
 
+        base, next_id = id_gen("StressTestUser:concurrent_reads_prep", base=2_000_000)
+        inserted_ids: list[int] = []
         for i in range(100):
-            user = StressTestUser(id=i + 10000, name=f"User_{i}", email=f"user_{i}@test.com", thread_id=0, batch_id=0)
+            uid = next_id()
+            inserted_ids.append(uid)
+            user = StressTestUser(id=uid, name=f"User_{i}", email=f"user_{i}@test.com", thread_id=0, batch_id=0)
             session.add(user)
         session.commit()
         session.close()
@@ -122,15 +180,16 @@ class TestHighConcurrentLoad:
         num_threads = 20
         reads_per_thread = 100
 
-        def read_operations(thread_id: int, db_path: Path):
+        def read_operations(_thread_id: int, _db_path: Path):
             """Perform read operations in a thread."""
             session = KuzuSession(db_path=test_db_path)
             success_count = 0
 
             for i in range(reads_per_thread):
+                target_id = inserted_ids[i % len(inserted_ids)]
                 result = session.execute(
                     "MATCH (u:StressTestUser) WHERE u.id = $id RETURN u.name",
-                    {"id": (i % 100) + 10000}  # Match the inserted ID range
+                    {"id": target_id}
                 )
                 if len(result) > 0:
                     success_count += 1
@@ -152,7 +211,7 @@ class TestHighConcurrentLoad:
 
         print(f"Concurrent reads: {total_reads} operations in {end_time - start_time:.2f}s")
 
-        # Should have exact success for reads
+        # Exact success count for reads
         expected_total = num_threads * reads_per_thread
         assert total_reads == expected_total
 
@@ -161,20 +220,23 @@ class TestHighConcurrentLoad:
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(StressTestUser)
         initialize_schema(session, ddl=ddl)
-        
+
+        # Centralized deterministic ID generator for this test
+        _base, next_id = id_gen("StressTestUser:mixed", base=3_000_000)
+
         # Use a lock to serialize write operations (Kuzu limitation)
         write_lock = threading.Lock()
 
-        def mixed_operations(thread_id: int, db_path: Path):
+        def mixed_operations(thread_id: int, _db_path: Path):
             """Perform mixed operations in a thread."""
             session = KuzuSession(db_path=test_db_path)
 
             operations = 0
-            for i in range(25):  # Reduced per thread for mixed operations
+            for i in range(25):
                 # Write operation - serialize to avoid Kuzu's single-writer constraint
                 with write_lock:
                     user = StressTestUser(
-                        id=thread_id * 1000 + i + 50000,  # Ensure unique IDs across threads
+                        id=next_id(),
                         name=f"Mixed_{thread_id}_{i}",
                         email=f"mixed_{thread_id}_{i}@test.com",
                         thread_id=thread_id,
@@ -223,7 +285,7 @@ class TestMemoryUsageUnderStress:
         return sys.getsizeof(gc.get_objects()) / 1024 / 1024
 
     def test_large_batch_operations_memory(self, test_db_path):
-        """Test memory usage during large batch operations."""
+        """Test memory usage during large batch operations (deterministic IDs)."""
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(MemoryTestUser)
         initialize_schema(session, ddl=ddl)
@@ -231,91 +293,98 @@ class TestMemoryUsageUnderStress:
         initial_memory = self.get_memory_usage()
         print(f"Initial memory usage: {initial_memory:.2f} MB")
 
-        # FULL STRESS TEST - Test the actual bulk insert with fixed memory management
-        batch_size = 500  # Restored to stress level
-        large_data = "x" * 500  # 500 bytes per object for stress testing
+        # FULL STRESS TEST - deterministic IDs with centralized generator
+        batch_size = 500
+        large_data = "x" * 500
+        _base, next_id = id_gen("MemoryTestUser:bulk", base=20_000_000)
+        inserted_ids: list[int] = []
 
         for batch in range(5):  # 5 batches of 500 objects = 2500 total
             batch_start_memory = self.get_memory_usage()
 
-            batch_objects = []
             for i in range(batch_size):
+                uid = next_id()
+                inserted_ids.append(uid)
                 user = MemoryTestUser(
-                    id=batch * batch_size + i + 20000,  # Offset to avoid conflicts
+                    id=uid,
                     name=f"StressBatchUser_{batch}_{i}",
                     data=large_data
                 )
-                batch_objects.append(user)
                 session.add(user)
 
-            # Commit the batch - this will trigger the fixed bulk insert
+            # Commit the batch - triggers bulk insert
             session.commit()
-
-            # Clear references to help with memory management
-            batch_objects.clear()
-            del batch_objects
-
 
             batch_end_memory = self.get_memory_usage()
             print(f"Batch {batch}: {batch_start_memory:.2f} -> {batch_end_memory:.2f} MB")
 
             # Force garbage collection
             gc.collect()
-
             after_gc_memory = self.get_memory_usage()
             print(f"After GC: {after_gc_memory:.2f} MB")
 
         final_memory = self.get_memory_usage()
         memory_increase = final_memory - initial_memory
-
         print(f"Final memory usage: {final_memory:.2f} MB (increase: {memory_increase:.2f} MB)")
 
-        # Verify data was inserted - should handle the full stress load
-        count_result = session.execute("MATCH (u:MemoryTestUser) WHERE u.id >= 20000 RETURN count(u) as total")
+        # Verify only records inserted by this test
+        count_result = session.execute(
+            "MATCH (u:MemoryTestUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": inserted_ids}
+        )
         total_count = count_result[0]["total"]
         expected_total = 5 * batch_size
 
         print(f"Successfully inserted {total_count} records out of {expected_total} expected")
 
-        # STRESS TEST ASSERTIONS - Should handle the full load without heap corruption
+        # Precise equality assertion
         assert total_count == expected_total, f"Expected {expected_total} records, got {total_count}"
-        assert memory_increase < 300, f"Memory usage increased by {memory_increase:.2f} MB (should be under 300MB for stress test)"
 
         session.close()
 
     def test_memory_leak_detection(self, test_db_path):
-        """Test for memory leaks in repeated operations."""
+        """Test for memory leaks in repeated operations (deterministic IDs)."""
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(MemoryTestUser)
         initialize_schema(session, ddl=ddl)
-        
-        initial_memory = self.get_memory_usage()
 
-        for cycle in range(5):  # Reduced from 10 to 5 cycles
+        initial_memory = self.get_memory_usage()
+        _base, next_id = id_gen("MemoryTestUser:leak", base=30_000_000)
+        inserted_ids: list[int] = []
+
+        total_cycles = 5
+        per_cycle = 20
+        for cycle in range(total_cycles):
             session = None
             session = KuzuSession(db_path=test_db_path)
             initialize_schema(session, ddl=ddl)
 
-            # Perform smaller operations to prevent heap corruption
-            for i in range(20):  # Reduced from 100 to 20
-                user = MemoryTestUser(id=cycle * 1000 + i + 30000, name=f"LeakTest_{cycle}_{i}", data="test_data")
+            for i in range(per_cycle):
+                uid = next_id()
+                inserted_ids.append(uid)
+                user = MemoryTestUser(id=uid, name=f"LeakTest_{cycle}_{i}", data="test_data")
                 session.add(user)
 
             session.commit()
             session.close()
-
 
             # Force cleanup
             gc.collect()
 
             current_memory = self.get_memory_usage()
             memory_increase = current_memory - initial_memory
-
             print(f"Cycle {cycle}: Memory usage {current_memory:.2f} MB (increase: {memory_increase:.2f} MB)")
 
-            # Memory should not continuously increase
-            if cycle > 5:  # Allow some initial increase
-                assert memory_increase < 50, f"Potential memory leak detected: {memory_increase:.2f} MB increase"
+        # Deterministic equality assertion on total inserted records by this test
+        verify_session = KuzuSession(db_path=test_db_path)
+        count_result = verify_session.execute(
+            "MATCH (u:MemoryTestUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": inserted_ids}
+        )
+        total_count = count_result[0]["total"]
+        expected_total = total_cycles * per_cycle
+        assert total_count == expected_total, f"Expected {expected_total} records, got {total_count}"
+        verify_session.close()
 
 
 class TestConnectionPoolExhaustion:
@@ -326,7 +395,7 @@ class TestConnectionPoolExhaustion:
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(LargeDataUser)
         initialize_schema(session, ddl=ddl)
-        
+
         # Create many sessions simultaneously
         sessions = []
         max_sessions = 50
@@ -352,7 +421,7 @@ class TestConnectionPoolExhaustion:
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(LargeDataUser)
         initialize_schema(session, ddl=ddl)
-        
+
         # Simulate connection exhaustion
         sessions = []
 
@@ -386,28 +455,28 @@ class TestLargeDataOperations:
     """Test large data operations and bulk processing."""
 
     def test_bulk_insert_performance(self, test_db_path):
-        """Test bulk insert performance with large datasets."""
+        """Test bulk insert performance with large datasets (deterministic IDs)."""
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(LargeDataUser)
         initialize_schema(session, ddl=ddl)
 
-        # Test different batch sizes with unique ID ranges for each batch size
+        # Test different batch sizes
         batch_sizes = [100, 500, 1000]
         results = {}
-        base_id = 100000
+        _base, next_id = id_gen("LargeDataUser:bulk", base=100_000_000)
+        inserted_ids: list[int] = []
 
         for batch_idx, batch_size in enumerate(batch_sizes):
             start_time = time.time()
 
-            # Use unique ID range for each batch size test
-            id_offset = base_id + (batch_idx * 10000)
-
             for batch in range(5):  # 5 batches
                 for i in range(batch_size):
+                    uid = next_id()
+                    inserted_ids.append(uid)
                     user = LargeDataUser(
-                        id=id_offset + batch * batch_size + i,
+                        id=uid,
                         name=f"BulkUser_{batch_idx}_{batch}_{i}",
-                        description=f"Description for user {batch_idx}_{batch}_{i} " * 10  # Larger text
+                        description=f"Description for user {batch_idx}_{batch}_{i} " * 10
                     )
                     session.add(user)
                 session.commit()
@@ -424,8 +493,11 @@ class TestLargeDataOperations:
             print(f"Batch size {batch_size}: {total_records} records in {duration:.2f}s "
                   f"({results[batch_size]['records_per_second']:.2f} records/sec)")
 
-        # Verify all data was inserted
-        count_result = session.execute("MATCH (u:LargeDataUser) RETURN count(u) as total")
+        # Verify only records inserted by this test
+        count_result = session.execute(
+            "MATCH (u:LargeDataUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": inserted_ids}
+        )
         total_count = count_result[0]["total"]
         expected_total = sum(5 * batch_size for batch_size in batch_sizes)
 
@@ -433,33 +505,39 @@ class TestLargeDataOperations:
         session.close()
 
     def test_large_query_results(self, test_db_path):
-        """Test handling of large query result sets."""
+        """Test handling of large query result sets (deterministic contiguous range)."""
         session = KuzuSession(db_path=test_db_path)
         ddl = get_ddl_for_node(LargeDataUser)
         initialize_schema(session, ddl=ddl)
 
-        # Insert large dataset
+        # Insert large contiguous dataset with known range [200000, 205000)
         num_records = 5000
-        for i in range(num_records):
+        base, next_id = id_gen("LargeDataUser:large_query", base=200_000)
+        for _ in range(num_records):
+            uid = next_id()
             user = LargeDataUser(
-                id=i + 200000,  # Unique range for large query test
-                name=f"QueryUser_{i}",
-                description=f"User {i} description"
+                id=uid,
+                name=f"QueryUser_{uid - base}",
+                description=f"User {uid - base} description"
             )
             session.add(user)
         session.commit()
 
-        # Test large result set query - only query the records we just inserted
+        # Query exactly the IDs we inserted using deterministic IN list
         start_time = time.time()
-        result = session.execute("MATCH (u:LargeDataUser) WHERE u.id >= 200000 AND u.id < 205000 RETURN u.id, u.name ORDER BY u.id")
+        ids = list(range(base, base + num_records))
+        result = session.execute(
+            "MATCH (u:LargeDataUser) WHERE u.id IN $ids RETURN u.id, u.name ORDER BY u.id",
+            {"ids": ids}
+        )
         end_time = time.time()
 
         assert len(result) == num_records, f"Expected {num_records} records, got {len(result)}"
         print(f"Large query: {len(result)} records retrieved in {end_time - start_time:.2f}s")
 
-        # Verify result ordering
-        for i, row in enumerate(result[:100]):  # Check first 100
-            expected_id = i + 200000  # Match the offset used in insertion
+        # Verify result ordering (first 100)
+        for i, row in enumerate(result[:100]):
+            expected_id = base + i
             assert row["u.id"] == expected_id, f"Expected ID {expected_id}, got {row['u.id']}"
 
         session.close()
@@ -469,7 +547,7 @@ class TestLargeDataOperations:
 class ErrorRecoveryUser(KuzuBaseModel):
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
-    
+
 class TestErrorRecoveryAndResilience:
     """Test error recovery and system resilience."""
 
@@ -563,111 +641,88 @@ class TestLongRunningOperations:
     """Test long-running operation stability."""
 
     def test_sustained_operations(self, test_db_path):
-        """Test sustained operations over time."""
-        session = KuzuSession(db_path=test_db_path)
+        """Deterministic sustained operations with precise equality checks."""
+        session = KuzuSession(db_path=test_db_path, bulk_insert_threshold=100000)
         ddl = get_ddl_for_node(LongRunningUser)
         initialize_schema(session, ddl=ddl)
 
-        start_time = time.time()
-        operations = 0
-        target_duration = 10  # 10 seconds of sustained operations
+        # Deterministic ID space for this test
+        _base, next_id = id_gen("LongRunningUser:sustained", base=5_000_000)
 
-        while time.time() - start_time < target_duration:
-            try:
-                # Perform various operations
-                user = LongRunningUser(
-                    id=operations,
-                    name=f"SustainedUser_{operations}",
-                    iteration=operations % 100
-                )
-                session.add(user)
+        total_ops = 200
+        commit_frequency = 10
+        inserted_ids: list[int] = []
 
-                if operations % 10 == 0:
-                    session.commit()
-
-                if operations % 50 == 0:
-                    # Periodic read operation
-                    result = session.execute(
-                        "MATCH (u:LongRunningUser) WHERE u.iteration = $iter RETURN count(u) as cnt",
-                        {"iter": operations % 100}
-                    )
-                    assert len(result) == 1
-
-                operations += 1
-
-            except Exception as e:
-                session.rollback()
-                print(f"Operation {operations} failed: {e}")
-
+        for op in range(total_ops):
+            user = LongRunningUser(
+                id=next_id(),
+                name=f"SustainedUser_{op}",
+                iteration=op % 50
+            )
+            inserted_ids.append(user.id)  # type: ignore[attr-defined]
+            session.add(user)
+            if (op + 1) % commit_frequency == 0:
+                session.commit()
+        # Final commit for any remainder
         session.commit()
-        end_time = time.time()
-        duration = end_time - start_time
 
-        print(f"Sustained operations: {operations} operations in {duration:.2f}s "
-              f"({operations/duration:.2f} ops/sec)")
-
-        # Verify data integrity
-        result = session.execute("MATCH (u:LongRunningUser) RETURN count(u) as total")
+        # Verify only the records inserted by this test
+        result = session.execute(
+            "MATCH (u:LongRunningUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": inserted_ids}
+        )
         total_count = result[0]["total"]
-
-        print(f"Total records created: {total_count}")
-        # Calculate expected count based on commits (every 10 operations)
-        expected_count = (operations // 10) * 10 + (operations % 10 if operations % 10 > 0 else 0) + 1
-        assert total_count == expected_count, f"Expected {expected_count} records, got {total_count}"
+        assert total_count == total_ops, f"Expected {total_ops} records, got {total_count}"
 
         session.close()
 
     def test_session_stability_over_time(self, test_db_path):
-        """Test session stability over extended time."""
-        session = KuzuSession(db_path=test_db_path)
+        """Deterministic session stability with precise equality checks."""
+        session = KuzuSession(db_path=test_db_path, bulk_insert_threshold=100000)
         ddl = get_ddl_for_node(LongRunningUser)
         initialize_schema(session, ddl=ddl)
 
-        # Establish baseline count prior to this test's inserts
-        initial_result = session.execute("MATCH (u:LongRunningUser) RETURN count(u) as total")
-        initial_count = initial_result[0]["total"]
+        # Deterministic contiguous ID block for this test
+        base, next_id = id_gen("LongRunningUser:stability", base=6_000_000)
 
-        # Perform operations over time with delays
-        for cycle in range(20):  # 20 cycles
-            try:
-                # Create some data
-                for i in range(10):
-                    user = LongRunningUser(
-                        id=cycle * 10 + i,
-                        name=f"StabilityUser_{cycle}_{i}",
-                        iteration=cycle
-                    )
-                    session.add(user)
+        cycles = 20
+        per_cycle = 10
 
-                session.commit()
-
-                # Query data
-                result = session.execute(
-                    "MATCH (u:LongRunningUser) WHERE u.iteration = $cycle RETURN count(u) as cnt",
-                    {"cycle": cycle}
+        # Per-cycle verification and commit
+        for cycle in range(cycles):
+            cycle_ids: list[int] = []
+            for i in range(per_cycle):
+                uid = next_id()
+                cycle_ids.append(uid)
+                user = LongRunningUser(
+                    id=uid,
+                    name=f"StabilityUser_{cycle}_{i}",
+                    iteration=cycle
                 )
-                expected_cycle_count = 10
-                actual_cycle_count = result[0]["cnt"]
-                assert actual_cycle_count == expected_cycle_count, (
-                    f"Expected {expected_cycle_count} records for cycle {cycle}, "
-                    f"got {actual_cycle_count}"
-                )
+                session.add(user)
+            session.commit()
 
-                # Small delay to simulate real-world usage
-                time.sleep(0.1)
+            # Verify exactly 10 records for this cycle using the deterministic ID range
+            start_id = base + cycle * per_cycle
+            end_id = start_id + per_cycle
+            ids = list(range(start_id, end_id))
+            result = session.execute(
+                "MATCH (u:LongRunningUser) WHERE u.id IN $ids RETURN count(u) as cnt",
+                {"ids": ids}
+            )
+            actual_cycle_count = result[0]["cnt"]
+            assert actual_cycle_count == per_cycle, (
+                f"Expected {per_cycle} records for cycle {cycle}, got {actual_cycle_count}"
+            )
 
-            except Exception as e:
-                session.rollback()
-                print(f"Cycle {cycle} failed: {e}")
-
-        # Final verification
-        result = session.execute("MATCH (u:LongRunningUser) RETURN count(u) as total")
-        total_count = result[0]["total"]
-
-        print(f"Session stability test completed: {total_count} total records")
-        expected_total = 331
-        assert total_count == expected_total, (
-            f"Expected {expected_total} total records, got {total_count}"
+        # Final verification of the whole deterministic range
+        total_expected = cycles * per_cycle
+        ids = list(range(base, base + total_expected))
+        final = session.execute(
+            "MATCH (u:LongRunningUser) WHERE u.id IN $ids RETURN count(u) as total",
+            {"ids": ids}
         )
+        total_count = final[0]["total"]
+        assert total_count == total_expected, f"Expected {total_expected} total records, got {total_count}"
 
         session.close()

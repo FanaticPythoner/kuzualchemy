@@ -7,7 +7,7 @@ name = "kuzualchemy"
 version = "0.2.0"
 description = "SQLAlchemy-like ORM for Kuzu graph database"
 readme = "README.md"
-license = {text = "GPL-3.0"}
+license = { file = "LICENSE" }
 authors = [
     {name = "FanaticPythoner", email = "info@kuzualchemy.com"}
 ]
@@ -23,10 +23,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
     "Topic :: Database",
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
+    "License :: OSI Approved :: Apache Software License",
 ]
 requires-python = ">=3.8"
 dependencies = [
@@ -36,7 +38,6 @@ dependencies = [
     "polars",
     "pyarrow",
     "pyahocorasick",
-    "importlib-metadata>=1.0; python_version<'3.8'"
 ]
 
 [project.optional-dependencies]
@@ -69,6 +70,7 @@ Homepage = "https://github.com/FanaticPythoner/kuzualchemy"
 Documentation = "https://kuzualchemy.readthedocs.io"
 Repository = "https://github.com/FanaticPythoner/kuzualchemy"
 "Bug Tracker" = "https://github.com/FanaticPythoner/kuzualchemy/issues"
+Funding = "https://github.com/sponsors/FanaticPythoner"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -76,6 +78,14 @@ include = ["kuzualchemy*"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools]
+include-package-data = true
+license-files = ["LICENSE", "NOTICE", "LICENSES/Apache-2.0.txt"]
+
+[tool.setuptools.package-data]
+kuzualchemy = ["py.typed"]
+
 
 [tool.black]
 line-length = 88

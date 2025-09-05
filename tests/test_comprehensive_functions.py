@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for all KuzuAlchemy functions to verify they work correctly with Kuzu.
 This test suite validates that all implemented functions generate correct Cypher and execute properly.

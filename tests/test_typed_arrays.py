@@ -1,10 +1,12 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Comprehensive tests for typed array specifications.
 Tests the various ways to specify typed arrays in Kuzu fields.
 """
 import pytest
 from typing import List
-# Import not needed - removed unused imports
 
 from kuzualchemy.kuzu_orm import (
     kuzu_node,

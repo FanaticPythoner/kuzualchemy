@@ -1,0 +1,31 @@
+version = 1
+
+# Python source files
+[[annotations]]
+path = "**/*.py"
+SPDX-FileCopyrightText = "2025 FanaticPythoner"
+SPDX-License-Identifier = "Apache-2.0"
+
+# GitHub workflow files
+[[annotations]]
+path = ".github/workflows/*.yml"
+SPDX-FileCopyrightText = "2025 FanaticPythoner"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Configuration files
+[[annotations]]
+path = [".gitignore", ".pre-commit-config.yaml", "pyproject.toml", "MANIFEST.in"]
+SPDX-FileCopyrightText = "2025 FanaticPythoner"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Documentation and metadata files
+[[annotations]]
+path = ["README.md", "CITATION.cff", "TRADEMARKS.md", "VERSIONING.md", "NOTICE"]
+SPDX-FileCopyrightText = "2025 FanaticPythoner"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Script files
+[[annotations]]
+path = ["run_bash.ps1", "test-versioning-local.bat", "test-versioning-local.sh"]
+SPDX-FileCopyrightText = "2025 FanaticPythoner"
+SPDX-License-Identifier = "Apache-2.0"

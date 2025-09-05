@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Comprehensive tests for foreign key validation.
 Tests the validation of foreign key references in Kuzu models.
@@ -15,7 +18,6 @@ from kuzualchemy.kuzu_orm import (
     ForeignKeyMetadata,
     clear_registry,
     validate_all_models,
-    get_registered_nodes,
 )
 
 

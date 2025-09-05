@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 name: Publish Python Package to PyPI and TestPyPI
 
 on:
@@ -15,9 +18,21 @@ on:
           - pypi
 
 jobs:
-  build-and-publish:
-    name: Build and publish Python distributions
+  # @@ STEP 1: Build comprehensive wheels for all platforms
+  build-wheels:
+    name: Build Multi-Platform Wheels
+    uses: ./.github/workflows/build-wheels.yml
+    with:
+      upload_artifacts: true
+      artifact_name_suffix: "publish"
+      build_sdist: true
+      build_wheels: true
+
+  # @@ STEP 2: Publish to PyPI with comprehensive wheel support
+  publish:
+    name: Publish Python distributions
     runs-on: ubuntu-latest
+    needs: [build-wheels]
 
     # Define the environment based on the trigger
     # If it's a release, target 'pypi' environment.
@@ -29,27 +44,28 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        id: setup-python
-        uses: actions/setup-python@v5
+      - name: Download sorted, deduplicated artifacts
+        uses: actions/download-artifact@v4
         with:
-          python-version: '3.11'
+          pattern: "sorted-wheels-*publish*"
+          path: dist/
+          merge-multiple: true
 
-      - name: Install dependencies
+      - name: Verify distribution files
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install build twine wheel setuptools
+          echo "Distribution files prepared:"
+          ls -la dist/
 
-      - name: Build package
-        run: |
-          python -m build
+          # Verify we have files to publish
+          if [ ! "$(ls -A dist/)" ]; then
+            echo "ERROR: No distribution files found"
+            exit 1
+          fi
 
       - name: Verify built artifacts
         run: |
-          twine check dist/*
+          python -m pip install --upgrade pip twine
+          python -m twine check dist/*
 
       - name: Publish package to TestPyPI
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_pypi == 'testpypi'

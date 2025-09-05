@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 KuzuDB Connection Pool Implementation
 ====================================
@@ -19,7 +22,7 @@ import weakref
 from pathlib import Path
 from typing import Dict, Optional, Union
 import kuzu
-from .constants import DatabaseConstants
+from .constants import DatabaseConstants, PerformanceConstants
 
 
 class DatabaseManager:
@@ -280,6 +283,52 @@ class ConnectionPool:
 
 # Global database manager instance
 _database_manager = DatabaseManager()
+
+
+# Thread-safe registry of shared ConnectionPool instances per (db_path, read_only)
+_pools_lock = threading.RLock()
+_connection_pools: Dict[str, ConnectionPool] = {}
+
+
+def _pool_key(db_path: Union[str, Path], read_only: bool) -> str:
+    path = str(Path(db_path).resolve())
+    return f"{path}::{int(bool(read_only))}"
+
+
+def get_shared_connection_pool(
+    db_path: Union[str, Path],
+    read_only: bool = False,
+    max_connections: Optional[int] = None,
+    buffer_pool_size: int = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE,
+) -> ConnectionPool:
+    """
+    Get or create a shared ConnectionPool for the given database path.
+
+    The pool bounds the number of low-level kuzu.Connection objects to avoid resource
+    exhaustion and native crashes under stress. Multiple logical sessions may borrow
+    connections from this pool and return them immediately after each operation.
+
+    Args:
+        db_path: Database path
+        read_only: Whether connections should be opened in read-only mode
+        max_connections: Max pooled connections; defaults to PerformanceConstants.CONNECTION_POOL_SIZE
+        buffer_pool_size: Database buffer pool size hint
+
+    Returns:
+        A process-wide shared ConnectionPool for the (db_path, read_only) pair.
+    """
+    key = _pool_key(db_path, read_only)
+    with _pools_lock:
+        pool = _connection_pools.get(key)
+        if pool is None:
+            pool = ConnectionPool(
+                db_path=db_path,
+                read_only=read_only,
+                max_connections=max_connections or PerformanceConstants.CONNECTION_POOL_SIZE,
+                buffer_pool_size=buffer_pool_size,
+            )
+            _connection_pools[key] = pool
+        return pool
 
 
 def get_database_manager() -> DatabaseManager:

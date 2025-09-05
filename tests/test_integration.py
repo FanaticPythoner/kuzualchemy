@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Integration tests for KuzuAlchemy ORM.
 
@@ -23,7 +26,6 @@ from kuzualchemy import (
     KuzuDataType,
     foreign_key,
     KuzuSession,
-    get_all_ddl,
 )
 from kuzualchemy.test_utilities import initialize_schema
 

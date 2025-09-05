@@ -1,5 +1,7 @@
 include README.md
 include LICENSE
+include NOTICE
+recursive-include LICENSES *.txt
 include CHANGELOG.md
 include pyproject.toml
 recursive-include src/kuzualchemy *.py

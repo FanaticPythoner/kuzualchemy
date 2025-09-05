@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: KuzuAlchemy
+message: "If you use KuzuAlchemy, please cite it."
+type: software
+authors:
+  - family-names: "FanaticPythoner"
+    given-names: ""
+keywords: [kuzu, graph, orm, cypher, python, kuzudb, kuzualchemy]
+repository-code: "https://github.com/FanaticPythoner/kuzualchemy"
+url: "https://kuzualchemy.com"
+license: Apache-2.0

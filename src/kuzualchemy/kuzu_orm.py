@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Kùzu ORM system with decorators, field metadata, and DDL generation.
 Type-safe metadata and DDL emission that matches the expected grammar and ordering

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Session management for Kuzu ORM with query execution and transaction support.
 """
@@ -13,8 +16,9 @@ import ahocorasick
 import polars as pl
 
 from .kuzu_query import Query
-from .constants import ValidationMessageConstants, QueryFieldConstants
-from .connection_pool import get_database_manager
+from .constants import ValidationMessageConstants, QueryFieldConstants, ErrorMessages
+from .connection_pool import get_shared_connection_pool
+from .constants import PerformanceConstants
 
 ModelType = TypeVar("ModelType")
 
@@ -60,18 +64,33 @@ class KuzuConnection:
             buffer_pool_size = max_buffer_size
 
         self.buffer_pool_size = buffer_pool_size
-        self._manager = get_database_manager()
-        self.conn = self._manager.get_connection(self.db_path, read_only, buffer_pool_size)
+        # Acquire a shared connection pool instead of a dedicated connection to avoid
+        # exhausting native resources under stress.
+        self._pool = get_shared_connection_pool(
+            self.db_path,
+            read_only=read_only,
+            max_connections=PerformanceConstants.CONNECTION_POOL_SIZE,
+            buffer_pool_size=self.buffer_pool_size,
+        )
         self._lock = RLock()
-    
+        self._closed = False
+
     def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
         """Execute a Cypher query and normalize results."""
         with self._lock:
-            if parameters:
-                result = self.conn.execute(query, parameters)
-            else:
-                result = self.conn.execute(query)
-            
+            if self._closed:
+                raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
+            conn = self._pool.get_connection()
+            try:
+                if parameters:
+                    result = conn.execute(query, parameters)
+                else:
+                    result = conn.execute(query)
+            finally:
+                # Return the connection immediately to the pool to keep the number of
+                # active native connections bounded, even if many logical sessions exist.
+                self._pool.return_connection(conn)
+
             # @@ STEP: Normalize Kuzu result format
             # || S.1: Kuzu returns each row as a list of values
             # || S.2: Need to map to dict based on RETURN clause
@@ -182,9 +201,9 @@ class KuzuConnection:
         return aliases
     
     def close(self) -> None:
-        """Close the connection."""
+        """Mark this logical connection as closed; further executes will fail."""
         with self._lock:
-            self.conn.close()
+            self._closed = True
 
 
 class KuzuSession:
@@ -1038,10 +1057,13 @@ class KuzuSession:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         _ = exc_val, exc_tb  # Mark as intentionally unused
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
         self.close()
     
     def __repr__(self) -> str:
