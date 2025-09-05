@@ -6,16 +6,16 @@ name: Build and Publish Release Wheels
 "on":
   # @@ STEP 1: Trigger on all releases and pre-releases
   release:
-    types: [published, prereleased]
-  
+    types: [published, prereleased, created, released]
+
   # @@ STEP 2: Trigger on all tags (covers cases where releases are created from tags)
   push:
     tags:
       - 'v*'
       - '*.*.*'
       - '*.*.*-*'  # Pre-release tags like 1.0.0-alpha.1, 1.0.0-beta.2, etc.
-  
-  # @@ STEP 3: Manual trigger for testing and emergency releases
+
+  # @@ STEP 3: Manual trigger for testing, emergency releases, and auto-release workflow
   workflow_dispatch:
     inputs:
       version:

@@ -476,6 +476,33 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Trigger wheel building and attachment
+        run: |
+          # Skip in local testing environment
+          if [[ "${{ github.actor }}" == "nektos/act" ]] || [[ -z "${{ secrets.GITHUB_TOKEN }}" ]]; then
+            echo "Skipping wheel workflow trigger (local testing or missing token)"
+            exit 0
+          fi
+
+          VERSION="v${{ steps.calculate_version.outputs.final_version }}"
+
+          echo "Waiting 5 seconds for release to be fully created..."
+          sleep 5
+
+          echo "Triggering release-wheels workflow for version: $VERSION"
+
+          # Trigger the release-wheels workflow via workflow_dispatch
+          gh workflow run "release-wheels.yml" \
+            --field version="${{ steps.calculate_version.outputs.final_version }}" \
+            --field publish_to_pypi=true \
+            --field publish_to_test_pypi=false \
+            --repo ${{ github.repository }}
+
+          echo "Release-wheels workflow triggered successfully"
+          echo "Wheels will be built and attached to release $VERSION"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Summary
         run: |
           echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
@@ -483,5 +510,6 @@ jobs:
           echo "- **Type**: ${{ steps.calculate_version.outputs.release_type }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **PyPI**: Published with skip-existing" >> $GITHUB_STEP_SUMMARY
           echo "- **GitHub Release**: Created" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wheels**: Building and attachment triggered via release-wheels workflow" >> $GITHUB_STEP_SUMMARY
+          echo "- **PyPI**: Will be published by release-wheels workflow" >> $GITHUB_STEP_SUMMARY
