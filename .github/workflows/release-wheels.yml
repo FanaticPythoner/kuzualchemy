@@ -163,35 +163,56 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           
-      - name: Download wheel artifacts
+      - name: Download sorted wheel artifacts (all platforms)
         uses: actions/download-artifact@v4
         with:
-          pattern: wheels-${{ matrix.os }}-*
-          path: wheels/
+          pattern: "sorted-wheels-*"
+          path: dist/
           merge-multiple: true
-          
+
       - name: Install and test wheel
         run: |
+          set -euo pipefail
+
+          # Derive CPython tag (e.g., 3.8 -> cp38)
+          PY_VER="${{ matrix.python-version }}"
+          PY_TAG="cp${PY_VER/./}"
+
           # Find the appropriate wheel for this platform and Python version
-          WHEEL_FILE=$(find wheels/ -name "*cp${{ matrix.python-version }}*" -name "*.whl" | head -1)
-          
-          if [ -z "$WHEEL_FILE" ]; then
-            echo "No wheel found for Python ${{ matrix.python-version }} on ${{ matrix.os }}"
+          case "${{ runner.os }}" in
+            Linux)
+              OS_HINT="manylinux|linux" ;;
+            macOS)
+              OS_HINT="macos|darwin" ;;
+            Windows)
+              OS_HINT="win" ;;
+          esac
+
+          WHEEL_FILE=$(find dist/ -type f -name "*.whl" | grep -Ei ".*${PY_TAG}.*(${OS_HINT}).*" | head -1 || true)
+
+          if [ -z "${WHEEL_FILE:-}" ]; then
+            echo "ERROR: No wheel found for Python ${{ matrix.python-version }} on ${{ matrix.os }}"
+            echo "Available files:"; ls -la dist/ || true
             exit 1
           fi
-          
+
           echo "Testing wheel: $WHEEL_FILE"
-          
+
           # Install the wheel
           python -m pip install --upgrade pip
           python -m pip install "$WHEEL_FILE"
-          
+
           # Basic import test
-          python -c "import kuzualchemy; print(f'Successfully imported kuzualchemy version: {kuzualchemy.__version__ if hasattr(kuzualchemy, \"__version__\") else \"unknown\"}')"
-          
+          python - << 'PYCODE'
+          import importlib, sys
+          m = importlib.import_module('kuzualchemy')
+          ver = getattr(m, '__version__', 'unknown')
+          print(f"Successfully imported kuzualchemy version: {ver}")
+          PYCODE
+
           # Install test dependencies and run basic tests
           python -m pip install pytest pytest-asyncio pytest-mock
-          
+
           # Run a subset of tests to verify the wheel works
           if [ -d "tests" ]; then
             python -m pytest tests/ -v --tb=short -x --maxfail=3 || echo "Some tests failed, but wheel installation was successful"
@@ -281,3 +302,67 @@ jobs:
           ls dist/ | while read file; do
             echo "- $file" >> $GITHUB_STEP_SUMMARY
           done
+
+  # @@ STEP 8: Attach built wheels and sdist to the GitHub Release assets
+  attach-release-assets:
+    name: Attach Wheels to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [determine-version, build-wheels, test-wheels, publish-pypi]
+    if: github.actor != 'nektos/act' && needs.build-wheels.result == 'success'
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download sorted artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "sorted-wheels-*"
+          path: release-dist/
+          merge-multiple: true
+
+      - name: Verify files to upload
+        run: |
+          echo "Files prepared for release upload:" || true
+          ls -la release-dist/ || true
+          if [ ! "$(ls -A release-dist/ 2>/dev/null || true)" ]; then
+            echo "ERROR: No distribution files found to upload to release"
+            exit 1
+          fi
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          TAG="${{ github.event_name == 'release' && github.event.release.tag_name || '' }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${{ needs.determine-version.outputs.version }}"
+          fi
+          echo "Using release tag: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Ensure release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+          else
+            echo "Creating release $TAG"
+            PRERELEASE_FLAG=""
+            if [ "${{ needs.determine-version.outputs.is_prerelease }}" = "true" ]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            gh release create "$TAG" --title "Release $TAG" --notes "Automated release (assets upload)" $PRERELEASE_FLAG --repo ${{ github.repository }}
+          fi
+
+      - name: Upload assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.tag.outputs.tag }}"
+          echo "Uploading assets to $TAG"
+          gh release upload "$TAG" release-dist/* --clobber --repo ${{ github.repository }}
+
