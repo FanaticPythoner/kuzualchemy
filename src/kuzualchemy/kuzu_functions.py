@@ -1025,5 +1025,3 @@ def regexp_split_to_array(string: Any, pattern: str, options: str | None = None)
         return FunctionExpression("regexp_split_to_array", [string, pattern, options])
     else:
         return FunctionExpression("regexp_split_to_array", [string, pattern])
-
-
