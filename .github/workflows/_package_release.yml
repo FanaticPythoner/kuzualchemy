@@ -1,0 +1,184 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
+name: _package_release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Tag name to use/update (e.g., 'nightly' or 'vX.Y.Z')."
+        required: true
+        type: string
+      release_name:
+        description: "Human-friendly release name ('Nightly (main)' or 'Release vX.Y.Z')."
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub release as pre-release."
+        required: true
+        type: boolean
+      publish_to_pypi:
+        description: "Publish dist/ to PyPI via Trusted Publishers."
+        required: true
+        type: boolean
+      create_or_move_tag:
+        description: "If true, create/move the tag to this commit (lightweight)."
+        required: true
+        type: boolean
+      purge_existing_assets:
+        description: "If true, delete ALL existing assets on the release before upload."
+        required: true
+        type: boolean
+      verify_version_tag_match:
+        description: "If true, verify [project].version == SemVer from release_tag (strip leading 'v')."
+        required: false
+        default: false
+        type: boolean
+      python_version:
+        description: "Python version to use for build."
+        required: false
+        default: "3.12"
+        type: string
+    secrets:
+      GH_TOKEN:
+        required: false
+
+# NOTE: Permissions are controlled by the CALLER workflow to avoid over-granting.
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONNOUSERSITE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+
+jobs:
+  package_and_release:
+    name: Build, tag, GitHub Release, (optional) PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: "pip"
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: Verify pyproject version matches tag (if requested)
+        if: ${{ inputs.verify_version_tag_match }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          TAG_VER="${TAG#v}"
+          python - <<'PY' > pyproj_version.txt
+          import sys, tomllib
+          with open("pyproject.toml","rb") as f:
+              data = tomllib.load(f)
+          v = (data.get("project",{}) or {}).get("version")
+          if not v:
+              print("ERROR: [project].version missing in pyproject.toml", file=sys.stderr)
+              sys.exit(2)
+          print(v)
+          PY
+          PROJ_VER="$(tr -d '\r\n' < pyproj_version.txt)"
+          if [ "${PROJ_VER}" != "${TAG_VER}" ]; then
+            echo "pyproject.toml version (${PROJ_VER}) != tag (${TAG_VER})"
+            exit 1
+          fi
+          echo "Version OK: ${PROJ_VER} == ${TAG_VER}"
+
+      - name: Build sdist + wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist --wheel
+          python -m twine check dist/*
+          ls -lh dist
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          (for f in *; do sha256sum "$f"; done) > SHA256SUMS.txt
+          ls -l
+
+      - name: Create/move tag (lightweight)
+        if: ${{ inputs.create_or_move_tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag -f "${{ inputs.release_tag }}" "$GITHUB_SHA"
+          git push -f origin "refs/tags/${{ inputs.release_tag }}"
+
+      - name: Ensure release exists (no assets yet)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ inputs.release_tag }}
+          commit: ${{ github.sha }}
+          name: ${{ inputs.release_name }}
+          allowUpdates: true
+          generateReleaseNotes: ${{ !inputs.prerelease }}
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+          makeLatest: ${{ inputs.prerelease && 'false' || 'legacy' }}
+
+      - name: Purge existing assets (if requested)
+        if: ${{ inputs.purge_existing_assets }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ids=$(gh release view "${{ inputs.release_tag }}" --json assets --jq '.assets[].id' || true)
+          if [ -n "${ids:-}" ]; then
+            for id in $ids; do
+              gh api --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
+            done
+          fi
+
+      - name: Upload fresh assets
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${{ inputs.release_tag }}" dist/* --clobber
+
+      - name: Publish to PyPI (Trusted Publishers)
+        if: ${{ inputs.publish_to_pypi }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+          print-hashes: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Package & Release summary"
+            echo "- tag: ${{ inputs.release_tag }}"
+            echo "- name: ${{ inputs.release_name }}"
+            echo "- prerelease: ${{ inputs.prerelease }}"
+            echo "- publish_to_pypi: ${{ inputs.publish_to_pypi }}"
+            echo "- purged_assets: ${{ inputs.purge_existing_assets }}"
+          } >> "$GITHUB_STEP_SUMMARY"

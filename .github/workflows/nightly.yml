@@ -9,112 +9,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write       # needed to manage releases/assets
 
 concurrency:
   group: nightly-main
   cancel-in-progress: true
 
-env:
-  PYTHONUNBUFFERED: "1"
-  PYTHONDONTWRITEBYTECODE: "1"
-  PYTHONNOUSERSITE: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  PIP_NO_INPUT: "1"
-
 jobs:
-  build-and-update:
-    name: Build universal wheel + sdist; update 'nightly' pre-release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: (act-only) sanitize toolcache leftovers
-        if: ${{ env.ACT == 'true' }}
-        run: |
-          set -euxo pipefail
-          find /opt/hostedtoolcache -type d -path "*/site-packages/~*" -maxdepth 1 -print -exec rm -rf {} + || true
-
-      - name: Build sdist + universal wheel
-        run: |
-          set -euxo pipefail
-          python -m venv .venv
-          . .venv/bin/activate
-          python -m pip install --upgrade pip build twine
-          python -m build --sdist --wheel
-          python -m twine check dist/*
-          ls -lh dist
-
-      - name: Generate SHA256SUMS.txt
-        run: |
-          set -euxo pipefail
-          cd dist
-          (for f in *; do sha256sum "$f"; done) > SHA256SUMS.txt
-          ls -l
-
-      # Move the 'nightly' tag only on GitHub-hosted runners (not under act).
-      - name: Move 'nightly' tag to this commit (force)
-        if: ${{ env.ACT != 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euxo pipefail
-          git tag -f nightly $GITHUB_SHA
-          git push -f origin nightly
-
-      # Ensure the release object for 'nightly' exists and points at this commit,
-      # but DO NOT upload artifacts here.
-      - name: Ensure Nightly pre-release exists (no assets)
-        if: ${{ env.ACT != 'true' }}
-        uses: ncipollo/release-action@v1
-        with:
-          tag: nightly
-          commit: ${{ github.sha }}
-          name: Nightly (main)
-          allowUpdates: true
-          generateReleaseNotes: false
-          draft: false
-          prerelease: true
-          makeLatest: false
-
-      # Hard-delete ALL existing assets on the nightly release, then upload a clean set.
-      - name: Purge existing Nightly assets (hard reset)
-        if: ${{ env.ACT != 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Get asset IDs; delete every one
-          ids=$(gh release view nightly --json assets --jq '.assets[].id' || true)
-          if [ -n "${ids:-}" ]; then
-            for id in $ids; do
-              gh api --method DELETE \
-                -H "Accept: application/vnd.github+json" \
-                "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
-            done
-          fi
-
-      - name: Upload fresh Nightly assets
-        if: ${{ env.ACT != 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload nightly dist/* --clobber
-
-      # Under act, just prove the build completed and would have uploaded.
-      - name: Nightly summary (act)
-        if: ${{ env.ACT == 'true' }}
-        run: |
-          set -euxo pipefail
-          echo "## Nightly build completed (act local run)" >> $GITHUB_STEP_SUMMARY
-          ls -lh dist >> $GITHUB_STEP_SUMMARY
+  nightly:
+    uses: ./.github/workflows/_package_release.yml
+    permissions:
+      contents: write   # do NOT include id-token here (never publish to PyPI)
+    with:
+      release_tag: nightly
+      release_name: Nightly (main)
+      prerelease: true
+      publish_to_pypi: false
+      create_or_move_tag: true
+      purge_existing_assets: true
+      verify_version_tag_match: false
+      python_version: "3.12"
+    secrets: inherit
