@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kuzualchemy"
-version = "0.2.5"
+version = "0.2.6"
 description = "SQLAlchemy-like ORM for Kuzu graph database"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -167,4 +167,5 @@ exclude_lines = [
     "@(abc\\.)?abstractmethod",
 
 ]
+
 
