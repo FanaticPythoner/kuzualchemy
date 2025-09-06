@@ -26,9 +26,7 @@ env:
 jobs:
   build-and-publish:
     name: Build sdist+wheel; attach assets; publish to PyPI
-    # CHANGE: START guard job to tagged refs only to avoid act push triggering on branch
     if: startsWith(github.ref, 'refs/tags/v')
-    # CHANGE: END
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
