@@ -1,0 +1,102 @@
+name: Release (tagged)
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  id-token: write   # for PyPI Trusted Publishers (OIDC)
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONNOUSERSITE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+
+jobs:
+  build-and-publish:
+    name: Build sdist+wheel; attach assets; publish to PyPI
+    # CHANGE: START guard job to tagged refs only to avoid act push triggering on branch
+    if: startsWith(github.ref, 'refs/tags/v')
+    # CHANGE: END
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Verify pyproject version matches tag (or dynamic)
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os,re,tomllib
+          tag = os.environ["GITHUB_REF_NAME"]  # e.g., v0.2.1
+          m = re.fullmatch(r"v(\d+\.\d+\.\d+)", tag)
+          if not m:
+              raise SystemExit(f"Bad tag format: {tag}")
+          tag_version = m.group(1)
+          with open("pyproject.toml","rb") as f:
+              data = tomllib.load(f)
+          proj = data.get("project", {})
+          explicit = proj.get("version")
+          dynamic = proj.get("dynamic", [])
+          if explicit is None:
+              if "version" in dynamic:
+                  print(f"OK: dynamic versioning; tag is {tag_version}")
+              else:
+                  raise SystemExit("No [project].version and 'version' not listed as dynamic.")
+          else:
+              if explicit != tag_version:
+                  raise SystemExit(f"pyproject version {explicit} != tag {tag_version}")
+              print(f"OK: {explicit} == {tag_version}")
+          PY
+
+      - name: Build sdist + universal wheel
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist --wheel
+          python -m twine check dist/*
+          ls -lh dist
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          set -euxo pipefail
+          cd dist
+          (for f in *; do sha256sum "$f"; done) > SHA256SUMS.txt
+          ls -l
+
+      - name: Create/Update GitHub release (attach assets)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}         # vX.Y.Z
+          name: Release ${{ github.ref_name }}
+          generateReleaseNotes: true
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: "dist/*"
+          draft: false
+          prerelease: false
+
+      # Skip PyPI under act to avoid OIDC/network failures locally.
+      - name: Publish to PyPI (Trusted Publishers)
+        if: ${{ env.ACT != 'true' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hashes: true

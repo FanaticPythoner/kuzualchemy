@@ -1,0 +1,53 @@
+name: Cleanup dev tags & prereleases
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, only print what would be deleted."
+        required: true
+        default: "true"
+        type: choice
+        options: ["true","false"]
+
+permissions:
+  contents: write
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: List dev tags
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --json tagName,isPrerelease | jq -r '.[] | select(.tagName|test("^v[0-9]+\\.[0-9]+\\.[0-9]+\\.dev[0-9]+$")) | .tagName' > devtags.txt
+          echo "Found $(wc -l < devtags.txt) dev tags:"
+          cat devtags.txt || true
+
+      - name: Delete prereleases and tags (if dry_run=false)
+        if: ${{ inputs.dry_run == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while read -r TAG; do
+            echo "Deleting release for $TAG (if exists)…"
+            # Delete release if present
+            gh release delete "$TAG" --yes || true
+            echo "Deleting tag ref $TAG…"
+            git tag -d "$TAG" || true
+            git push origin ":refs/tags/$TAG" || true
+          done < devtags.txt
+
+      - name: Summary
+        run: |
+          echo "## Cleanup summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Candidate tags:" >> $GITHUB_STEP_SUMMARY
+          sed 's/^/- /' devtags.txt >> $GITHUB_STEP_SUMMARY || true
