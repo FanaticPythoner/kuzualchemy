@@ -52,39 +52,18 @@ jobs:
             fi
           fi
 
-          # NEW version from current workspace
-          python - <<'PYNEW' > new_version.txt
-          import sys, tomllib
-          with open("pyproject.toml", "rb") as f:
-              data = tomllib.load(f)
-          v = data.get("project", {}).get("version")
-          if not v:
-              print("ERROR: [project].version missing in pyproject.toml", file=sys.stderr)
-              sys.exit(2)
-          print(v)
-          PYNEW
-          NEW_VER="$(tr -d '\r\n' < new_version.txt)"
+          NEW_VER="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
 
-          # OLD version from file at BEFORE (if available)
           OLD_VER=""
           if [[ -n "${BEFORE}" ]]; then
-            OLD_TMP="$(mktemp)"
-            if git show "${BEFORE}:pyproject.toml" > "${OLD_TMP}" 2>/dev/null; then
-              python - "${OLD_TMP}" <<'PYOLD' > old_version.txt
-              import sys, tomllib, pathlib
-              p = pathlib.Path(sys.argv[1])
-              with p.open("rb") as f:
-                  data = tomllib.load(f)
-              print(data.get("project", {}).get("version") or "")
-              PYOLD
-              OLD_VER="$(tr -d '\r\n' < old_version.txt)"
+            if git show "${BEFORE}:pyproject.toml" > /tmp/_old_pyproject.toml 2>/dev/null; then
+              OLD_VER="$(python -c 'import tomllib; print((tomllib.load(open("/tmp/_old_pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
             fi
           fi
 
           echo "NEW=${NEW_VER}"
           echo "OLD=${OLD_VER}"
 
-          # Gate to plain SemVer X.Y.Z only
           if [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "semver=true" >> "$GITHUB_OUTPUT"
           else
