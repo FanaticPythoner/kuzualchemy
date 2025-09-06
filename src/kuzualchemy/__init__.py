@@ -197,7 +197,7 @@ from .kuzu_functions import (
 __version__ = metadata.version("kuzualchemy")
 __author__ = "FanaticPythoner"  # From pyproject.toml authors
 __email__ = "info@kuzualchemy.com"  # From pyproject.toml authors
-__license__ = "GPL-3.0"  # From pyproject.toml license
+__license__ = "Apache-2.0"  # From pyproject.toml license
 __url__ = "https://kuzualchemy.com"  # From pyproject.toml urls
 
 # Public API
