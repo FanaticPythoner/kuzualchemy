@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
+name: release-assets
+description: Ensure GitHub Release exists; optionally move/create tag; purge old assets; upload new ones
+inputs:
+  release_tag:
+    required: true
+    description: Tag name (e.g., nightly or vX.Y.Z)
+  release_name:
+    required: true
+    description: Human-readable Release title
+  prerelease:
+    required: true
+    description: "true|false"
+  purge_existing_assets:
+    required: true
+    description: "true|false"
+  create_or_move_tag:
+    required: true
+    description: "true|false"
+  dist_dir:
+    required: false
+    default: "dist"
+    description: Directory with files to upload
+runs:
+  using: "composite"
+  steps:
+    - name: Show inputs
+      shell: bash
+      run: |
+        echo "tag=${{ inputs.release_tag }}"
+        echo "name=${{ inputs.release_name }}"
+        echo "prerelease=${{ inputs.prerelease }}"
+        echo "purge=${{ inputs.purge_existing_assets }}"
+        echo "create_or_move_tag=${{ inputs.create_or_move_tag }}"
+        echo "dist_dir=${{ inputs.dist_dir }}"
+
+    - name: Create/move tag (lightweight)
+      if: ${{ inputs.create_or_move_tag == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        git tag -f "${{ inputs.release_tag }}" "$GITHUB_SHA"
+        git push -f origin "refs/tags/${{ inputs.release_tag }}"
+
+    - name: Ensure Release exists
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        TAG="${{ inputs.release_tag }}"
+        NAME="${{ inputs.release_name }}"
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            gh release edit "$TAG" --title "$NAME" --prerelease --latest=false || gh release edit "$TAG" --title "$NAME" --prerelease
+          else
+            gh release edit "$TAG" --title "$NAME" --latest || gh release edit "$TAG" --title "$NAME"
+          fi
+        else
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            gh release create "$TAG" --title "$NAME" --notes "" --target "$GITHUB_SHA" --prerelease --latest=false
+          else
+            gh release create "$TAG" --title "$NAME" --notes "" --target "$GITHUB_SHA" --latest
+          fi
+        fi
+
+    - name: Purge existing assets
+      if: ${{ inputs.purge_existing_assets == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        ids=$(gh release view "${{ inputs.release_tag }}" --json assets --jq '.assets[].id' || true)
+        if [ -n "${ids:-}" ]; then
+          for id in $ids; do
+            gh api --method DELETE -H "Accept: application/vnd.github+json" \
+              "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
+          done
+        fi
+
+    - name: Upload assets
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        gh release upload "${{ inputs.release_tag }}" "${{ inputs.dist_dir }}"/* --clobber

@@ -6,11 +6,11 @@ name: Release (tagged)
 on:
   push:
     tags:
-      - "v*.*.*"     # GLOB, not regex
+      - "v*.*.*"        # GLOB pattern for SemVer-like tags
 
 permissions:
   contents: write
-  id-token: write   # REQUIRED for PyPI Trusted Publishers
+  id-token: write      # REQUIRED for PyPI Trusted Publishers (OIDC)
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -18,19 +18,49 @@ concurrency:
 
 jobs:
   release:
-    # Skip if this tag was pushed by the auto-bump workflow
-    if: ${{ github.actor != 'github-actions[bot]' }}
-    uses: ./.github/workflows/_package_release.yml
-    permissions:
-      contents: write
-      id-token: write
-    with:
-      release_tag: ${{ github.ref_name }}         # e.g. v0.2.3
-      release_name: Release ${{ github.ref_name }}
-      prerelease: false
-      publish_to_pypi: true
-      create_or_move_tag: false                   # tag already exists
-      purge_existing_assets: true
-      verify_version_tag_match: true
-      python_version: "3.12"
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify pyproject version == tag (safety)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          TAG_VER="${TAG#v}"
+          PROJ_VER="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
+          if [ -z "${PROJ_VER}" ]; then
+            echo "ERROR: [project].version missing in pyproject.toml"; exit 2
+          fi
+          if [ "${PROJ_VER}" != "${TAG_VER}" ]; then
+            echo "pyproject.toml version (${PROJ_VER}) != tag (${TAG_VER})"; exit 1
+          fi
+          echo "Version OK: ${PROJ_VER} == ${TAG_VER}"
+
+      - id: pack
+        name: Build artifacts
+        uses: ./.github/actions/build-dist
+        with:
+          python_version: "3.12"
+
+      - name: Create/Update Release (purge + upload)
+        uses: ./.github/actions/release-assets
+        with:
+          release_tag: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          prerelease: "false"
+          purge_existing_assets: "true"
+          create_or_move_tag: "false"
+          dist_dir: ${{ steps.pack.outputs.dist_dir }}
+
+      - name: Publish to PyPI (Trusted Publishers)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ steps.pack.outputs.dist_dir }}
+          skip-existing: true
+          print-hash: true

@@ -25,13 +25,6 @@ jobs:
     name: Create vX.Y.Z tag when pyproject version changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
-    outputs:
-      version: ${{ steps.ver.outputs.new }}
-      changed: ${{ steps.ver.outputs.changed }}
-      semver:  ${{ steps.ver.outputs.semver }}
-      exists:  ${{ steps.exist.outputs.exists }}
-
     steps:
       - name: Checkout (full history incl. tags)
         uses: actions/checkout@v4
@@ -43,7 +36,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Read versions (before vs after)
+      - name: Detect version change & ensure plain SemVer
         id: ver
         shell: bash
         run: |
@@ -70,61 +63,18 @@ jobs:
           echo "NEW=${NEW_VER}"
           echo "OLD=${OLD_VER}"
 
-          if [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "semver=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "semver=false" >> "$GITHUB_OUTPUT"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [[ ! "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "No plain SemVer; skipping tag."
+            exit 0
+          fi
+          if [[ "${NEW_VER}" == "${OLD_VER}" ]]; then
+            echo "Version unchanged; skipping tag."
             exit 0
           fi
 
-          if [[ "${NEW_VER}" != "${OLD_VER}" ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "new=${NEW_VER}" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Fetch tags & check if tag exists
-        if: steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
-        id: exist
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --tags --quiet
-          TAG="v${{ steps.ver.outputs.new }}"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create & push tag vX.Y.Z (annotated)
-        if: steps.exist.outputs.exists != 'true' && steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="v${{ steps.ver.outputs.new }}"
+          TAG="v${NEW_VER}"
+          echo "Creating annotated tag ${TAG}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" "${{ github.sha }}" -m "Release ${TAG}"
           git push origin "refs/tags/${TAG}"
-
-  release:
-    name: Build, attach assets, publish to PyPI
-    needs: tag
-    if: needs.tag.outputs.changed == 'true' && needs.tag.outputs.semver == 'true' && needs.tag.outputs.exists != 'true'
-    uses: ./.github/workflows/_package_release.yml
-    permissions:
-      contents: write
-      id-token: write            # REQUIRED for PyPI OIDC
-    with:
-      release_tag: v${{ needs.tag.outputs.version }}
-      release_name: Release v${{ needs.tag.outputs.version }}
-      prerelease: false
-      publish_to_pypi: true
-      create_or_move_tag: false  # tag already created by job 'tag'
-      purge_existing_assets: true
-      verify_version_tag_match: true
-      python_version: "3.12"
-    secrets: inherit

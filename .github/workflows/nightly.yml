@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write       # needed to manage releases/assets
+  contents: write
 
 concurrency:
   group: nightly-main
@@ -17,16 +17,26 @@ concurrency:
 
 jobs:
   nightly:
-    uses: ./.github/workflows/_package_release.yml
-    permissions:
-      contents: write   # do NOT include id-token here (never publish to PyPI)
-    with:
-      release_tag: nightly
-      release_name: Nightly (main)
-      prerelease: true
-      publish_to_pypi: false
-      create_or_move_tag: true
-      purge_existing_assets: true
-      verify_version_tag_match: false
-      python_version: "3.12"
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: pack
+        name: Build artifacts
+        uses: ./.github/actions/build-dist
+        with:
+          python_version: "3.12"
+
+      - name: Update nightly release (purge + upload)
+        uses: ./.github/actions/release-assets
+        with:
+          release_tag: nightly
+          release_name: Nightly (main)
+          prerelease: "true"
+          purge_existing_assets: "true"
+          create_or_move_tag: "true"
+          dist_dir: ${{ steps.pack.outputs.dist_dir }}
