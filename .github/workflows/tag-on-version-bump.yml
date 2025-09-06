@@ -26,6 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
+    outputs:
+      version: ${{ steps.ver.outputs.new }}
+      changed: ${{ steps.ver.outputs.changed }}
+      semver:  ${{ steps.ver.outputs.semver }}
+      exists:  ${{ steps.exist.outputs.exists }}
+
     steps:
       - name: Checkout (full history incl. tags)
         uses: actions/checkout@v4
@@ -52,39 +58,18 @@ jobs:
             fi
           fi
 
-          # NEW version from current workspace
-          python - <<'PYNEW' > new_version.txt
-          import sys, tomllib
-          with open("pyproject.toml", "rb") as f:
-              data = tomllib.load(f)
-          v = data.get("project", {}).get("version")
-          if not v:
-              print("ERROR: [project].version missing in pyproject.toml", file=sys.stderr)
-              sys.exit(2)
-          print(v)
-          PYNEW
-          NEW_VER="$(tr -d '\r\n' < new_version.txt)"
+          NEW_VER="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
 
-          # OLD version from file at BEFORE (if available)
           OLD_VER=""
           if [[ -n "${BEFORE}" ]]; then
-            OLD_TMP="$(mktemp)"
-            if git show "${BEFORE}:pyproject.toml" > "${OLD_TMP}" 2>/dev/null; then
-              python - "${OLD_TMP}" <<'PYOLD' > old_version.txt
-              import sys, tomllib, pathlib
-              p = pathlib.Path(sys.argv[1])
-              with p.open("rb") as f:
-                  data = tomllib.load(f)
-              print(data.get("project", {}).get("version") or "")
-              PYOLD
-              OLD_VER="$(tr -d '\r\n' < old_version.txt)"
+            if git show "${BEFORE}:pyproject.toml" > /tmp/_old_pyproject.toml 2>/dev/null; then
+              OLD_VER="$(python -c 'import tomllib; print((tomllib.load(open("/tmp/_old_pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
             fi
           fi
 
           echo "NEW=${NEW_VER}"
           echo "OLD=${OLD_VER}"
 
-          # Gate to plain SemVer X.Y.Z only
           if [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "semver=true" >> "$GITHUB_OUTPUT"
           else
@@ -115,7 +100,7 @@ jobs:
           fi
 
       - name: Create & push tag vX.Y.Z (annotated)
-        if: steps.exist.outputs.exists == 'false' && steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
+        if: steps.exist.outputs.exists != 'true' && steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -125,13 +110,21 @@ jobs:
           git tag -a "${TAG}" "${{ github.sha }}" -m "Release ${TAG}"
           git push origin "refs/tags/${TAG}"
 
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "## Tag-on-bump summary"
-            echo "- new: ${{ steps.ver.outputs.new }}"
-            echo "- changed: ${{ steps.ver.outputs.changed }}"
-            echo "- semver: ${{ steps.ver.outputs.semver }}"
-            echo "- existed: ${{ steps.exist.outputs.exists }}"
-          } >> "$GITHUB_STEP_SUMMARY"
+  release:
+    name: Build, attach assets, publish to PyPI
+    needs: tag
+    if: needs.tag.outputs.changed == 'true' && needs.tag.outputs.semver == 'true' && needs.tag.outputs.exists != 'true'
+    uses: ./.github/workflows/_package_release.yml
+    permissions:
+      contents: write
+      id-token: write            # REQUIRED for PyPI OIDC
+    with:
+      release_tag: v${{ needs.tag.outputs.version }}
+      release_name: Release v${{ needs.tag.outputs.version }}
+      prerelease: false
+      publish_to_pypi: true
+      create_or_move_tag: false  # tag already created by job 'tag'
+      purge_existing_assets: true
+      verify_version_tag_match: true
+      python_version: "3.12"
+    secrets: inherit

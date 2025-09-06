@@ -6,11 +6,11 @@ name: Release (tagged)
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v*.*.*"     # GLOB, not regex
 
 permissions:
   contents: write
-  id-token: write   # REQUIRED for PyPI Trusted Publishers (OIDC)
+  id-token: write   # REQUIRED for PyPI Trusted Publishers
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -18,16 +18,18 @@ concurrency:
 
 jobs:
   release:
+    # Skip if this tag was pushed by the auto-bump workflow
+    if: ${{ github.actor != 'github-actions[bot]' }}
     uses: ./.github/workflows/_package_release.yml
     permissions:
       contents: write
       id-token: write
     with:
-      release_tag: ${{ github.ref_name }}                # e.g. v0.2.3
+      release_tag: ${{ github.ref_name }}         # e.g. v0.2.3
       release_name: Release ${{ github.ref_name }}
       prerelease: false
       publish_to_pypi: true
-      create_or_move_tag: false                          # tag already exists
+      create_or_move_tag: false                   # tag already exists
       purge_existing_assets: true
       verify_version_tag_match: true
       python_version: "3.12"
