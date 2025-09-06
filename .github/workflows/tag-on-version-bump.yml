@@ -37,43 +37,23 @@ jobs:
           python-version: "3.12"
 
       - name: Detect version change & ensure plain SemVer
-        id: ver
         shell: bash
         run: |
           set -euo pipefail
-
           BEFORE="${{ github.event.before }}"
           if [[ -z "${BEFORE}" || "${BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
-            if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
-              BEFORE="$(git rev-parse HEAD^)"
-            else
-              BEFORE=""
-            fi
+            if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then BEFORE="$(git rev-parse HEAD^)"; else BEFORE=""; fi
           fi
-
           NEW_VER="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
-
           OLD_VER=""
           if [[ -n "${BEFORE}" ]]; then
             if git show "${BEFORE}:pyproject.toml" > /tmp/_old_pyproject.toml 2>/dev/null; then
               OLD_VER="$(python -c 'import tomllib; print((tomllib.load(open("/tmp/_old_pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
             fi
           fi
-
-          echo "NEW=${NEW_VER}"
-          echo "OLD=${OLD_VER}"
-
-          if [[ ! "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "No plain SemVer; skipping tag."
-            exit 0
-          fi
-          if [[ "${NEW_VER}" == "${OLD_VER}" ]]; then
-            echo "Version unchanged; skipping tag."
-            exit 0
-          fi
-
+          [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 0
+          [[ "${NEW_VER}" != "${OLD_VER}" ]] || exit 0
           TAG="v${NEW_VER}"
-          echo "Creating annotated tag ${TAG}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" "${{ github.sha }}" -m "Release ${TAG}"
