@@ -6,7 +6,7 @@ name: Release (tagged)
 on:
   push:
     tags:
-      - "v*.*.*"        # GLOB for SemVer-like tags
+      - "v*.*.*"        # GLOB pattern for SemVer-like tags
 
 permissions:
   contents: write
@@ -19,7 +19,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
       - name: Checkout (full history)
@@ -27,15 +27,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify pyproject version == tag
+      - name: Verify pyproject version == tag (safety)
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
           TAG_VER="${TAG#v}"
           PROJ_VER="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("version") or "")')"
-          [ -n "${PROJ_VER}" ] || { echo "ERROR: [project].version missing"; exit 2; }
-          [ "${PROJ_VER}" = "${TAG_VER}" ] || { echo "pyproject version ${PROJ_VER} != tag ${TAG_VER}"; exit 1; }
+          if [ -z "${PROJ_VER}" ]; then
+            echo "ERROR: [project].version missing in pyproject.toml"; exit 2
+          fi
+          if [ "${PROJ_VER}" != "${TAG_VER}" ]; then
+            echo "pyproject.toml version (${PROJ_VER}) != tag (${TAG_VER})"; exit 1
+          fi
           echo "Version OK: ${PROJ_VER} == ${TAG_VER}"
 
       - id: pack
@@ -54,40 +58,13 @@ jobs:
           create_or_move_tag: "false"
           dist_dir: ${{ steps.pack.outputs.dist_dir }}
 
-      - name: Publish to PyPI (Trusted Publishers)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: ${{ steps.pack.outputs.dist_dir }}
-          skip-existing: true
-
-      # Hard verification without heredocs
-      - name: Verify release visible on PyPI
-        shell: bash
-        run: |
-          set -euo pipefail
-          NAME="$(python -c 'import tomllib; print((tomllib.load(open("pyproject.toml","rb")).get("project") or {}).get("name") or "")')"
-          [ -n "${NAME}" ] || { echo "ERROR: project.name missing"; exit 2; }
-          TAG="${{ github.ref_name }}"
-          VER="${TAG#v}"
-          echo "Checking PyPI for ${NAME}==${VER} …"
-          for i in $(seq 1 36); do
-            OK="$(curl -fsSL "https://pypi.org/pypi/${NAME}/json" \
-                 | python -c 'import sys,json,os; d=json.load(sys.stdin); v=os.environ.get("VER",""); print("OK" if v in (d.get("releases") or {}) else "MISS")' \
-                   )"
-            if [ "${OK}" = "OK" ]; then
-              echo "PyPI has ${NAME}==${VER}"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "ERROR: ${NAME}==${VER} not visible on PyPI after publish window." >&2
-          exit 1
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "## Release summary"
-            echo "- tag: ${{ github.ref_name }}"
-            echo "- published_to_pypi: ${{ job.status == 'success' && 'true' || 'false' }}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Force a hard error if the version already exists,
+          # so we never "succeed" without uploading.
+          skip-existing: false
+          print-hash: true
