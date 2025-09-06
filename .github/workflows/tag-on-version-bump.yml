@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: 2025 FanaticPythoner
+# SPDX-License-Identifier: Apache-2.0
+
+name: Tag on version bump
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "pyproject.toml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-on-bump-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  tag:
+    name: Create vX.Y.Z tag when pyproject version changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout (full history incl. tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Ensure tomllib is available and consistent
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read versions (before vs after)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BEFORE="${{ github.event.before }}"
+          # Handle cases where BEFORE is empty/zero (first push/new branch)
+          if [[ -z "${BEFORE}" || "${BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
+            if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
+              BEFORE="$(git rev-parse HEAD^)"
+            else
+              BEFORE=""
+            fi
+          fi
+
+          # NEW version from current workspace
+          python - <<'PY' > new_version.txt
+          import sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+          v = data.get("project", {}).get("version")
+          if not v:
+              print("ERROR: [project].version missing in pyproject.toml", file=sys.stderr)
+              sys.exit(2)
+          print(v)
+          PY
+          NEW_VER="$(tr -d '\r\n' < new_version.txt)"
+
+          # OLD version from file at BEFORE (if available)
+          OLD_VER=""
+          if [[ -n "${BEFORE}" ]]; then
+            OLD_TMP="$(mktemp)"
+            if git show "${BEFORE}:pyproject.toml" > "${OLD_TMP}" 2>/dev/null; then
+              python - "$OLD_TMP" <<'PY' > old_version.txt
+              import sys, tomllib, pathlib
+              p = pathlib.Path(sys.argv[1])
+              with p.open("rb") as f:
+                  data = tomllib.load(f)
+              print(data.get("project", {}).get("version") or "")
+              PY
+              OLD_VER="$(tr -d '\r\n' < old_version.txt)"
+            fi
+          fi
+
+          echo "NEW=${NEW_VER}"
+          echo "OLD=${OLD_VER}"
+
+          # Gate to plain SemVer X.Y.Z (no pre/dev labels)
+          if [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "semver=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "semver=false" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${NEW_VER}" != "${OLD_VER}" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new=${NEW_VER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch tags & check if tag exists
+        if: steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
+        id: exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet
+          TAG="v${{ steps.ver.outputs.new }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} already exists; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create & push tag vX.Y.Z (annotated)
+        if: steps.exist.outputs.exists == 'false' && steps.ver.outputs.changed == 'true' && steps.ver.outputs.semver == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.ver.outputs.new }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" "${{ github.sha }}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Tag-on-bump summary"
+            echo "- new: ${{ steps.ver.outputs.new }}"
+            echo "- changed: ${{ steps.ver.outputs.changed }}"
+            echo "- semver: ${{ steps.ver.outputs.semver }}"
+            echo "- existed: ${{ steps.exist.outputs.exists }}"
+          } >> "$GITHUB_STEP_SUMMARY"

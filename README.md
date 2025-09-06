@@ -2,7 +2,7 @@
 
 A SQLAlchemy-like ORM for Kuzu graph database
 
-[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml/badge.svg)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/test.yml)
+[![Tests](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/FanaticPythoner/kuzualchemy/actions/workflows/ci.yml?query=branch%3Amain)
 [![PyPI version](https://img.shields.io/pypi/v/kuzualchemy.svg)](https://pypi.org/project/kuzualchemy/)
 [![Python versions](https://img.shields.io/pypi/pyversions/kuzualchemy.svg)](https://pypi.org/project/kuzualchemy/)
 
