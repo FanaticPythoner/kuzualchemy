@@ -32,8 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Ensure tomllib is available and consistent
-      - name: Setup Python
+      - name: Setup Python (for tomllib)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -45,7 +44,7 @@ jobs:
           set -euo pipefail
 
           BEFORE="${{ github.event.before }}"
-          # Handle cases where BEFORE is empty/zero (first push/new branch)
+          # Handle first-push/zero SHA defensively
           if [[ -z "${BEFORE}" || "${BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
             if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
               BEFORE="$(git rev-parse HEAD^)"
@@ -55,7 +54,7 @@ jobs:
           fi
 
           # NEW version from current workspace
-          python - <<'PY' > new_version.txt
+          python - <<'PYNEW' > new_version.txt
           import sys, tomllib
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
@@ -64,7 +63,7 @@ jobs:
               print("ERROR: [project].version missing in pyproject.toml", file=sys.stderr)
               sys.exit(2)
           print(v)
-          PY
+          PYNEW
           NEW_VER="$(tr -d '\r\n' < new_version.txt)"
 
           # OLD version from file at BEFORE (if available)
@@ -72,13 +71,13 @@ jobs:
           if [[ -n "${BEFORE}" ]]; then
             OLD_TMP="$(mktemp)"
             if git show "${BEFORE}:pyproject.toml" > "${OLD_TMP}" 2>/dev/null; then
-              python - "$OLD_TMP" <<'PY' > old_version.txt
+              python - "${OLD_TMP}" <<'PYOLD' > old_version.txt
               import sys, tomllib, pathlib
               p = pathlib.Path(sys.argv[1])
               with p.open("rb") as f:
                   data = tomllib.load(f)
               print(data.get("project", {}).get("version") or "")
-              PY
+              PYOLD
               OLD_VER="$(tr -d '\r\n' < old_version.txt)"
             fi
           fi
