@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2025 FanaticPythoner
-# SPDX-License-Identifier: Apache-2.0
-
 name: Tag on version bump
 
 on:
@@ -44,7 +41,6 @@ jobs:
           set -euo pipefail
 
           BEFORE="${{ github.event.before }}"
-          # Handle first-push/zero SHA defensively
           if [[ -z "${BEFORE}" || "${BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
             if git rev-parse -q --verify HEAD^ >/dev/null 2>&1; then
               BEFORE="$(git rev-parse HEAD^)"
@@ -53,7 +49,6 @@ jobs:
             fi
           fi
 
-          # NEW version from current workspace
           python - <<'PYNEW' > new_version.txt
           import sys, tomllib
           with open("pyproject.toml", "rb") as f:
@@ -66,7 +61,6 @@ jobs:
           PYNEW
           NEW_VER="$(tr -d '\r\n' < new_version.txt)"
 
-          # OLD version from file at BEFORE (if available)
           OLD_VER=""
           if [[ -n "${BEFORE}" ]]; then
             OLD_TMP="$(mktemp)"
@@ -85,7 +79,6 @@ jobs:
           echo "NEW=${NEW_VER}"
           echo "OLD=${OLD_VER}"
 
-          # Gate to plain SemVer X.Y.Z (no pre/dev labels)
           if [[ "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "semver=true" >> "$GITHUB_OUTPUT"
           else
@@ -111,7 +104,6 @@ jobs:
           TAG="v${{ steps.ver.outputs.new }}"
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} already exists; nothing to do."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi

@@ -71,19 +71,45 @@ jobs:
           git tag -f nightly $GITHUB_SHA
           git push -f origin nightly
 
-      - name: Create/Update Nightly pre-release (replace assets)
+      # Ensure the release object for 'nightly' exists and points at this commit,
+      # but DO NOT upload artifacts here.
+      - name: Ensure Nightly pre-release exists (no assets)
         if: ${{ env.ACT != 'true' }}
         uses: ncipollo/release-action@v1
         with:
           tag: nightly
+          commit: ${{ github.sha }}
           name: Nightly (main)
           allowUpdates: true
-          replacesArtifacts: true
-          artifactErrorsFailBuild: true
           generateReleaseNotes: false
           draft: false
           prerelease: true
-          artifacts: "dist/*"
+          makeLatest: false
+
+      # Hard-delete ALL existing assets on the nightly release, then upload a clean set.
+      - name: Purge existing Nightly assets (hard reset)
+        if: ${{ env.ACT != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Get asset IDs; delete every one
+          ids=$(gh release view nightly --json assets --jq '.assets[].id' || true)
+          if [ -n "${ids:-}" ]; then
+            for id in $ids; do
+              gh api --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
+            done
+          fi
+
+      - name: Upload fresh Nightly assets
+        if: ${{ env.ACT != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload nightly dist/* --clobber
 
       # Under act, just prove the build completed and would have uploaded.
       - name: Nightly summary (act)
