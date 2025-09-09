@@ -6,12 +6,13 @@ Session management for Kuzu ORM with query execution and transaction support.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Tuple, Iterator, cast
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Tuple, Iterator, cast, Set
 from contextlib import contextmanager
 from threading import RLock
 from pathlib import Path
 from collections import defaultdict
 import ahocorasick
+import xxhash
 
 import polars as pl
 
@@ -19,7 +20,7 @@ from .kuzu_query import Query
 from .constants import ValidationMessageConstants, QueryFieldConstants, ErrorMessages
 from .connection_pool import get_shared_connection_pool
 from .constants import PerformanceConstants
-from .constants import DDLConstants
+from .constants import DDLConstants, CypherConstants
 
 ModelType = TypeVar("ModelType")
 
@@ -212,6 +213,69 @@ class KuzuSession:
     Session for executing queries and managing transactions.
     Provides SQLAlchemy-like interface for Kuzu database operations.
     """
+
+    # @@ STEP 1: Cache for reserved keywords set to avoid recomputation
+    _RESERVED_KEYWORDS_CACHE: Optional[Set[str]] = None
+
+    @classmethod
+    def _generate_cypher_reserved_keywords(cls) -> Set[str]:
+        """
+        Generate comprehensive set of Cypher reserved keywords from KuzuAlchemy constants.
+
+        Extracts all keywords from CypherConstants and DDLConstants, splits multi-word
+        constants into individual words, and normalizes to lowercase for case-insensitive
+        comparison.
+
+        Returns:
+            Set of lowercase reserved keywords that cause parser conflicts
+        """
+        if cls._RESERVED_KEYWORDS_CACHE is not None:
+            return cls._RESERVED_KEYWORDS_CACHE
+
+        keywords = set()
+
+        # @@ STEP 2: Extract keywords from CypherConstants
+        for attr_name in dir(CypherConstants):
+            if not attr_name.startswith('_'):  # Skip private attributes
+                attr_value = getattr(CypherConstants, attr_name)
+                if isinstance(attr_value, str):
+                    # Split multi-word constants and add individual words
+                    words = attr_value.lower().split()
+                    keywords.update(words)
+
+        # @@ STEP 3: Extract keywords from DDLConstants
+        for attr_name in dir(DDLConstants):
+            if not attr_name.startswith('_'):  # Skip private attributes
+                attr_value = getattr(DDLConstants, attr_name)
+                if isinstance(attr_value, str):
+                    # Split multi-word constants and add individual words
+                    words = attr_value.lower().split()
+                    keywords.update(words)
+
+        # @@ STEP 5: Cache the result for performance
+        cls._RESERVED_KEYWORDS_CACHE = keywords
+        return keywords
+
+    @staticmethod
+    def _generate_collision_proof_param_name(keyword: str) -> str:
+        """
+        Generate collision-proof parameter name for reserved keywords.
+
+        Uses a scheme that cannot conflict with user field names:
+        __kuzu_param_{keyword}_{hash}
+
+        Args:
+            keyword: The reserved keyword to create parameter name for
+
+        Returns:
+            Collision-proof parameter name that's debuggable and deterministic
+        """
+        # @@ STEP 1: Create fast deterministic hash for uniqueness using xxhash
+        hash_input = f"kuzu_reserved_param_{keyword}".encode('utf-8')
+        short_hash = xxhash.xxh64(hash_input).hexdigest()[:8]
+
+        # @@ STEP 2: Generate collision-proof parameter name
+        return f"__kuzu_param_{keyword}_{short_hash}"
     
     def __init__(
         self,
@@ -882,7 +946,11 @@ class KuzuSession:
             self._identity_map[(model_class, pk_value)] = instance
 
     def _insert_relationship_instance(self, instance: Any) -> None:
-        """Insert a relationship instance into the database."""
+        """Insert a relationship instance into the database.
+
+        Uses CREATE + SET approach when relationship properties contain Cypher reserved keywords
+        to avoid parser conflicts with property maps.
+        """
         from .kuzu_orm import KuzuRelationshipBase
 
         if not isinstance(instance, KuzuRelationshipBase):
@@ -967,17 +1035,12 @@ class KuzuSession:
         else:
             to_pk_field = self._get_primary_key_field_name(to_node_class)
 
+        # @@ STEP 1: Get comprehensive reserved keywords from KuzuAlchemy constants
+        cypher_reserved_keywords = self._generate_cypher_reserved_keywords()
+
         # Build Cypher query to create relationship
-        if properties:
-            prop_str = ", ".join(f"{k}: ${k}" for k in properties.keys())
-            query = f"""
-            MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
-            WHERE from_node.{from_pk_field} = $from_pk
-              AND to_node.{to_pk_field} = $to_pk
-            CREATE (from_node)-[:{rel_name} {{{prop_str}}}]->(to_node)
-            """
-            params = {**properties, 'from_pk': from_pk, 'to_pk': to_pk}
-        else:
+        if not properties:
+            # No properties, simple CREATE
             query = f"""
             MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
             WHERE from_node.{from_pk_field} = $from_pk
@@ -985,6 +1048,44 @@ class KuzuSession:
             CREATE (from_node)-[:{rel_name}]->(to_node)
             """
             params = {'from_pk': from_pk, 'to_pk': to_pk}
+        else:
+            # TODO: Massively improve the performance here. Time comlexity is too high right now.
+            # @@ STEP 2: Check if any property names are reserved keywords
+            has_reserved_keywords = any(k.lower() in cypher_reserved_keywords for k in properties.keys())
+
+            if has_reserved_keywords:
+                # @@ STEP 3: Use CREATE + SET approach with collision-proof parameter aliasing
+                set_clauses = []
+                params = {'from_pk': from_pk, 'to_pk': to_pk}
+
+                for k, v in properties.items():
+                    if k.lower() in cypher_reserved_keywords:
+                        # @@ STEP 4: Use collision-proof parameter name for reserved keywords
+                        param_name = self._generate_collision_proof_param_name(k)
+                        set_clauses.append(f'rel.`{k}` = ${param_name}')
+                        params[param_name] = v
+                    else:
+                        # @@ STEP 5: Use direct parameter binding for non-reserved keywords
+                        set_clauses.append(f'rel.{k} = ${k}')
+                        params[k] = v
+
+                query = f"""
+                MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
+                WHERE from_node.{from_pk_field} = $from_pk
+                  AND to_node.{to_pk_field} = $to_pk
+                CREATE (from_node)-[rel:{rel_name}]->(to_node)
+                SET {', '.join(set_clauses)}
+                """
+            else:
+                # Use efficient property map approach for non-reserved keywords
+                prop_str = ", ".join(f"{k}: ${k}" for k in properties.keys())
+                query = f"""
+                MATCH (from_node:{from_node_name}), (to_node:{to_node_name})
+                WHERE from_node.{from_pk_field} = $from_pk
+                  AND to_node.{to_pk_field} = $to_pk
+                CREATE (from_node)-[:{rel_name} {{{prop_str}}}]->(to_node)
+                """
+                params = {**properties, 'from_pk': from_pk, 'to_pk': to_pk}
 
         self._conn.execute(query, params)
 
