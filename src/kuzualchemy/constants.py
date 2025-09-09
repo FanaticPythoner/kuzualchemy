@@ -34,7 +34,7 @@ class DatabaseConstants:
     DEFAULT_MAX_THREADS: Final[int] = 8
     DEFAULT_CHECKPOINT_THRESHOLD: Final[int] = 1000000
     DEFAULT_COMPRESSION: Final[bool] = True
-    
+
 
 # ============================================================================
 # KUZU DEFAULT VALUE FUNCTIONS
@@ -42,24 +42,24 @@ class DatabaseConstants:
 
 class KuzuDefaultFunction(Enum):
     """Master enum with properly typed default value functions."""
-    
+
     # @@ STEP 1: Time functions - using TimeFunction class
     CURRENT_TIMESTAMP = TimeFunction("current_timestamp()")
     CURRENT_DATE = TimeFunction("current_date()")
     CURRENT_TIME = TimeFunction("current_time()")
     NOW = TimeFunction("now()")
-    
+
     # @@ STEP 2: UUID functions - using UUIDFunction class
     GEN_RANDOM_UUID = UUIDFunction("gen_random_uuid()")
     UUID = UUIDFunction("uuid()")
-    
+
     # @@ STEP 3: Sequence functions - using SequenceFunction class
     NEXTVAL = SequenceFunction("nextval")
-    
+
     def __str__(self) -> str:
         """Return the function call string."""
         return str(self.value)
-    
+
     def with_args(self, *args: Any) -> str:
         """Return function with arguments (for NEXTVAL)."""
         if isinstance(self.value, SequenceFunction):
@@ -74,11 +74,11 @@ class KuzuDefaultFunction(Enum):
 class CascadeAction(Enum):
     """
     Foreign key cascade actions for referential integrity.
-    
+
     :class: CascadeAction
     :synopsis: Enumeration of cascade actions for foreign key constraints
     """
-    
+
     CASCADE = "CASCADE"      # Delete/update related records
     SET_NULL = "SET NULL"    # Set foreign key to NULL
     SET_DEFAULT = "SET DEFAULT"  # Set foreign key to default value
@@ -89,11 +89,11 @@ class CascadeAction(Enum):
 class RelationshipMultiplicity(Enum):
     """
     Relationship multiplicity types.
-    
+
     :class: RelationshipMultiplicity
     :synopsis: Enumeration of relationship multiplicity constraints
     """
-    
+
     MANY_TO_MANY = "MANY_MANY"
     MANY_TO_ONE = "MANY_ONE"
     ONE_TO_MANY = "ONE_MANY"
@@ -106,7 +106,7 @@ class RelationshipMultiplicity(Enum):
 
 class DDLConstants:
     """DDL generation constants."""
-    
+
     # @@ STEP 1: Define DDL keywords
     CREATE_NODE_TABLE: Final[str] = "CREATE NODE TABLE"
     CREATE_REL_TABLE: Final[str] = "CREATE REL TABLE"
@@ -114,7 +114,7 @@ class DDLConstants:
     ALTER_TABLE: Final[str] = "ALTER TABLE"
     DROP_TABLE: Final[str] = "DROP TABLE"
     DROP_INDEX: Final[str] = "DROP INDEX"
-    
+
     # @@ STEP 2: Define DDL clauses
     PRIMARY_KEY: Final[str] = "PRIMARY KEY"
     FOREIGN_KEY: Final[str] = "FOREIGN KEY"
@@ -129,7 +129,7 @@ class DDLConstants:
     SET_NULL: Final[str] = "SET NULL"
     RESTRICT: Final[str] = "RESTRICT"
     NO_ACTION: Final[str] = "NO ACTION"
-    
+
     # @@ STEP 3: Define relationship keywords
     FROM: Final[str] = "FROM"
     TO: Final[str] = "TO"
@@ -137,7 +137,7 @@ class DDLConstants:
     ONE_TO_MANY: Final[str] = "ONE_MANY"
     MANY_TO_MANY: Final[str] = "MANY_MANY"
     ONE_TO_ONE: Final[str] = "ONE_ONE"
-    
+
     # @@ STEP 3.1: Define REL TABLE GROUP keywords for multi-node relationships
     CREATE_REL_TABLE_GROUP: Final[str] = "CREATE REL TABLE GROUP"
     REL_TABLE_GROUP_FROM: Final[str] = "FROM"
@@ -146,14 +146,16 @@ class DDLConstants:
     # @@ STEP 3.2: Define relationship field names that should be excluded from queries
     REL_FROM_NODE_FIELD: Final[str] = "from_node"
     REL_TO_NODE_FIELD: Final[str] = "to_node"
-    
+    REL_FROM_NODE_PK_FIELD: Final[str] = "_priv_from_node_pk"
+    REL_TO_NODE_PK_FIELD: Final[str] = "_priv_to_node_pk"
+
     # @@ STEP 4: Define formatting constants
     STATEMENT_SEPARATOR: Final[str] = ";"
     FIELD_SEPARATOR: Final[str] = ", "
     NEWLINE: Final[str] = "\n"
     INDENT: Final[str] = "    "
     COMMENT_PREFIX: Final[str] = "-- "
-    
+
 
 # ============================================================================
 # CYPHER QUERY CONSTANTS
@@ -161,7 +163,7 @@ class DDLConstants:
 
 class CypherConstants:
     """Cypher query language constants."""
-    
+
     # @@ STEP 1: Define Cypher keywords
     MATCH: Final[str] = "MATCH"
     WHERE: Final[str] = "WHERE"
@@ -179,7 +181,7 @@ class CypherConstants:
     LIMIT: Final[str] = "LIMIT"
     DISTINCT: Final[str] = "DISTINCT"
     DETACH_DELETE: Final[str] = "DETACH DELETE"
-    
+
     # @@ STEP 2: Define Cypher operators
     AND: Final[str] = "AND"
     OR: Final[str] = "OR"
@@ -194,7 +196,7 @@ class CypherConstants:
     LIKE: Final[str] = "LIKE"
     BETWEEN: Final[str] = "BETWEEN"
     EXISTS: Final[str] = "EXISTS"
-    
+
     # @@ STEP 3: Define comparison operators
     EQ: Final[str] = "="
     NEQ: Final[str] = "<>"
@@ -202,7 +204,7 @@ class CypherConstants:
     LTE: Final[str] = "<="
     GT: Final[str] = ">"
     GTE: Final[str] = ">="
-    
+
     # @@ STEP 4: Define aggregate functions
     COUNT: Final[str] = "COUNT"
     SUM: Final[str] = "SUM"
@@ -212,26 +214,38 @@ class CypherConstants:
     COLLECT: Final[str] = "COLLECT"
     COLLECT_LIST: Final[str] = "COLLECT_LIST"
     COLLECT_SET: Final[str] = "COLLECT_SET"
-    
+
     # @@ STEP 5: Define join types
     INNER_JOIN: Final[str] = "INNER JOIN"
     LEFT_JOIN: Final[str] = "LEFT JOIN"
     RIGHT_JOIN: Final[str] = "RIGHT JOIN"
     FULL_JOIN: Final[str] = "FULL JOIN"
     CROSS_JOIN: Final[str] = "CROSS JOIN"
-    
+
     # @@ STEP 6: Define order directions
     ASC: Final[str] = "ASC"
     DESC: Final[str] = "DESC"
-    
+
     # @@ STEP 7: Define grouping keywords
     GROUP_BY: Final[str] = "GROUP BY"
     HAVING: Final[str] = "HAVING"
-    
+
     # @@ STEP 8: Define parameter prefix
     PARAM_PREFIX: Final[str] = "$"
     PARAM_SEPARATOR: Final[str] = "_"
-    
+
+# ============================================================================
+# QUERY RETURN ALIAS CONSTANTS
+# ============================================================================
+
+class QueryReturnAliasConstants:
+    """Constants for standardized aliases in query RETURN clauses."""
+
+    FROM_ENDPOINT: Final[str] = "__from_endpoint__"
+    TO_ENDPOINT: Final[str] = "__to_endpoint__"
+    FROM_ID: Final[str] = "__from_id__"
+    TO_ID: Final[str] = "__to_id__"
+
 
 # ============================================================================
 # MODEL METADATA CONSTANTS
@@ -239,30 +253,30 @@ class CypherConstants:
 
 class ModelMetadataConstants:
     """Model metadata attribute constants."""
-    
+
     # @@ STEP 1: Define node metadata attributes
     KUZU_NODE_NAME: Final[str] = "__kuzu_node_name__"
     IS_KUZU_NODE: Final[str] = "__is_kuzu_node__"
     KUZU_NODE_LABELS: Final[str] = "__kuzu_node_labels__"
     KUZU_COMPOUND_INDEXES: Final[str] = "__kuzu_compound_indexes__"
-    
+
     # @@ STEP 2: Define relationship metadata attributes
     KUZU_REL_NAME: Final[str] = "__kuzu_rel_name__"
     IS_KUZU_RELATIONSHIP: Final[str] = "__is_kuzu_relationship__"
     KUZU_REL_DIRECTION: Final[str] = "__kuzu_rel_direction__"
     KUZU_REL_MULTIPLICITY: Final[str] = "__kuzu_rel_multiplicity__"
-    
+
     # @@ STEP 3: Define field metadata attributes
     KUZU_FIELDS: Final[str] = "__kuzu_fields__"
     KUZU_PRIMARY_KEY: Final[str] = "__kuzu_primary_key__"
     KUZU_UNIQUE_FIELDS: Final[str] = "__kuzu_unique_fields__"
     KUZU_INDEXED_FIELDS: Final[str] = "__kuzu_indexed_fields__"
     KUZU_FIELD_METADATA: Final[str] = "kuzu_metadata"
-    
+
     # @@ STEP 4: Define validation attributes
     KUZU_VALIDATED: Final[str] = "__kuzu_validated__"
     KUZU_VALIDATION_ERRORS: Final[str] = "__kuzu_validation_errors__"
-    
+
 
 # ============================================================================
 # SESSION CONSTANTS
@@ -270,7 +284,7 @@ class ModelMetadataConstants:
 
 class SessionConstants:
     """Session management constants."""
-    
+
     # @@ STEP 1: Define session states
     STATE_NEW: Final[str] = "new"
     STATE_DIRTY: Final[str] = "dirty"
@@ -278,24 +292,24 @@ class SessionConstants:
     STATE_DETACHED: Final[str] = "detached"
     STATE_TRANSIENT: Final[str] = "transient"
     STATE_PERSISTENT: Final[str] = "persistent"
-    
+
     # @@ STEP 2: Define transaction states
     TRANSACTION_ACTIVE: Final[str] = "active"
     TRANSACTION_COMMITTED: Final[str] = "committed"
     TRANSACTION_ROLLED_BACK: Final[str] = "rolled_back"
     TRANSACTION_FAILED: Final[str] = "failed"
-    
+
     # @@ STEP 3: Define flush modes
     FLUSH_AUTO: Final[str] = "auto"
     FLUSH_COMMIT: Final[str] = "commit"
     FLUSH_MANUAL: Final[str] = "manual"
     FLUSH_ALWAYS: Final[str] = "always"
-    
+
     # @@ STEP 4: Define batch sizes
     DEFAULT_BATCH_SIZE: Final[int] = 1000
     MAX_BATCH_SIZE: Final[int] = 10000
     MIN_BATCH_SIZE: Final[int] = 1
-    
+
 
 # ============================================================================
 # QUERY CONSTANTS
@@ -303,30 +317,30 @@ class SessionConstants:
 
 class QueryConstants:
     """Query building constants."""
-    
+
     # @@ STEP 1: Define query states
     QUERY_STATE_INIT: Final[str] = "initialized"
     QUERY_STATE_BUILT: Final[str] = "built"
     QUERY_STATE_EXECUTED: Final[str] = "executed"
     QUERY_STATE_FAILED: Final[str] = "failed"
-    
+
     # @@ STEP 2: Define default aliases
     DEFAULT_NODE_ALIAS: Final[str] = "n"
     DEFAULT_REL_ALIAS: Final[str] = "r"
     DEFAULT_PATH_ALIAS: Final[str] = "p"
     ALIAS_PREFIX: Final[str] = "n"
     ALIAS_SEPARATOR: Final[str] = "_"
-    
+
     # @@ STEP 3: Define query limits
     DEFAULT_LIMIT: Final[int] = 1000
     MAX_LIMIT: Final[int] = 100000
     DEFAULT_OFFSET: Final[int] = 0
-    
+
     # @@ STEP 4: Define query modes
     MODE_READ: Final[str] = "read"
     MODE_WRITE: Final[str] = "write"
     MODE_READ_WRITE: Final[str] = "read_write"
-    
+
 
 # ============================================================================
 # ERROR MESSAGE CONSTANTS
@@ -334,54 +348,54 @@ class QueryConstants:
 
 class ErrorMessages:
     """Error message constants."""
-    
+
     # @@ STEP 1: Define connection errors
     CONNECTION_FAILED: Final[str] = "Failed to establish database connection"
     CONNECTION_CLOSED: Final[str] = "Database connection is closed"
     CONNECTION_TIMEOUT: Final[str] = "Database connection timed out"
     KUZU_NOT_INSTALLED: Final[str] = "kuzu package not installed. Install with: pip install kuzu"
-    
+
     # @@ STEP 2: Define model errors
     MODEL_NOT_REGISTERED: Final[str] = "Model {model_name} is not registered"
     MODEL_VALIDATION_FAILED: Final[str] = "Model validation failed: {errors}"
     INVALID_MODEL_TYPE: Final[str] = "Invalid model type: expected {expected}, got {actual}"
     MISSING_PRIMARY_KEY: Final[str] = "Model {model_name} is missing a primary key"
     DUPLICATE_PRIMARY_KEY: Final[str] = "Model {model_name} has multiple primary keys"
-    
+
     # @@ STEP 3: Define field errors
     FIELD_NOT_FOUND: Final[str] = "Field {field_name} not found in model {model_name}"
     INVALID_FIELD_TYPE: Final[str] = "Invalid field type for {field_name}: {error}"
     MISSING_REQUIRED_FIELD: Final[str] = "Required field {field_name} is missing"
     INVALID_FIELD_VALUE: Final[str] = "Invalid value for field {field_name}: {value}"
-    
+
     # @@ STEP 4: Define relationship errors
     RELATIONSHIP_NOT_FOUND: Final[str] = "Relationship {rel_name} not found"
     INVALID_RELATIONSHIP_NODES: Final[str] = "Invalid nodes for relationship {rel_name}"
     CIRCULAR_RELATIONSHIP: Final[str] = "Circular relationship detected: {path}"
-    
+
     # @@ STEP 5: Define query errors
     QUERY_BUILD_FAILED: Final[str] = "Failed to build query: {error}"
     QUERY_EXECUTION_FAILED: Final[str] = "Query execution failed: {error}"
     INVALID_QUERY_SYNTAX: Final[str] = "Invalid query syntax: {query}"
     QUERY_TIMEOUT: Final[str] = "Query execution timed out after {timeout} seconds"
-    
+
     # @@ STEP 6: Define session errors
     SESSION_CLOSED: Final[str] = "Session is closed"
     TRANSACTION_ALREADY_ACTIVE: Final[str] = "Transaction is already active"
     NO_ACTIVE_TRANSACTION: Final[str] = "No active transaction"
     TRANSACTION_COMMIT_FAILED: Final[str] = "Failed to commit transaction: {error}"
     TRANSACTION_ROLLBACK_FAILED: Final[str] = "Failed to rollback transaction: {error}"
-    
+
     # @@ STEP 7: Define validation errors
     VALIDATION_FAILED: Final[str] = "Validation failed: {errors}"
     TYPE_VALIDATION_FAILED: Final[str] = "Type validation failed for {field}: expected {expected}, got {actual}"
     CONSTRAINT_VIOLATION: Final[str] = "Constraint violation: {constraint}"
-    
+
     # @@ STEP 8: Define generic errors
     INVALID_ARGUMENT: Final[str] = "Invalid argument: {argument}"
     NOT_IMPLEMENTED: Final[str] = "Feature not implemented: {feature}"
     INTERNAL_ERROR: Final[str] = "Internal error: {error}"
-    
+
 
 # ============================================================================
 # VALIDATION CONSTANTS
@@ -389,7 +403,7 @@ class ErrorMessages:
 
 class ValidationConstants:
     """Validation constants."""
-    
+
     # @@ STEP 1: Define validation rules
     MIN_STRING_LENGTH: Final[int] = 0
     MAX_STRING_LENGTH: Final[int] = 10000
@@ -397,14 +411,14 @@ class ValidationConstants:
     MAX_INT_VALUE: Final[int] = 2**63 - 1
     MIN_FLOAT_VALUE: Final[float] = -1.7976931348623157e+308
     MAX_FLOAT_VALUE: Final[float] = 1.7976931348623157e+308
-    
+
     # @@ STEP 2: Define regex patterns
     EMAIL_PATTERN: Final[str] = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     UUID_PATTERN: Final[str] = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     URL_PATTERN: Final[str] = r"^https?://[^\s/$.?#].[^\s]*$"
     ISO_DATE_PATTERN: Final[str] = r"^\d{4}-\d{2}-\d{2}$"
     ISO_DATETIME_PATTERN: Final[str] = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$"
-    
+
 
 # ============================================================================
 # LOGGING CONSTANTS
@@ -412,24 +426,24 @@ class ValidationConstants:
 
 class LoggingConstants:
     """Logging constants."""
-    
+
     # @@ STEP 1: Define log levels
     LOG_DEBUG: Final[str] = "DEBUG"
     LOG_INFO: Final[str] = "INFO"
     LOG_WARNING: Final[str] = "WARNING"
     LOG_ERROR: Final[str] = "ERROR"
     LOG_CRITICAL: Final[str] = "CRITICAL"
-    
+
     # @@ STEP 2: Define log formats
     LOG_FORMAT: Final[str] = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
-    
+
     # @@ STEP 3: Define logger names
     LOGGER_ORM: Final[str] = "kuzualchemy.orm"
     LOGGER_QUERY: Final[str] = "kuzualchemy.query"
     LOGGER_SESSION: Final[str] = "kuzualchemy.session"
     LOGGER_DDL: Final[str] = "kuzualchemy.ddl"
-    
+
 
 # ============================================================================
 # TYPE MAPPING CONSTANTS
@@ -437,7 +451,7 @@ class LoggingConstants:
 
 class TypeMappingConstants:
     """Type mapping constants between Python and Kuzu."""
-    
+
     # @@ STEP 1: Define Python to Kuzu type mappings
     PYTHON_TO_KUZU: Final[dict[str, str]] = {
         "int": "INT64",
@@ -453,7 +467,7 @@ class TypeMappingConstants:
         "dict": "STRUCT",
         "set": "SET",
     }
-    
+
     # @@ STEP 2: Define Kuzu to Python type mappings
     KUZU_TO_PYTHON: Final[dict[str, str]] = {
         "INT8": "int",
@@ -479,7 +493,7 @@ class TypeMappingConstants:
         "SET": "set",
         "MAP": "dict",
     }
-    
+
 
 # ============================================================================
 # PERFORMANCE CONSTANTS
@@ -487,27 +501,27 @@ class TypeMappingConstants:
 
 class PerformanceConstants:
     """Performance tuning constants."""
-    
+
     # @@ STEP 1: Define cache settings
     CACHE_SIZE: Final[int] = 1000
     CACHE_TTL: Final[int] = 3600  # 1 hour in seconds
     CACHE_MAX_AGE: Final[int] = 86400  # 24 hours in seconds
-    
+
     # @@ STEP 2: Define pool settings
     CONNECTION_POOL_SIZE: Final[int] = 10
     CONNECTION_POOL_MAX_OVERFLOW: Final[int] = 20
     CONNECTION_POOL_TIMEOUT: Final[int] = 30
-    
+
     # @@ STEP 3: Define query optimization
     QUERY_CACHE_SIZE: Final[int] = 500
     QUERY_PLAN_CACHE_SIZE: Final[int] = 100
     STATISTICS_CACHE_TTL: Final[int] = 300  # 5 minutes
-    
+
     # @@ STEP 4: Define batch processing
     BATCH_INSERT_SIZE: Final[int] = 1000
     BATCH_UPDATE_SIZE: Final[int] = 500
     BATCH_DELETE_SIZE: Final[int] = 500
-    
+
 
 # ============================================================================
 # FILE SYSTEM CONSTANTS
@@ -615,7 +629,7 @@ class RelationshipDirection:
     OUTGOING: Final[str] = "outgoing"
     INCOMING: Final[str] = "incoming"
     BOTH: Final[str] = "both"
-    
+
     # @@ STEP 3: Define direction aliases
     FORWARD: Final[str] = "forward"
     BACKWARD: Final[str] = "backward"
@@ -871,4 +885,5 @@ __all__ = [
     "SessionOperationConstants",
     "JoinPatternConstants",
     "ValidationMessageConstants",
+    "QueryReturnAliasConstants",
 ]

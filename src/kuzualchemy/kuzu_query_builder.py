@@ -13,7 +13,7 @@ from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType
 )
 from .kuzu_orm import RelationshipPair
-from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants
+from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants, QueryReturnAliasConstants
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +314,12 @@ class CypherQueryBuilder:
         rel_alias = self.state.alias
         direction = rel_class.__dict__.get('__kuzu_direction__')
         
+        endpoint_aliases: List[Tuple[str, str]] = []
         for idx, pair in enumerate(rel_pairs):
             # || S.S.5: Get node names from the pair
             from_name = pair.get_from_name()
             to_name = pair.get_to_name()
-            
+
             # || S.S.6: Create unique aliases for each pair to avoid conflicts
             if len(rel_pairs) > 1:
                 from_alias = f"from_node_{idx}"
@@ -326,11 +327,13 @@ class CypherQueryBuilder:
             else:
                 from_alias = "from_node"
                 to_alias = "to_node"
-            
+
+            endpoint_aliases.append((from_alias, to_alias))
+
             # || S.S.7: Register aliases in the map
             self.alias_map[from_alias] = from_alias
             self.alias_map[to_alias] = to_alias
-            
+
             # @@ STEP 3: Build pattern based on direction
             if direction:
                 if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
@@ -345,9 +348,9 @@ class CypherQueryBuilder:
             else:
                 # || S.S.8: Default to forward direction if not specified
                 pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
-            
+
             match_patterns.append(pattern)
-        
+
         # @@ STEP 4: Add MATCH clause(s) to the query
         # || S.S.9: For multi-pair relationships, we need to handle all patterns properly
         if len(match_patterns) == 1:
@@ -355,7 +358,7 @@ class CypherQueryBuilder:
         else:
             # || S.S.10: For multi-pair relationships, we use UNION ALL to match any valid pattern
             # || This creates a query that handles all relationship pair combinations
-            union_query = self._build_multi_pair_union_query(match_patterns, rel_alias, rel_pairs)
+            union_query = self._build_multi_pair_union_query(match_patterns, endpoint_aliases, rel_alias, rel_pairs)
             # Don't clear parameters - they're needed for WHERE clauses in UNION queries
             # Return the UNION query with parameters intact
             return union_query, self.parameters
@@ -422,7 +425,19 @@ class CypherQueryBuilder:
             else:
                 return_clause = f"RETURN {', '.join(return_items)}"
         else:
-            return_clause = self._build_return_clause()
+            # Build explicit RETURN including endpoints for relationship queries
+            if self.state.select_fields:
+                items = []
+                for field in self.state.select_fields:
+                    if "." in field:
+                        items.append(field)
+                    else:
+                        items.append(f"{self.state.alias}.{field}")
+                from_alias, to_alias = endpoint_aliases[0]
+                return_clause = f"RETURN {', '.join(items)}, {from_alias} AS {DDLConstants.REL_FROM_NODE_FIELD}, {to_alias} AS {DDLConstants.REL_TO_NODE_FIELD}"
+            else:
+                from_alias, to_alias = endpoint_aliases[0]
+                return_clause = f"RETURN {self.state.alias}, {from_alias} AS {DDLConstants.REL_FROM_NODE_FIELD}, {to_alias} AS {DDLConstants.REL_TO_NODE_FIELD}"
         clauses.append(return_clause)
         
         if self.state.order_by:
@@ -559,7 +574,7 @@ class CypherQueryBuilder:
                 f"Current GROUP BY: {self.state.group_by}"
             )
 
-    def _build_multi_pair_union_query(self, match_patterns: List[str], rel_alias: str, rel_pairs: List[Any]) -> str:
+    def _build_multi_pair_union_query(self, match_patterns: List[str], endpoint_aliases: List[Tuple[str, str]], rel_alias: str, rel_pairs: List[Any]) -> str:
         """
         Build a UNION ALL query for multi-pair relationships.
 
@@ -581,7 +596,7 @@ class CypherQueryBuilder:
         # @@ STEP 1: Build individual subqueries for each relationship pair
         subqueries = []
 
-        for pattern in match_patterns:
+        for (pattern, (from_alias, to_alias)) in zip(match_patterns, endpoint_aliases):
             # || S.S.1: Start building subquery clauses
             subquery_clauses = [f"MATCH {pattern}"]
 
@@ -610,7 +625,7 @@ class CypherQueryBuilder:
             if not return_items:
                 return_items = [f"{rel_alias}.*"]
 
-            subquery_clauses.append(f"RETURN {', '.join(return_items)}")
+            subquery_clauses.append(f"RETURN {', '.join(return_items)}, {from_alias} AS {DDLConstants.REL_FROM_NODE_FIELD}, {to_alias} AS {DDLConstants.REL_TO_NODE_FIELD}")
 
             # || S.S.9: Join clauses into subquery
             subqueries.append(" ".join(subquery_clauses))
@@ -620,7 +635,7 @@ class CypherQueryBuilder:
         # || Apply filters and ordering within each subquery instead
         final_subqueries = []
 
-        for pattern in match_patterns:
+        for (pattern, (from_alias, to_alias)) in zip(match_patterns, endpoint_aliases):
             # || S.S.6: Rebuild each subquery with proper filtering and ordering
             subquery_clauses = [f"MATCH {pattern}"]
 
@@ -629,32 +644,30 @@ class CypherQueryBuilder:
             if where_clause:
                 subquery_clauses.append(where_clause)
 
-            # || S.S.8: Add return clause with explicit field names
-            return_items = []
-            rel_class = self.state.model_class
-            if hasattr(rel_class, 'model_fields'):
-                for field_name in rel_class.model_fields.keys():
-                    # || Use constants for relationship field names that should be excluded
-                    excluded_fields = {
-                        DDLConstants.REL_FROM_NODE_FIELD,
-                        DDLConstants.REL_TO_NODE_FIELD
-                    }
-                    if not field_name.startswith('_') and field_name not in excluded_fields:
-                        return_items.append(f"{rel_alias}.{field_name}")
-
-            if not return_items:
-                return_items = [f"{rel_alias}.*"]
-
-            subquery_clauses.append(f"RETURN {', '.join(return_items)}")
+            # || S.S.8: Return the full relationship variable for consistent typing across UNIONs
+            # || Returning the variable ensures stable column types; include endpoints explicitly
+            # Use neutral endpoint aliases to avoid binder conflicts in UNION
+            # Normalize endpoint typing across UNION branches by rematching endpoints via ID to unlabeled variables
+            subquery_clauses.append(f"WITH {from_alias}, {to_alias}, {rel_alias}")
+            subquery_clauses.append(f"MATCH (f) WHERE ID(f) = ID({from_alias})")
+            subquery_clauses.append(f"MATCH (t) WHERE ID(t) = ID({to_alias})")
+            return_line = (
+                f"RETURN {rel_alias} AS {self.state.alias}, "
+                f"f AS {QueryReturnAliasConstants.FROM_ENDPOINT}, "
+                f"t AS {QueryReturnAliasConstants.TO_ENDPOINT}, "
+                f"ID(f) AS {QueryReturnAliasConstants.FROM_ID}, "
+                f"ID(t) AS {QueryReturnAliasConstants.TO_ID}"
+            )
+            subquery_clauses.append(return_line)
 
             # || S.S.9: Add ORDER BY if specified
             if self.state.order_by:
                 order_items = []
-                for field, direction in self.state.order_by:
-                    if "." in field:
-                        order_items.append(f"{field} {direction.value}")
+                for ob_field, direction in self.state.order_by:
+                    if "." in ob_field:
+                        order_items.append(f"{ob_field} {direction.value}")
                     else:
-                        order_items.append(f"{rel_alias}.{field} {direction.value}")
+                        order_items.append(f"{rel_alias}.{ob_field} {direction.value}")
                 subquery_clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
 
             # || S.S.10: Add SKIP and LIMIT if specified

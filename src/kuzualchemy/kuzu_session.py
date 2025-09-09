@@ -19,6 +19,7 @@ from .kuzu_query import Query
 from .constants import ValidationMessageConstants, QueryFieldConstants, ErrorMessages
 from .connection_pool import get_shared_connection_pool
 from .constants import PerformanceConstants
+from .constants import DDLConstants
 
 ModelType = TypeVar("ModelType")
 
@@ -432,7 +433,16 @@ class KuzuSession:
         if is_relationship:
             # For relationships, we need to include from_node_pk and to_node_pk
             # Use class attribute instead of instance attribute to avoid deprecation warning
-            field_names = list(model_class.model_fields.keys())
+            all_field_names = list(model_class.model_fields.keys())
+
+            # Filter out internal relationship fields for bulk insert
+            internal_fields = {
+                DDLConstants.REL_FROM_NODE_FIELD,  # 'from_node'
+                DDLConstants.REL_TO_NODE_FIELD,    # 'to_node'
+                DDLConstants.REL_FROM_NODE_PK_FIELD,  # Private field for from_node primary key cache
+                DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
+            }
+            field_names = [f for f in all_field_names if f not in internal_fields]
 
             # Add node reference columns for relationships
             data_dict['from_node_pk'] = []
@@ -913,7 +923,12 @@ class KuzuSession:
         # Build relationship properties (exclude internal fields)
         properties = instance.model_dump(exclude_unset=True)
         # Remove internal fields that shouldn't be in the relationship
-        internal_fields = {'_from_node', '_to_node', '_from_node_pk', '_to_node_pk'}
+        internal_fields = {
+            DDLConstants.REL_FROM_NODE_FIELD,  # 'from_node'
+            DDLConstants.REL_TO_NODE_FIELD,    # 'to_node'
+            DDLConstants.REL_FROM_NODE_PK_FIELD,  # Private field for from_node primary key cache
+            DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
+        }
         properties = {k: v for k, v in properties.items() if k not in internal_fields}
 
         # Get primary key field names
