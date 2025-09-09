@@ -913,12 +913,35 @@ class KuzuSession:
         if isinstance(from_node_class, str):
             from_node_name = from_node_class
         else:
-            from_node_name = from_node_class.__kuzu_node_name__
+            from_node_name = getattr(from_node_class, '__kuzu_node_name__', None)
+            if not from_node_name:
+                raise ValueError(
+                    f"From node class {from_node_class.__name__} is missing __kuzu_node_name__ attribute. "
+                    f"Ensure the class is decorated with @kuzu_node and not abstract."
+                )
 
         if isinstance(to_node_class, str):
             to_node_name = to_node_class
         else:
-            to_node_name = to_node_class.__kuzu_node_name__
+            to_node_name = getattr(to_node_class, '__kuzu_node_name__', None)
+            if not to_node_name:
+                raise ValueError(
+                    f"To node class {to_node_class.__name__} is missing __kuzu_node_name__ attribute. "
+                    f"Ensure the class is decorated with @kuzu_node and not abstract."
+                )
+
+        # Additional validation for empty node names
+        if not from_node_name or not from_node_name.strip():
+            raise ValueError(
+                f"From node name is empty or whitespace-only. "
+                f"Node class: {from_node_class}, name: '{from_node_name}'"
+            )
+
+        if not to_node_name or not to_node_name.strip():
+            raise ValueError(
+                f"To node name is empty or whitespace-only. "
+                f"Node class: {to_node_class}, name: '{to_node_name}'"
+            )
 
         # Build relationship properties (exclude internal fields)
         properties = instance.model_dump(exclude_unset=True)
@@ -926,6 +949,8 @@ class KuzuSession:
         internal_fields = {
             DDLConstants.REL_FROM_NODE_FIELD,  # 'from_node'
             DDLConstants.REL_TO_NODE_FIELD,    # 'to_node'
+            DDLConstants.REL_FROM_NODE_PK_FIELD,  # Private field for from_node primary key cache
+            DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
             DDLConstants.REL_FROM_NODE_PK_FIELD,  # Private field for from_node primary key cache
             DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
         }
