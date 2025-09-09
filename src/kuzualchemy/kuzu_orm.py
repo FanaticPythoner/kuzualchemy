@@ -1692,29 +1692,23 @@ class KuzuBaseModel(BaseModel):
 class KuzuRelationshipBase(KuzuBaseModel):
     """Base class for relationship entities with proper node reference handling."""
 
-    def __init__(self, from_node: Optional[Any] = None, to_node: Optional[Any] = None, **kwargs):
-        """
-        Initialize relationship with from/to node references.
-
-        Args:
-            from_node: Source node instance or primary key value
-            to_node: Target node instance or primary key value
-            **kwargs: Additional relationship properties
-        """
-        super().__init__(**kwargs)
-        self._from_node = from_node
-        self._to_node = to_node
-
-        # Store node references for relationship creation
-        if from_node is not None:
-            self._from_node_pk = self._extract_node_pk(from_node)
-        else:
-            self._from_node_pk = None
-
-        if to_node is not None:
-            self._to_node_pk = self._extract_node_pk(to_node)
-        else:
-            self._to_node_pk = None
+    from_node: Any
+    to_node: Any
+    
+    _priv_from_node_pk: Optional[Any] = None
+    _priv_to_node_pk: Optional[Any] = None
+    
+    @property
+    def _from_node_pk(self) -> Optional[Any]:
+        if self._priv_from_node_pk is None:
+            self._priv_from_node_pk = self._extract_node_pk(self.from_node)
+        return self._priv_from_node_pk
+    
+    @property
+    def _to_node_pk(self) -> Optional[Any]:
+        if self._priv_to_node_pk is None:
+            self._priv_to_node_pk = self._extract_node_pk(self.to_node)
+        return self._priv_to_node_pk
 
     def __hash__(self) -> int:
         """Make relationship instances hashable using from/to node combination plus properties."""
@@ -1760,16 +1754,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
 
         # Fallback to object identity
         return id(self) == id(other)
-
-    @property
-    def from_node(self) -> Optional[Any]:
-        """Get the source node of this relationship."""
-        return self._from_node
-
-    @property
-    def to_node(self) -> Optional[Any]:
-        """Get the target node of this relationship."""
-        return self._to_node
 
     @property
     def from_node_pk(self) -> Optional[Any]:

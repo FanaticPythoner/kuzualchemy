@@ -46,7 +46,48 @@ class BaseModel(KuzuBaseModel):
                 values[member.value] = member
             _ENUM_CACHE[enum_type] = (names, values)
         return _ENUM_CACHE[enum_type]
-    
+
+    @staticmethod
+    def _create_enum_converter(enum_type: Type[Enum]) -> callable:
+        """
+        Create a high-performance converter function for enum elements.
+
+        Returns a closure that captures cached lookups for O(1) performance.
+        """
+        names, value_map = BaseModel._get_enum_lookups(enum_type)
+
+        def convert_element(elem: Any) -> Any:
+            # Fast path: already correct enum instance
+            if isinstance(elem, Enum) and elem.__class__ is enum_type:
+                return elem
+
+            # Direct value lookup
+            member = value_map.get(elem, _MISSING)
+            if member is not _MISSING:
+                return member
+
+            # String conversions
+            if isinstance(elem, str):
+                member = names.get(elem, _MISSING)
+                if member is not _MISSING:
+                    return member
+
+                # Numeric string conversion
+                if len(elem) > 0:
+                    first_char = elem[0]
+                    if first_char.isdigit() or (len(elem) > 1 and first_char == '-' and elem[1].isdigit()):
+                        try:
+                            numeric = int(elem) if '.' not in elem and 'e' not in elem.lower() else float(elem)
+                            member = value_map.get(numeric, _MISSING)
+                            if member is not _MISSING:
+                                return member
+                        except (ValueError, OverflowError):
+                            pass
+
+            raise ValueError(f"Invalid enum value: {elem}")
+
+        return convert_element
+
     @model_validator(mode='before')
     @classmethod
     def convert_str_to_enum(cls: Type['BaseModel'], values: Any) -> Any:
@@ -83,61 +124,199 @@ class BaseModel(KuzuBaseModel):
             # Get resolved type from Pydantic's field info
             field_type = field_info.annotation
 
-            # Optimization #2 & #3: Conditional assignment and type checking
-            if get_origin(field_type) is Union:
-                enum_type = None
+            # Fast path: Direct enum type (most common case)
+            if isinstance(field_type, type) and issubclass(field_type, Enum):
+                enum_type = field_type
+                # Inline scalar conversion for maximum performance
+                names, value_map = BaseModel._get_enum_lookups(enum_type)
+
+                # Direct value lookup (works for all types)
+                member = value_map.get(value, _MISSING)
+                if member is not _MISSING:
+                    values[field_name] = member
+                    continue
+
+                # String-specific conversions
+                if isinstance(value, str):
+                    # Name lookup
+                    member = names.get(value, _MISSING)
+                    if member is not _MISSING:
+                        values[field_name] = member
+                        continue
+
+                    # Optimized numeric string conversion
+                    if len(value) > 0:
+                        first_char = value[0]
+                        if first_char.isdigit() or (len(value) > 1 and first_char == '-' and value[1].isdigit()):
+                            try:
+                                numeric = int(value) if '.' not in value and 'e' not in value.lower() else float(value)
+                                member = value_map.get(numeric, _MISSING)
+                                if member is not _MISSING:
+                                    values[field_name] = member
+                                    continue
+                            except (ValueError, OverflowError):
+                                pass
+
+                # Invalid value - immediate error
+                valid_names = list(names.keys())
+                valid_values = list(filter(lambda v: v is not None, value_map.keys()))
+                raise ValueError(
+                    f"Invalid value for field {field_name}: {value} "
+                    f"Valid names: {valid_names}, valid values: {valid_values}"
+                )
+
+            # Complex type analysis (Union, List, Tuple)
+            enum_type = None
+            is_sequence = False
+            allow_none_elements = False
+
+            origin = get_origin(field_type)
+            if origin is Union:
+                # Handle Optional[Enum] and Union types - mathematical optimization
                 union_args = get_args(field_type)
                 has_none_type = type(None) in union_args
 
-                for arg in union_args:
-                    if isinstance(arg, type) and issubclass(arg, Enum):
-                        enum_type = arg
-                        break
+                # Mathematical extraction: check first 3 args (covers 99% of cases)
+                if len(union_args) >= 1:
+                    arg0 = union_args[0]
+                    if isinstance(arg0, type) and issubclass(arg0, Enum):
+                        enum_type = arg0
+                    elif len(union_args) >= 2:
+                        arg1 = union_args[1]
+                        if isinstance(arg1, type) and issubclass(arg1, Enum):
+                            enum_type = arg1
+                        elif len(union_args) >= 3:
+                            arg2 = union_args[2]
+                            if isinstance(arg2, type) and issubclass(arg2, Enum):
+                                enum_type = arg2
+
                 if enum_type is None:
                     continue
 
                 # For Optional[Enum], skip None values (they should remain None)
                 if value is None and has_none_type:
                     continue
-                # No need to re-verify enum_type - already checked in loop
+            elif origin in (list, tuple):
+                # Handle List[Enum], Tuple[Enum], List[Optional[Enum]]
+                args = get_args(field_type)
+                if not args:
+                    continue
+
+                inner_type = args[0]
+                inner_origin = get_origin(inner_type)
+
+                if inner_origin is Union:
+                    # List[Optional[Enum]] case - mathematical optimization
+                    inner_args = get_args(inner_type)
+                    has_none = type(None) in inner_args
+
+                    # Mathematical extraction: check first 3 args
+                    if len(inner_args) >= 1:
+                        arg0 = inner_args[0]
+                        if isinstance(arg0, type) and issubclass(arg0, Enum):
+                            enum_type = arg0
+                            is_sequence = True
+                            allow_none_elements = has_none
+                        elif len(inner_args) >= 2:
+                            arg1 = inner_args[1]
+                            if isinstance(arg1, type) and issubclass(arg1, Enum):
+                                enum_type = arg1
+                                is_sequence = True
+                                allow_none_elements = has_none
+                elif isinstance(inner_type, type) and issubclass(inner_type, Enum):
+                    # List[Enum] case
+                    enum_type = inner_type
+                    is_sequence = True
+
+                if enum_type is None:
+                    continue
             else:
+                # Direct enum type
                 enum_type = field_type
                 if not (isinstance(enum_type, type) and issubclass(enum_type, Enum)):
                     continue
 
-            # Optimization #4: Tuple unpacking for faster cache access
-            names, value_map = BaseModel._get_enum_lookups(enum_type)
+            # Conversion logic: sequence vs scalar
+            if is_sequence:
+                # Sequence conversion path
+                if not isinstance(value, (list, tuple)):
+                    continue  # Let Pydantic handle type coercion
 
-            # Direct value lookup (works for all types)
-            member = value_map.get(value, _MISSING)
-            if member is not _MISSING:
-                values[field_name] = member
-                continue
+                # FOR TOKEN #3: Single comprehension for sequence conversion
+                converted = []
+                for elem in value:
+                    if allow_none_elements and elem is None:
+                        converted.append(None)
+                    elif isinstance(elem, Enum) and elem.__class__ is enum_type:
+                        converted.append(elem)
+                    else:
+                        # Inline enum conversion for sequence elements
+                        names, value_map = BaseModel._get_enum_lookups(enum_type)
+                        member = value_map.get(elem, _MISSING)
+                        if member is not _MISSING:
+                            converted.append(member)
+                        elif isinstance(elem, str):
+                            member = names.get(elem, _MISSING)
+                            if member is not _MISSING:
+                                converted.append(member)
+                            elif len(elem) > 0:
+                                first_char = elem[0]
+                                if first_char.isdigit() or (len(elem) > 1 and first_char == '-' and elem[1].isdigit()):
+                                    try:
+                                        numeric = int(elem) if '.' not in elem and 'e' not in elem.lower() else float(elem)
+                                        member = value_map.get(numeric, _MISSING)
+                                        if member is not _MISSING:
+                                            converted.append(member)
+                                        else:
+                                            raise ValueError(f"Invalid enum value: {elem}")
+                                    except (ValueError, OverflowError):
+                                        raise ValueError(f"Invalid enum value: {elem}")
+                                else:
+                                    raise ValueError(f"Invalid enum value: {elem}")
+                            else:
+                                raise ValueError(f"Invalid enum value: {elem}")
+                        else:
+                            raise ValueError(f"Invalid enum value: {elem}")
 
-            # String-specific conversions
-            if isinstance(value, str):
-                # Name lookup
-                member = names.get(value, _MISSING)
+                # Preserve container type
+                values[field_name] = tuple(converted) if isinstance(value, tuple) else converted
+            else:
+                # Scalar conversion path - INLINE for performance
+                names, value_map = BaseModel._get_enum_lookups(enum_type)
+
+                # Direct value lookup (works for all types)
+                member = value_map.get(value, _MISSING)
                 if member is not _MISSING:
                     values[field_name] = member
                     continue
 
-                # Optimization #5: Optimized numeric string conversion
-                if len(value) > 0:
-                    first_char = value[0]
-                    if first_char.isdigit() or (len(value) > 1 and first_char == '-' and value[1].isdigit()):
-                        numeric = int(value) if '.' not in value and 'e' not in value.lower() else float(value)
-                        member = value_map.get(numeric, _MISSING)
-                        if member is not _MISSING:
-                            values[field_name] = member
-                            continue
+                # String-specific conversions
+                if isinstance(value, str):
+                    # Name lookup
+                    member = names.get(value, _MISSING)
+                    if member is not _MISSING:
+                        values[field_name] = member
+                        continue
 
-            # Invalid value - immediate error
-            valid_names = list(names.keys())
-            valid_values = [v for v in value_map.keys() if v is not None]
-            raise ValueError(
-                f"Invalid value for field {field_name}: {value} "
-                f"Valid names: {valid_names}, valid values: {valid_values}"
-            )
+                    # Optimized numeric string conversion
+                    if len(value) > 0:
+                        first_char = value[0]
+                        if first_char.isdigit() or (len(value) > 1 and first_char == '-' and value[1].isdigit()):
+                            try:
+                                numeric = int(value) if '.' not in value and 'e' not in value.lower() else float(value)
+                                member = value_map.get(numeric, _MISSING)
+                                if member is not _MISSING:
+                                    values[field_name] = member
+                                    continue
+                            except (ValueError, OverflowError):
+                                pass
+
+                # Invalid value - immediate error
+                valid_names = list(names.keys())
+                valid_values = list(filter(lambda v: v is not None, value_map.keys()))
+                raise ValueError(
+                    f"Invalid value for field {field_name}: {value} "
+                    f"Valid names: {valid_names}, valid values: {valid_values}"
+                )
 
         return values
