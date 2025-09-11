@@ -1220,7 +1220,7 @@ class KuzuSession:
                 if result and len(result) > 0 and result[0].get('count', 0) > 0:
                     matching_node_types.append(node_name)
 
-            # TODO: THIS IS A VIOLATION AND NEEDS TO BE FIXED ASAP. PERFORMANCE IS CRITICAL HERE. AND THIS IS A DIRECT VIOLATION OF THE RULES.
+            # TODO: Fix this asap.
             except Exception:
                 # || S.S.5: Continue checking other node types if one fails
                 continue
