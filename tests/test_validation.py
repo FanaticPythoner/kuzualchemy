@@ -112,6 +112,21 @@ class TestValidation:
         import shutil
         from pathlib import Path
 
+        # @@ STEP: Re-register models due to conftest.py registry cleanup
+        from kuzualchemy.kuzu_orm import _kuzu_registry
+
+        # Re-register node models
+        node_models = [ProdUser, ProdCompany, ProdProject]
+        for model in node_models:
+            node_name = model.__kuzu_node_name__
+            _kuzu_registry.register_node(node_name, model)
+
+        # Re-register relationship models
+        rel_models = [ProdWorksFor, ProdManages, ProdSponsors]
+        for model in rel_models:
+            rel_name = model.__kuzu_relationship_name__
+            _kuzu_registry.register_relationship(rel_name, model)
+
         temp_dir = tempfile.mkdtemp()
         db_path = Path(temp_dir) / "validation_test.db"
         session = KuzuSession(db_path=str(db_path))

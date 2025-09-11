@@ -36,18 +36,19 @@ def global_registry_cleanup():
     CRITICAL: Clean up global registry before EVERY test to prevent access violations.
 
     This prevents registry pollution that causes Windows fatal exceptions.
+
+    NOTE: clear_registry() already calls gc.collect() internally, so no additional
+    garbage collection is needed to prevent double-GC memory corruption.
     """
     # Global registry cleanup before every test
     from kuzualchemy import clear_registry
-    clear_registry()
-    gc.collect()  # Force garbage collection
+    clear_registry()  # Already includes gc.collect() internally
 
     yield
 
     # Also cleanup after test
     from kuzualchemy import clear_registry
-    clear_registry()
-    gc.collect()
+    clear_registry()  # Already includes gc.collect() internally
 
 @pytest.fixture(autouse=True)
 def cleanup_connection_pool():

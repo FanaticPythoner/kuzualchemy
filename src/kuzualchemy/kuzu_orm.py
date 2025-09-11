@@ -11,7 +11,6 @@ FK constraints, column-level INDEX tags, and correct relationship multiplicity p
 from __future__ import annotations
 
 from dataclasses import dataclass
-import gc
 import logging
 from typing import (
     TYPE_CHECKING,
@@ -835,9 +834,11 @@ def kuzu_field(
         "description": description,
     }
 
-    if isinstance(kuzu_type, KuzuDataType) and kuzu_type == KuzuDataType.SERIAL:
-        # SERIAL fields should not have Python-side defaults
-        return Field(**field_kwargs)
+    if auto_increment:
+        # Auto-increment fields should be optional during instantiation since KuzuDB auto-generates them
+        # Allow both None (explicit) and unset (auto-generate) values
+        # Use None as default to make field optional, distinguish in session logic
+        return Field(default=None, **field_kwargs)
     elif default_factory is not None:
         return Field(default_factory=default_factory, **field_kwargs)
     else:
@@ -1486,6 +1487,19 @@ class KuzuBaseModel(BaseModel):
             # @@ STEP: Access attribute directly
             try:
                 pk_value = self.__dict__[primary_key_field]
+
+                # Special handling for auto-increment fields
+                if pk_value is None:
+                    # Check if this is an auto-increment field that wasn't explicitly set
+                    auto_increment_fields = self.get_auto_increment_fields()
+                    if primary_key_field in auto_increment_fields:
+                        fields_set = getattr(self, '__pydantic_fields_set__', set())
+                        if primary_key_field not in fields_set:
+                            # For auto-increment fields that are unset, use object identity
+                            # This ensures that multiple instances with unset auto-increment PKs
+                            # are treated as different objects in sets
+                            return hash(id(self))
+
                 return hash((self.__class__.__name__, pk_value))
             except KeyError:
                 # Primary key not set - THIS IS AN ERROR
@@ -1567,6 +1581,95 @@ class KuzuBaseModel(BaseModel):
             if meta and meta.foreign_key:
                 fks[field_name] = meta.foreign_key
         return fks
+
+    @classmethod
+    def get_auto_increment_fields(cls) -> List[str]:
+        """
+        Get list of field names that have auto_increment=True.
+
+        Returns:
+            List of field names that are auto-increment (SERIAL) fields
+        """
+        auto_inc_fields: List[str] = []
+        for field_name, field_info in cls.model_fields.items():
+            meta = _kuzu_registry.get_field_metadata(field_info)
+            if meta and meta.auto_increment:
+                auto_inc_fields.append(field_name)
+        return auto_inc_fields
+
+    @classmethod
+    def get_auto_increment_metadata(cls) -> Dict[str, KuzuFieldMetadata]:
+        """
+        Get metadata for all auto-increment fields in the model.
+
+        Returns:
+            Dictionary mapping field names to their KuzuFieldMetadata for auto-increment fields
+        """
+        auto_inc_meta: Dict[str, KuzuFieldMetadata] = {}
+        for field_name, field_info in cls.model_fields.items():
+            meta = _kuzu_registry.get_field_metadata(field_info)
+            if meta and meta.auto_increment:
+                auto_inc_meta[field_name] = meta
+        return auto_inc_meta
+
+    @classmethod
+    def has_auto_increment_primary_key(cls) -> bool:
+        """
+        Check if the model has an auto-increment primary key field.
+
+        Returns:
+            True if there's a primary key field with auto_increment=True
+        """
+        for field_name, field_info in cls.model_fields.items():
+            meta = _kuzu_registry.get_field_metadata(field_info)
+            if meta and meta.primary_key and meta.auto_increment:
+                return True
+        return False
+
+    def get_auto_increment_fields_needing_generation(self) -> List[str]:
+        """
+        Get list of auto-increment field names that need database generation.
+
+        This method distinguishes between:
+        - Fields not explicitly set during instantiation -> need auto-generation
+        - Fields with explicit values (including None) -> use provided value
+
+        Returns:
+            List of field names that need auto-generation from database
+        """
+        auto_increment_fields = self.get_auto_increment_fields()
+        fields_needing_generation = []
+
+        # Check which fields were explicitly set during model instantiation
+        fields_set = getattr(self, '__pydantic_fields_set__', set())
+
+        for field_name in auto_increment_fields:
+            if field_name not in fields_set:
+                # Field was not explicitly set, needs auto-generation
+                fields_needing_generation.append(field_name)
+
+        return fields_needing_generation
+
+    def get_manual_auto_increment_values(self) -> Dict[str, Any]:
+        """
+        Get manually provided values for auto-increment fields.
+
+        Returns:
+            Dictionary mapping field names to their manually provided values
+        """
+        auto_increment_fields = self.get_auto_increment_fields()
+        manual_values = {}
+
+        # Check which fields were explicitly set during model instantiation
+        fields_set = getattr(self, '__pydantic_fields_set__', set())
+
+        for field_name in auto_increment_fields:
+            if field_name in fields_set:
+                # Field was explicitly set (including None)
+                field_value = getattr(self, field_name)
+                manual_values[field_name] = field_value
+
+        return manual_values
 
     @classmethod
     def validate_foreign_keys(cls) -> List[str]:
@@ -2319,24 +2422,26 @@ def validate_all_models() -> None:
 
 def clear_registry():
     """Clear all registered models and reset registry state."""
-    # Enhanced registry cleanup to prevent memory corruption
-    # @@ STEP 1: Clear all model registrations
-    _kuzu_registry.nodes.clear()
-    _kuzu_registry.relationships.clear()
-    _kuzu_registry.models.clear()
-
-    # @@ STEP 2: Clear dependency tracking
+    # @@ STEP 1: Break circular references FIRST (critical for preventing segfaults)
+    # || S.S.1: Clear dependency tracking to break circular references between Pydantic models
     _kuzu_registry._model_dependencies.clear()
     _kuzu_registry._unresolved_foreign_keys.clear()
     _kuzu_registry._resolution_errors.clear()
     _kuzu_registry._circular_dependencies.clear()
     _kuzu_registry._self_references.clear()
 
-    # @@ STEP 3: Reset resolution phase
+    # @@ STEP 2: Reset resolution phase before clearing main dictionaries
     _kuzu_registry._resolution_phase = RegistryResolutionConstants.PHASE_REGISTRATION
 
-    # @@ STEP 4: Force garbage collection to free memory
-    gc.collect()
+    # @@ STEP 3: Clear main model registrations AFTER breaking circular references
+    # || S.S.2: Now safe to clear complex Pydantic model classes without memory corruption
+    _kuzu_registry.nodes.clear()
+    _kuzu_registry.relationships.clear()
+    _kuzu_registry.models.clear()
+
+    # @@ STEP 4: No forced garbage collection - let Python handle cleanup naturally
+    # || S.S.3: Forced gc.collect() on complex objects with circular refs causes segfaults
+    # || S.S.4: Python's automatic garbage collection is safer for C extension cleanup
 
 
 def get_node_by_name(name: str) -> Optional[Type[Any]]:

@@ -212,8 +212,7 @@ class TestReadinessComprehensive:
     def setup_method(self):
         """Set up test environment with configuration."""
         # Clear registry at start of each test to prevent memory corruption
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         self.temp_db = tempfile.mkdtemp()
         self.db_path = Path(self.temp_db) / "readiness_test.db"
@@ -232,8 +231,7 @@ class TestReadinessComprehensive:
     def teardown_method(self):
         """Clean up test environment and report metrics."""
         # Clear registry after each test to prevent memory leaks
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         # Clean up connection pool to prevent test isolation issues
         try:
@@ -578,9 +576,7 @@ class TestReadinessComprehensive:
         """
         # CRITICAL: Registry cleanup to prevent access violations
         from kuzualchemy import clear_registry
-        clear_registry()
-        import gc
-        gc.collect()
+        clear_registry()  # Already includes gc.collect() internally
         session = KuzuSession(db_path=str(self.db_path))
 
         # Generate DDL for e-commerce models
@@ -909,12 +905,7 @@ class TestReadinessComprehensive:
         """
         # CRITICAL: Registry cleanup to prevent access violations
         from kuzualchemy import clear_registry
-        clear_registry()
-        import gc
-        gc.collect()
-        # Clear registry to prevent memory corruption
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         session = KuzuSession(db_path=str(self.db_path))
 
@@ -1119,12 +1110,7 @@ class TestReadinessComprehensive:
         """
         # CRITICAL: Registry cleanup to prevent access violations
         from kuzualchemy import clear_registry
-        clear_registry()
-        import gc
-        gc.collect()
-        # Clear registry to prevent memory corruption
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         session = KuzuSession(db_path=str(self.db_path))
 
@@ -1314,7 +1300,7 @@ class TestReadinessComprehensive:
         assert insert_rate > 50, f"Concurrent insert rate {insert_rate:.1f}/sec below 50/sec minimum"
         
         # Temporarily reduced query rate to 90 to get CI passing for wheel parallelism
-        # TODO: Drastically improve performance
+        # TODO: Drastically improve performance of the core code (kuzu_session / kuzu_orm) by at LEAST 10-FOLDS and thus WITHOUT USING ANY CACHING MECHANISMS WHATSOEVER.
         # TODO: Isolate this test to be run in its own workflow
         assert query_rate > 90, f"Concurrent query rate {query_rate:.1f}/sec below 90/sec minimum"
 
@@ -1346,8 +1332,7 @@ class TestReadinessComprehensive:
         Validation of ACID properties.
         """
         # Clear registry to prevent memory corruption
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         session = KuzuSession(db_path=str(self.db_path))
 
@@ -1409,9 +1394,10 @@ class TestReadinessComprehensive:
                 session.add(account)
 
                 # Create ownership relationship
+                # Use model instances instead of raw primary key values to avoid ambiguity
                 ownership = OwnsAccount(
-                    from_node=user.user_id,
-                    to_node=account.account_id,
+                    from_node=user,
+                    to_node=account,
                     ownership_percentage=100.0,
                     created_at=datetime.now()
                 )
@@ -1443,9 +1429,16 @@ class TestReadinessComprehensive:
                 raise ValueError(f"Insufficient funds: {from_balance} < {amount}")
 
             # Create transfer record
+            # Fetch account instances to avoid ambiguity with raw primary key values
+            from_account = session.query(TxnAccount).filter_by(account_id=from_account_id).first()
+            to_account = session.query(TxnAccount).filter_by(account_id=to_account_id).first()
+
+            if not from_account or not to_account:
+                raise ValueError(f"Account not found: from_account_id={from_account_id}, to_account_id={to_account_id}")
+
             transfer = Transfer(
-                from_node=from_account_id,
-                to_node=to_account_id,
+                from_node=from_account,
+                to_node=to_account,
                 amount=amount,
                 transfer_date=datetime.now(),
                 status="completed",
@@ -1545,8 +1538,7 @@ class TestReadinessComprehensive:
         Validation of error boundaries and recovery.
         """
         # Clear registry to prevent memory corruption
-        clear_registry()
-        gc.collect()  # Force garbage collection to free memory
+        clear_registry()  # Already includes gc.collect() internally
 
         session = KuzuSession(db_path=str(self.db_path))
 

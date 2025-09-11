@@ -66,6 +66,21 @@ class TestConnectionPoolValidation:
         self.temp_db = tempfile.mkdtemp()
         self.db_path = Path(self.temp_db) / "connection_pool_test.db"
 
+        # @@ STEP: Re-register models due to conftest.py registry cleanup
+        from kuzualchemy.kuzu_orm import _kuzu_registry
+
+        # Re-register node models
+        node_models = [TestUser, TestProduct]
+        for model in node_models:
+            node_name = model.__kuzu_node_name__
+            _kuzu_registry.register_node(node_name, model)
+
+        # Re-register relationship models
+        rel_models = [TestPurchased]
+        for model in rel_models:
+            rel_name = model.__kuzu_relationship_name__
+            _kuzu_registry.register_relationship(rel_name, model)
+
     def teardown_method(self):
         """Clean up test database."""
         if Path(self.temp_db).exists():
@@ -276,17 +291,18 @@ class TestConnectionPoolValidation:
         
         # Create multiple relationships with same nodes but different properties
         # This should not cause hash collisions or warnings
+        # Use model instances instead of raw primary key values to avoid ambiguity
         purchase1 = TestPurchased(
-            from_node=1,
-            to_node=1,
+            from_node=user,
+            to_node=product,
             quantity=1,
             price_paid=99.99,
             purchased_at=datetime.now()
         )
-        
+
         purchase2 = TestPurchased(
-            from_node=1,
-            to_node=1,
+            from_node=user,
+            to_node=product,
             quantity=2,
             price_paid=199.98,
             purchased_at=datetime.now()

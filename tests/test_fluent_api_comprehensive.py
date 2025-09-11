@@ -139,16 +139,26 @@ class MultiRel(KuzuRelationshipBase):
 
 def initialize_schema(session: KuzuSession) -> None:
     """Initialize database schema with all test models."""
-    from kuzualchemy.kuzu_orm import generate_node_ddl, generate_relationship_ddl
-    
-    # @@ STEP: Generate and execute DDL for node tables
+    from kuzualchemy.kuzu_orm import generate_node_ddl, generate_relationship_ddl, _kuzu_registry
+
+    # @@ STEP: Re-register models in case registry was cleared by conftest.py
+    # || S.S.: The global_registry_cleanup fixture clears the registry before each test
     node_models = [TestPerson, TestCompany, TestProject]
+    for model in node_models:
+        node_name = model.__kuzu_node_name__
+        _kuzu_registry.register_node(node_name, model)
+
+    rel_models = [WorksFor, Collaborates, Manages, Owns, MultiRel]
+    for model in rel_models:
+        rel_name = model.__kuzu_relationship_name__
+        _kuzu_registry.register_relationship(rel_name, model)
+
+    # @@ STEP: Generate and execute DDL for node tables
     for model in node_models:
         ddl = generate_node_ddl(model)
         session.execute(ddl)
-    
+
     # @@ STEP: Generate and execute DDL for relationship tables
-    rel_models = [WorksFor, Collaborates, Manages, Owns, MultiRel]
     for model in rel_models:
         ddl = generate_relationship_ddl(model)
         session.execute(ddl)
@@ -1372,19 +1382,34 @@ class TestCombinedQueries:
 
 class TestEdgeCasesAndErrors:
     """Tests for edge cases and error scenarios."""
-    
+
     @classmethod
     def setup_class(cls):
         """Set up test database and session once for all tests."""
         cls.temp_db = tempfile.mkdtemp()
         cls.db_path = Path(cls.temp_db) / "test_fluent_edge.db"
         cls.session = KuzuSession(db_path=str(cls.db_path))
-        
+
         # @@ STEP: Initialize schema
         initialize_schema(cls.session)
-        
+
         # @@ STEP: Insert minimal test data
         cls._insert_test_data_static(cls.session)
+
+    def setup_method(self):
+        """Re-register models before each test method due to conftest.py registry cleanup."""
+        # @@ STEP: Re-register models that may have been cleared by global_registry_cleanup
+        from kuzualchemy.kuzu_orm import _kuzu_registry
+
+        node_models = [TestPerson, TestCompany, TestProject]
+        for model in node_models:
+            node_name = model.__kuzu_node_name__
+            _kuzu_registry.register_node(node_name, model)
+
+        rel_models = [WorksFor, Collaborates, Manages, Owns, MultiRel]
+        for model in rel_models:
+            rel_name = model.__kuzu_relationship_name__
+            _kuzu_registry.register_relationship(rel_name, model)
     
     @classmethod
     def teardown_class(cls):

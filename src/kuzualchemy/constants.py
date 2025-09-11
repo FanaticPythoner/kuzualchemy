@@ -148,6 +148,9 @@ class DDLConstants:
     REL_TO_NODE_FIELD: Final[str] = "to_node"
     REL_FROM_NODE_PK_FIELD: Final[str] = "_priv_from_node_pk"
     REL_TO_NODE_PK_FIELD: Final[str] = "_priv_to_node_pk"
+    # @@ STEP 3.3: Default primary key field name for unresolved string node refs
+    DEFAULT_PK_FIELD_NAME: Final[str] = "id"
+
 
     # @@ STEP 4: Define formatting constants
     STATEMENT_SEPARATOR: Final[str] = ";"
