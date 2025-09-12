@@ -198,8 +198,8 @@ class TestFunctionIntegration:
         # Average of 9, 13, 13 = 11.67
         assert abs(results[0]["avg_name_length"] - 11.67) < 0.1
 
-    def test_mathematical_expressions(self, session):
-        """Test complex mathematical expressions with functions."""
+    def test_complex_expressions(self, session):
+        """Test complex expressions with functions."""
         results = session.execute("""
             MATCH (p:Person)
             RETURN p.age, p.height,
@@ -217,7 +217,7 @@ class TestFunctionIntegration:
         results = session.execute("MATCH (p:Person) RETURN sqrt(p.age) AS sqrt_age")
         assert len(results) == 3
 
-        # Test error handling for invalid mathematical operations
+        # Test error handling for invalid operations
 
         # Test 1: Division by zero handling
         with pytest.raises(Exception) as exc_info:

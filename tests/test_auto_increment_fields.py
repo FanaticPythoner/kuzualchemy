@@ -12,7 +12,11 @@ Tests cover:
 - Pydantic validation behavior with auto-increment fields
 """
 
+from __future__ import annotations
+
 import pytest
+import re
+import uuid
 from typing import Optional
 from pydantic import ValidationError
 
@@ -73,11 +77,35 @@ class TestAutoIncrementFields:
             transaction_id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, auto_increment=True)
             amount: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
 
+        @kuzu_node("AutoUUIDUser")
+        class AutoUUIDUser(KuzuBaseModel):
+            """User model with UUID auto-increment primary key."""
+            id: Optional[uuid.UUID] = kuzu_field(kuzu_type=KuzuDataType.UUID, primary_key=True, auto_increment=True)
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+            email: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True, default=None)
+
+        @kuzu_node("AutoUUIDProduct")
+        class AutoUUIDProduct(KuzuBaseModel):
+            """Product model with UUID auto-increment field (not primary key)."""
+            name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
+            product_uuid: Optional[uuid.UUID] = kuzu_field(kuzu_type=KuzuDataType.UUID, auto_increment=True)
+            price: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
+
+        @kuzu_relationship("AutoUUIDFollows", pairs=[(AutoUUIDUser, AutoUUIDUser)])
+        class AutoUUIDFollows(KuzuRelationshipBase):
+            """Relationship with UUID auto-increment primary key."""
+            follow_uuid: Optional[uuid.UUID] = kuzu_field(kuzu_type=KuzuDataType.UUID, primary_key=True, auto_increment=True)
+            followed_at: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
+
         self.AutoUser = AutoUser
         self.AutoProduct = AutoProduct
         self.AutoOrder = AutoOrder
         self.AutoFollows = AutoFollows
         self.AutoPurchase = AutoPurchase
+
+        self.AutoUUIDUser = AutoUUIDUser
+        self.AutoUUIDProduct = AutoUUIDProduct
+        self.AutoUUIDFollows = AutoUUIDFollows
 
     def test_auto_increment_field_detection(self):
         """Test that auto-increment fields are correctly detected."""
@@ -243,7 +271,7 @@ class TestAutoIncrementFields:
 
         # User should be in identity map after commit
         assert user.id is not None
-        identity_key = (self.AutoUser, user.id)
+        identity_key = f"{self.AutoUser.__name__}:{user.id}"
         assert identity_key in session._identity_map
         assert session._identity_map[identity_key] is user
 
@@ -417,7 +445,7 @@ class TestAutoIncrementFields:
         initialize_schema(session, ddl=ddl)
 
         # Test negative integer (should be caught by our custom validation)
-        with pytest.raises(ValueError, match="must be a non-negative integer"):
+        with pytest.raises(ValueError, match="must be non-negative"):
             user = self.AutoUser(id=-1, name="Invalid", email="invalid@example.com")
             session.add(user)
             session.commit()
@@ -541,15 +569,11 @@ class TestAutoIncrementFields:
 
         session.close()
 
-    # ========================================
-    # ADVERSARIAL TESTS - HAT 1: QA TESTER
-    # ========================================
-
-    def test_adversarial_multi_session_auto_increment_insertion(self, test_db_path):
+    def test_multi_session_auto_increment_insertion(self, test_db_path):
         """
-        Adversarial test: Multi-session insertion of auto-increment nodes.
+        test: Multi-session insertion of auto-increment nodes.
 
-        Tests the mathematical correctness of auto-increment sequence generation
+        Tests the auto-increment sequence generation
         across multiple sessions to ensure proper sequence continuity.
         """
         # Initialize schema with first session
@@ -587,7 +611,7 @@ class TestAutoIncrementFields:
             assert isinstance(user_id, int)
             assert user_id >= 0  # SERIAL starts from 0
 
-        # Validation 2: All IDs must be unique (mathematical uniqueness constraint)
+        # Validation 2: All IDs must be unique (uniqueness constraint)
         unique_ids = set(all_ids)
         assert len(unique_ids) == 50, f"Expected 50 unique IDs, got {len(unique_ids)}: {sorted(all_ids)}"
 
@@ -596,11 +620,11 @@ class TestAutoIncrementFields:
         expected_sequence = list(range(50))
         assert sorted_ids == expected_sequence, f"Expected {expected_sequence}, got {sorted_ids}"
 
-    def test_adversarial_multi_pair_relationship_type_determination(self, test_db_path):
+    def test_multi_pair_relationship_type_determination(self, test_db_path):
         """
-        Adversarial test: Multi-pair relationship with complex node type determination.
+        test: Multi-pair relationship with complex node type determination.
 
-        Tests the mathematical correctness of relationship pair matching when
+        Tests the correctness of relationship pair matching when
         dealing with complex inheritance hierarchies and multiple valid pairs.
         """
         session = KuzuSession(db_path=test_db_path)
@@ -669,7 +693,7 @@ class TestAutoIncrementFields:
 
         session.commit()
 
-        # Mathematical validation: All relationships should have auto-generated IDs
+        # Validation: All relationships should have auto-generated IDs
         for i, relationship in enumerate(created_relationships):
             # Validation 1: Auto-increment ID must be generated
             assert relationship.interaction_id is not None, f"Relationship {i} missing auto-increment ID"
@@ -691,11 +715,11 @@ class TestAutoIncrementFields:
 
         session.close()
 
-    def test_adversarial_raw_primary_key_node_type_determination(self, test_db_path):
+    def test_raw_primary_key_node_type_determination(self, test_db_path):
         """
-        Adversarial test: Node type determination from raw primary key values.
+        test: Node type determination from raw primary key values.
 
-        Tests the mathematical correctness of the _get_node_type_name method
+        Tests the correctness of the _get_node_type_name method
         when dealing with raw primary key values instead of model instances.
         """
         session = KuzuSession(db_path=test_db_path)
@@ -745,9 +769,9 @@ class TestAutoIncrementFields:
 
         session.close()
 
-    def test_adversarial_malformed_relationship_pairs(self, test_db_path):
+    def test_malformed_relationship_pairs(self, test_db_path):
         """
-        Adversarial test: Malformed relationship pair definitions.
+        test: Malformed relationship pair definitions.
 
         Tests error handling when relationship pairs are incorrectly defined
         or when node types don't match the actual instances.
@@ -808,11 +832,11 @@ class TestAutoIncrementFields:
 
         session.close()
 
-    def test_adversarial_auto_increment_boundary_conditions(self, test_db_path):
+    def test_auto_increment_boundary_conditions(self, test_db_path):
         """
-        Adversarial test: Auto-increment boundary conditions and edge cases.
+        test: Auto-increment boundary conditions and edge cases.
 
-        Tests mathematical correctness at boundary conditions like maximum values,
+        Tests correctness at boundary conditions like maximum values,
         rollover scenarios, and unusual data patterns.
         """
         session = KuzuSession(db_path=test_db_path)
@@ -831,7 +855,7 @@ class TestAutoIncrementFields:
         session.add_all(users)
         session.commit()
 
-        # Mathematical validation: All IDs should be sequential from 0 to 999
+        # Validation: All IDs should be sequential from 0 to 999
         user_ids = [user.id for user in users]
 
         # Validation 1: All IDs must be non-None integers
@@ -965,6 +989,157 @@ class TestAutoIncrementFields:
 
         # Check uniqueness
         assert len(set(all_ids)) == len(all_ids), f"Duplicate IDs found: {all_ids}"
+
+    # ========================================
+    # UUID AUTO-INCREMENT TESTS
+    # ========================================
+
+    def test_uuid_auto_increment_field_definition(self):
+        """Test that UUID auto-increment fields are properly defined."""
+        # Check that UUID auto-increment fields are recognized
+        auto_increment_fields = self.AutoUUIDUser.get_auto_increment_fields()
+        assert "id" in auto_increment_fields
+
+        # Check metadata
+        metadata = self.AutoUUIDUser.get_auto_increment_metadata()
+        assert "id" in metadata
+        assert metadata["id"].kuzu_type == KuzuDataType.UUID
+        assert metadata["id"].auto_increment is True
+        assert metadata["id"].primary_key is True
+
+    def test_uuid_auto_increment_ddl_generation(self):
+        """Test that DDL is correctly generated for UUID auto-increment fields."""
+        ddl = get_ddl_for_node(self.AutoUUIDUser)
+
+        # Should contain UUID type and DEFAULT gen_random_uuid()
+        assert "UUID" in ddl
+        assert "DEFAULT gen_random_uuid()" in ddl
+        assert "PRIMARY KEY" in ddl
+
+        # Verify the structure
+        assert "AutoUUIDUser" in ddl
+        assert "id UUID DEFAULT gen_random_uuid() PRIMARY KEY" in ddl or "id UUID" in ddl
+
+    def test_single_uuid_node_creation_with_auto_increment(self, test_db_path):
+        """Test creating a single node with UUID auto-increment primary key."""
+        session = KuzuSession(db_path=test_db_path)
+
+        # Initialize schema
+        ddl = get_ddl_for_node(self.AutoUUIDUser)
+        initialize_schema(session, ddl=ddl)
+
+        # Create user without providing UUID
+        user = self.AutoUUIDUser(name="Alice", email="alice@example.com")
+        assert user.id is None  # Should be None before insertion
+
+        session.add(user)
+        session.commit()
+
+        # After insertion, the auto-increment field should be populated with a UUID
+        assert user.id is not None
+        assert isinstance(user.id, uuid.UUID)
+
+        # Validate UUID format (8-4-4-4-12 hex digits)
+        uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        assert re.match(uuid_pattern, str(user.id), re.IGNORECASE)
+
+        session.close()
+
+    def test_uuid_auto_increment_manual_override(self, test_db_path):
+        """Test manually providing UUID values for auto-increment fields."""
+        session = KuzuSession(db_path=test_db_path)
+
+        # Initialize schema
+        ddl = get_ddl_for_node(self.AutoUUIDUser)
+        initialize_schema(session, ddl=ddl)
+
+        # Create user with manual UUID object (Pydantic expects UUID object)
+        manual_uuid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
+        user = self.AutoUUIDUser(id=manual_uuid, name="Bob", email="bob@example.com")
+
+        # Verify that the manual UUID was properly set during instantiation
+        assert user.id == manual_uuid
+
+        # Verify that the field is tracked as explicitly set
+        assert "id" in user.__pydantic_fields_set__
+
+        # Verify that get_manual_auto_increment_values() works correctly
+        manual_values = user.get_manual_auto_increment_values()
+        assert manual_values == {"id": manual_uuid}
+
+        session.add(user)
+        session.commit()
+
+        # The manual UUID should be preserved
+        assert user.id == manual_uuid
+
+        session.close()
+
+    def test_uuid_auto_increment_validation_invalid_format(self, test_db_path):
+        """Test validation of invalid UUID formats (strings are rejected at Pydantic level)."""
+        # Pydantic should reject strings at model instantiation level
+        with pytest.raises(ValidationError, match="Input should be a valid UUID"):
+            self.AutoUUIDUser(id="invalid-uuid", name="Charlie", email="charlie@example.com")
+
+    def test_uuid_auto_increment_validation_non_uuid(self, test_db_path):
+        """Test validation of non-UUID values for UUID fields."""
+        # Pydantic should catch non-UUID values at model instantiation
+        with pytest.raises(ValidationError, match="UUID input should be a string, bytes or UUID object"):
+            self.AutoUUIDUser(id=12345, name="Dave", email="dave@example.com")
+
+    def test_invalid_auto_increment_type_rejection(self):
+        """Test that invalid types for auto-increment are rejected."""
+        # Should raise error for unsupported auto-increment types
+        with pytest.raises(ValueError, match="Auto-increment is only supported for INT64/SERIAL and UUID fields"):
+            @kuzu_node("InvalidAutoIncrement")
+            class InvalidAutoIncrement(KuzuBaseModel):
+                id: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True, auto_increment=True)
+                name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
+
+    def test_comprehensive_uuid_auto_increment_workflow(self, test_db_path):
+        """Comprehensive test demonstrating UUID auto-increment functionality end-to-end."""
+        session = KuzuSession(db_path=test_db_path)
+
+        # Initialize schema
+        ddl = get_ddl_for_node(self.AutoUUIDUser)
+        initialize_schema(session, ddl=ddl)
+
+        # Test 1: Auto-generated UUID
+        user1 = self.AutoUUIDUser(name="Alice", email="alice@example.com")
+        assert user1.id is None
+
+        session.add(user1)
+        session.commit()
+
+        assert user1.id is not None
+        assert isinstance(user1.id, uuid.UUID)
+        uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        assert re.match(uuid_pattern, str(user1.id), re.IGNORECASE)
+
+        # Test 2: Manual UUID override
+        manual_uuid = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
+        user2 = self.AutoUUIDUser(id=manual_uuid, name="Bob", email="bob@example.com")
+
+        # Verify that the manual UUID was properly set and tracked
+        assert "id" in user2.__pydantic_fields_set__
+        manual_values = user2.get_manual_auto_increment_values()
+        assert manual_values == {"id": manual_uuid}
+
+        session.add(user2)
+        session.commit()
+
+        assert user2.id == manual_uuid
+
+        # Test 3: Verify both users exist and have different UUIDs
+        all_users = session.query(self.AutoUUIDUser).all()
+        assert len(all_users) == 2
+
+        user_ids = [user.id for user in all_users]
+        assert len(set(user_ids)) == 2  # All UUIDs should be unique
+        assert user1.id in user_ids
+        assert user2.id in user_ids
+
+        session.close()
 
     @pytest.fixture
     def test_db_path(self, tmp_path):

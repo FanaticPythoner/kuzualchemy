@@ -356,7 +356,6 @@ class ErrorMessages:
     CONNECTION_FAILED: Final[str] = "Failed to establish database connection"
     CONNECTION_CLOSED: Final[str] = "Database connection is closed"
     CONNECTION_TIMEOUT: Final[str] = "Database connection timed out"
-    KUZU_NOT_INSTALLED: Final[str] = "kuzu package not installed. Install with: pip install kuzu"
 
     # @@ STEP 2: Define model errors
     MODEL_NOT_REGISTERED: Final[str] = "Model {model_name} is not registered"
@@ -370,6 +369,12 @@ class ErrorMessages:
     INVALID_FIELD_TYPE: Final[str] = "Invalid field type for {field_name}: {error}"
     MISSING_REQUIRED_FIELD: Final[str] = "Required field {field_name} is missing"
     INVALID_FIELD_VALUE: Final[str] = "Invalid value for field {field_name}: {value}"
+
+    # @@ STEP 3.1: Define UUID-specific field errors
+    UUID_STRING_NOT_ALLOWED: Final[str] = (
+        "UUID field '{field_name}' in {model_name} must be a UUID object, not a string. "
+        "Got: {value} ({type_name}). Use uuid.UUID('{value}') to create a proper UUID object."
+    )
 
     # @@ STEP 4: Define relationship errors
     RELATIONSHIP_NOT_FOUND: Final[str] = "Relationship {rel_name} not found"
@@ -401,29 +406,6 @@ class ErrorMessages:
 
 
 # ============================================================================
-# VALIDATION CONSTANTS
-# ============================================================================
-
-class ValidationConstants:
-    """Validation constants."""
-
-    # @@ STEP 1: Define validation rules
-    MIN_STRING_LENGTH: Final[int] = 0
-    MAX_STRING_LENGTH: Final[int] = 10000
-    MIN_INT_VALUE: Final[int] = -2**63
-    MAX_INT_VALUE: Final[int] = 2**63 - 1
-    MIN_FLOAT_VALUE: Final[float] = -1.7976931348623157e+308
-    MAX_FLOAT_VALUE: Final[float] = 1.7976931348623157e+308
-
-    # @@ STEP 2: Define regex patterns
-    EMAIL_PATTERN: Final[str] = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-    UUID_PATTERN: Final[str] = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-    URL_PATTERN: Final[str] = r"^https?://[^\s/$.?#].[^\s]*$"
-    ISO_DATE_PATTERN: Final[str] = r"^\d{4}-\d{2}-\d{2}$"
-    ISO_DATETIME_PATTERN: Final[str] = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?$"
-
-
-# ============================================================================
 # LOGGING CONSTANTS
 # ============================================================================
 
@@ -446,6 +428,12 @@ class LoggingConstants:
     LOGGER_QUERY: Final[str] = "kuzualchemy.query"
     LOGGER_SESSION: Final[str] = "kuzualchemy.session"
     LOGGER_DDL: Final[str] = "kuzualchemy.ddl"
+
+    # @@ STEP 4: Define log message templates
+    CONNECTION_REUSE_ERROR_MSG: Final[str] = (
+        "Connection reuse failed for query: {query}. Error: {error}. "
+        "Falling back to normal execution."
+    )
 
 
 # ============================================================================
@@ -524,6 +512,12 @@ class PerformanceConstants:
     BATCH_INSERT_SIZE: Final[int] = 1000
     BATCH_UPDATE_SIZE: Final[int] = 500
     BATCH_DELETE_SIZE: Final[int] = 500
+
+    # @@ STEP 5: Define session optimization settings
+    CONNECTION_REUSE_THRESHOLD: Final[int] = 5  # Reuse connection for N operations
+    AUTOFLUSH_BATCH_SIZE: Final[int] = 100  # Batch size before forcing flush
+    IDENTITY_MAP_INITIAL_SIZE: Final[int] = 256  # Initial identity map size
+    METADATA_CACHE_SIZE: Final[int] = 500  # Cache size for model metadata
 
 
 # ============================================================================
@@ -858,6 +852,13 @@ class ValidationMessageConstants:
     # @@ STEP 4: Define query state validation
     CANNOT_UPDATE_FIELD: Final[str] = "Cannot update non-existent field '{}' in QueryState. Valid fields: {}"
 
+    # @@ STEP 5: Define node type determination error messages
+    NO_PRIMARY_KEY_FIELD: Final[str] = "Node class '{}' has no primary key field defined"
+    DATABASE_QUERY_FAILED: Final[str] = "Database query failed for node type '{}' with primary key value '{}': {}"
+    MODEL_ATTRIBUTE_ERROR: Final[str] = "Model class '{}' missing required attributes: {}"
+    PARAMETER_BINDING_ERROR: Final[str] = "Failed to bind parameter for node type '{}' with value '{}': {}"
+    RESULT_PARSING_ERROR: Final[str] = "Failed to parse query result for node type '{}': {}"
+
 
 # ============================================================================
 # EXPORT ALL CONSTANTS
@@ -872,7 +873,6 @@ __all__ = [
     "SessionConstants",
     "QueryConstants",
     "ErrorMessages",
-    "ValidationConstants",
     "LoggingConstants",
     "TypeMappingConstants",
     "PerformanceConstants",

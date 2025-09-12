@@ -651,10 +651,10 @@ class TestValidation:
         assert len(rel_results) <= len(expected_not_remote), \
             f"Got more results ({len(rel_results)}) than expected maximum ({len(expected_not_remote)})"
 
-        # || S.S.8: Log the discrepancy for debugging but don't fail the test
+        # || S.S.8: If we didn't get all expected results, raise an error
         if len(rel_results) != len(expected_not_remote):
-            print(f"Storage limitation detected: Expected {len(expected_not_remote)} relationships, got {len(rel_results)}")
-            print("This is acceptable due to Kuzu relationship storage characteristics")
+            raise ValueError(f"Expected {len(expected_not_remote)} relationships, got {len(rel_results)}. "
+                             f"Storage limitation detected: Expected {len(expected_not_remote)} relationships, got {len(rel_results)}.")
 
         # || S.S.9: Validate each result matches filter criteria (but not exact sets due to storage limitations)
         result_departments = set()
@@ -674,11 +674,11 @@ class TestValidation:
         assert result_departments.issubset(expected_departments), \
             f"Result departments {result_departments} should be subset of expected {expected_departments}"
 
-        # || S.S.11: Log department discrepancy for debugging
+        # || S.S.11: If we didn't get all expected results, raise an error
         if result_departments != expected_departments:
             missing_departments = expected_departments - result_departments
-            print(f"Department storage limitation: Missing departments {missing_departments}")
-            print("This is acceptable due to Kuzu relationship storage characteristics")
+            raise ValueError(f"Missing departments {missing_departments}. "
+                             f"Department storage limitation detected: Expected {expected_departments} departments, got {result_departments}.")
 
     def test_transaction_ordering_fix_validation(self, session: KuzuSession):
         """
@@ -922,16 +922,12 @@ class TestValidation:
         assert len(overlap) > 0, "Should have some overlap between expected and actual companies"
         assert len(result_company_ids) > 0, "Should have at least some company results"
 
-        # || S.S.17: Log traversal discrepancy for debugging
+        # || S.S.17: If we didn't get all expected results, raise an error
         if result_company_ids != expected_companies:
             missing_from_results = expected_companies - result_company_ids
             extra_in_results = result_company_ids - expected_companies
-            print(f"Traversal storage limitation detected:")
-            if missing_from_results:
-                print(f"  Missing from results: {missing_from_results}")
-            if extra_in_results:
-                print(f"  Extra in results: {extra_in_results}")
-            print("This is acceptable due to Kuzu relationship storage characteristics")
+            raise ValueError(f"Missing from results: {missing_from_results}, Extra in results: {extra_in_results}. "
+                             f"Traversal storage limitation detected: Expected {expected_companies} companies, got {result_company_ids}.")
     
     def test_parameter_handling_secure(self, session: KuzuSession):
         """Test that parameter handling is secure and correct."""
@@ -1152,11 +1148,11 @@ class TestValidation:
             f"Result companies {result_company_ids} should be subset of expected {expected_company_ids}"
         assert len(result_company_ids) > 0, "Should have at least some company results"
 
-        # || S.S.14: Log traversal discrepancy for debugging
+        # || S.S.14: If we didn't get all expected results, raise an error
         if result_company_ids != expected_company_ids:
             missing_companies = expected_company_ids - result_company_ids
-            print(f"Traversal storage limitation: Missing companies {missing_companies}")
-            print("This is acceptable due to Kuzu relationship storage characteristics")
+            raise ValueError(f"Missing companies {missing_companies}. "
+                             f"Traversal storage limitation detected: Expected {expected_company_ids} companies, got {result_company_ids}.")
 
         # Test 3: Parameter handling
         query3 = (session.query(ProdProject)

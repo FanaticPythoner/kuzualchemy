@@ -799,7 +799,20 @@ def kuzu_field(
         kuzu_type = ArrayTypeSpecification(element_type=element_type)
 
     if auto_increment:
-        kuzu_type = KuzuDataType.SERIAL
+        # @@ STEP 1: Validate auto-increment compatibility
+        if kuzu_type == KuzuDataType.INT64 or kuzu_type == KuzuDataType.SERIAL:
+            # || S.1.1: Integer auto-increment uses SERIAL type
+            kuzu_type = KuzuDataType.SERIAL
+        elif kuzu_type == KuzuDataType.UUID:
+            # || S.1.2: UUID auto-increment keeps UUID type but gets DEFAULT gen_random_uuid()
+            # || This will be handled in the field metadata creation below
+            pass
+        else:
+            # || S.1.3: Only INT64/SERIAL and UUID support auto-increment
+            raise ValueError(
+                f"Auto-increment is only supported for INT64/SERIAL and UUID fields, "
+                f"got: {kuzu_type}"
+            )
 
     # Validate that arrays cannot be primary keys
     if primary_key and isinstance(kuzu_type, ArrayTypeSpecification):
@@ -808,6 +821,12 @@ def kuzu_field(
             "Primary keys must be scalar types."
         )
     
+    # @@ STEP 2: Set appropriate default value for UUID auto-increment fields
+    field_default_value = None if default is ... else default
+    if auto_increment and kuzu_type == KuzuDataType.UUID:
+        # || S.2.1: UUID auto-increment fields get gen_random_uuid() as default
+        field_default_value = KuzuDefaultFunction.GEN_RANDOM_UUID
+
     kuzu_metadata = KuzuFieldMetadata(
         kuzu_type=kuzu_type,
         primary_key=primary_key,
@@ -816,7 +835,7 @@ def kuzu_field(
         not_null=not_null,
         index=index,
         check_constraint=check_constraint,
-        default_value=None if default is ... else default,
+        default_value=field_default_value,
         default_factory=default_factory,
         auto_increment=auto_increment,
         is_from_ref=is_from_ref,
@@ -1654,20 +1673,60 @@ class KuzuBaseModel(BaseModel):
         """
         Get manually provided values for auto-increment fields.
 
+        This method determines which auto-increment fields were explicitly provided
+        during model instantiation by checking Pydantic's __pydantic_fields_set__.
+
+        Relationship:
+        manual_values = {f: getattr(self, f) for f in (auto_increment_fields ∩ fields_set)}
+
         Returns:
             Dictionary mapping field names to their manually provided values
+
+        Raises:
+            AttributeError: If a field value cannot be retrieved
+            TypeError: If the model instance is invalid
         """
+        # @@ STEP 1: Defensive validation of model instance
+        # || S.1.1: Ensure this is a valid Pydantic model instance
+        if not hasattr(self, '__class__') or not issubclass(self.__class__, KuzuBaseModel):
+            raise TypeError(
+                f"get_manual_auto_increment_values() can only be called on KuzuBaseModel instances, "
+                f"got: {type(self).__name__}"
+            )
+
+        # @@ STEP 2: Get all auto-increment fields for this model
         auto_increment_fields = self.get_auto_increment_fields()
-        manual_values = {}
 
-        # Check which fields were explicitly set during model instantiation
+        # || S.2.1: Early return optimization for models with no auto-increment fields
+        if not auto_increment_fields:
+            return {}
+
+        manual_values: Dict[str, Any] = {}
+
+        # @@ STEP 3: Get fields that were explicitly set during model instantiation
+        # || S.3.1: Pydantic tracks explicitly provided fields in __pydantic_fields_set__
+        # || S.3.2: Defensive handling of missing or invalid __pydantic_fields_set__
         fields_set = getattr(self, '__pydantic_fields_set__', set())
+        if not isinstance(fields_set, set):
+            # || S.3.3: Handle corrupted __pydantic_fields_set__ gracefully
+            fields_set = set()
 
-        for field_name in auto_increment_fields:
-            if field_name in fields_set:
-                # Field was explicitly set (including None)
+        # @@ STEP 4: Find intersection of auto-increment fields and explicitly set fields
+        # || S.4.1: Use set intersection for precision and performance
+        fields_to_check = set(auto_increment_fields) & fields_set
+
+        for field_name in fields_to_check:
+            # || S.4.2: Field was explicitly provided during instantiation
+            try:
                 field_value = getattr(self, field_name)
                 manual_values[field_name] = field_value
+            except AttributeError as e:
+                # || S.4.3: This should never happen for valid Pydantic models
+                raise AttributeError(
+                    f"Cannot retrieve value for auto-increment field '{field_name}' "
+                    f"in {type(self).__name__}. This indicates a corrupted model instance "
+                    f"or invalid field configuration. Original error: {e}"
+                ) from e
 
         return manual_values
 

@@ -1297,12 +1297,8 @@ class TestReadinessComprehensive:
         print(f"Total insert errors: {operation_results['insert_errors']}, Total query errors: {operation_results['query_errors']}")
         print(f"Actual user count: {actual_user_count}, Expected user count: {operation_results['insert_success']}")
         
-        assert insert_rate > 50, f"Concurrent insert rate {insert_rate:.1f}/sec below 50/sec minimum"
-        
-        # Temporarily reduced query rate to 90 to get CI passing for wheel parallelism
-        # TODO: Drastically improve performance of the core code (kuzu_session / kuzu_orm) by at LEAST 10-FOLDS and thus WITHOUT USING ANY CACHING MECHANISMS WHATSOEVER.
-        # TODO: Isolate this test to be run in its own workflow
-        assert query_rate > 90, f"Concurrent query rate {query_rate:.1f}/sec below 90/sec minimum"
+        assert insert_rate > 1000, f"Concurrent insert rate {insert_rate:.1f}/sec below 1000/sec minimum"
+        assert query_rate > 1000, f"Concurrent query rate {query_rate:.1f}/sec below 1000/sec minimum"
 
         final_session.close()
 

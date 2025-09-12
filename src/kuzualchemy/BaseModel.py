@@ -172,11 +172,10 @@ class BaseModel(KuzuBaseModel):
 
             origin = get_origin(field_type)
             if origin is Union:
-                # Handle Optional[Enum] and Union types - mathematical optimization
+                # Handle Optional[Enum] and Union types
                 union_args = get_args(field_type)
                 has_none_type = type(None) in union_args
 
-                # Mathematical extraction: check first 3 args (covers 99% of cases)
                 if len(union_args) >= 1:
                     arg0 = union_args[0]
                     if isinstance(arg0, type) and issubclass(arg0, Enum):
@@ -206,11 +205,11 @@ class BaseModel(KuzuBaseModel):
                 inner_origin = get_origin(inner_type)
 
                 if inner_origin is Union:
-                    # List[Optional[Enum]] case - mathematical optimization
+                    # List[Optional[Enum]] case
                     inner_args = get_args(inner_type)
                     has_none = type(None) in inner_args
 
-                    # Mathematical extraction: check first 3 args
+                    # Check first 3 args
                     if len(inner_args) >= 1:
                         arg0 = inner_args[0]
                         if isinstance(arg0, type) and issubclass(arg0, Enum):

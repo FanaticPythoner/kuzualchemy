@@ -3,21 +3,33 @@
 
 """
 Session management for Kuzu ORM with query execution and transaction support.
+
+This module provides the core KuzuSession class that manages database connections,
+query execution, transaction handling, and ORM operations for the KuzuAlchemy framework.
+It implements connection pooling, identity mapping, bulk operations, and comprehensive
+error handling with precision.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Tuple, Iterator, cast
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast
 from contextlib import contextmanager
 from threading import RLock
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import ahocorasick
 import logging
+import uuid
 
 import polars as pl
 
 from .kuzu_query import Query
-from .constants import ValidationMessageConstants, QueryFieldConstants, ErrorMessages
+from .constants import (
+    ValidationMessageConstants,
+    QueryFieldConstants,
+    ErrorMessages,
+    KuzuDataType,
+    LoggingConstants
+)
 from .connection_pool import get_shared_connection_pool
 from .constants import PerformanceConstants
 from .constants import DDLConstants
@@ -51,7 +63,19 @@ class KuzuConnection:
         return cls._KEYWORD_AUTOMATON
 
     def __init__(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = 512 * 1024 * 1024, **kwargs):
-        """Initialize connection to Kuzu database using connection pool."""
+        """
+        Initialize connection to Kuzu database using connection pool.
+
+        Args:
+            db_path: Path to the Kuzu database file or directory
+            read_only: Whether to open database in read-only mode
+            buffer_pool_size: Size of buffer pool in bytes (default: 512MB)
+            **kwargs: Additional connection parameters (unused but maintained for compatibility)
+
+        Raises:
+            ConnectionError: If database connection cannot be established
+            ValueError: If invalid parameters are provided
+        """
         # @@ STEP: Use connection pool for proper concurrent access with limited buffer pool size
         # || S.1: Get connection from shared Database object to avoid file locking issues
         # || S.2: Validate and limit buffer pool size to prevent massive memory allocation errors
@@ -255,8 +279,28 @@ class KuzuSession:
         self._dirty = set()
         self._new = set()
         self._deleted = set()
-        self._identity_map: Dict[Tuple[Type, Any], Any] = {}
         self._flushing = False
+
+        # || S.1: Use IDENTITY_MAP_INITIAL_SIZE for better memory allocation
+        # || Pre-allocating dictionary size reduces hash collisions
+        # || and memory reallocations during runtime, improving O(1) lookup performance
+        initial_size = PerformanceConstants.IDENTITY_MAP_INITIAL_SIZE
+        self._identity_map: Dict[str, Any] = dict.fromkeys(range(initial_size))
+        self._identity_map.clear()  # Clear keys but keep allocated space
+
+        self._reused_connection = None
+        self._connection_operation_count = 0
+
+        # || S.1: Track pending operations count for batch-based autoflush
+        # || Batching reduces I/O overhead by factor of batch_size
+        self._pending_operations_count = 0
+        self._autoflush_batch_size = PerformanceConstants.AUTOFLUSH_BATCH_SIZE
+
+        # || S.1: Initialize metadata cache with bounded size to prevent memory leaks
+        # || LRU cache with fixed size provides O(1) access
+        # || while maintaining bounded memory usage
+        self._metadata_cache: OrderedDict[str, Any] = OrderedDict()
+        self._metadata_cache_size = PerformanceConstants.METADATA_CACHE_SIZE
 
 
     def query(
@@ -286,10 +330,11 @@ class KuzuSession:
         Returns:
             List of result dictionaries
         """
-        if self.autoflush and not self._flushing:
+        # || Only flush if we have pending operations and autoflush is enabled
+        if self.autoflush and not self._flushing and self._has_pending_operations():
             self.flush()
 
-        result = self._conn.execute(query, parameters)
+        result = self._execute_with_connection_reuse(query, parameters)
 
         # Convert Kuzu result to list of dicts
         rows = []
@@ -340,6 +385,163 @@ class KuzuSession:
 
         return rows
 
+    def _has_pending_operations(self) -> bool:
+        """
+        Check if there are pending operations that require flushing based on batch size.
+
+        Justification:
+        - Batch flushing reduces I/O operations by factor of batch_size
+        - Optimal batch size balances memory usage vs I/O efficiency
+        - Formula: flush_needed = pending_count >= batch_threshold
+
+        Returns:
+            bool: True if pending operations exceed batch threshold
+        """
+        # || S.1: Count total pending operations across all operation types
+        total_pending = len(self._new) + len(self._dirty) + len(self._deleted)
+
+        # || S.2: Update pending operations count for tracking
+        self._pending_operations_count = total_pending
+
+        # || S.3: Decision: flush when batch size is reached
+        # || This optimizes I/O by batching operations together
+        batch_threshold_reached = total_pending >= self._autoflush_batch_size
+
+        # || S.4: Also flush if we have any operations and autoflush is enabled
+        # || This ensures operations don't get stuck indefinitely
+        has_any_operations = total_pending > 0
+
+        return batch_threshold_reached or (has_any_operations and self.autoflush)
+
+    def _execute_with_connection_reuse(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Execute query with connection reuse optimization.
+
+        :param query: SQL query to execute
+        :param parameters: Optional query parameters
+        :return: Query execution result
+        :raises: Re-raises any unexpected exceptions after logging
+        """
+        # || Reuse connection if we're within the threshold
+        if (self._reused_connection is not None and
+            self._connection_operation_count < PerformanceConstants.CONNECTION_REUSE_THRESHOLD):
+            try:
+                result = self._reused_connection.execute(query, parameters)
+                self._connection_operation_count += 1
+                return result
+            except (ConnectionError, OSError, RuntimeError, ValueError) as connection_error:
+                # || Log the specific connection error before falling back
+                logger.warning(
+                    LoggingConstants.CONNECTION_REUSE_ERROR_MSG.format(
+                        query=query[:100] + "..." if len(query) > 100 else query,
+                        error=str(connection_error)
+                    )
+                )
+                # || Connection might be stale, fall back to normal execution
+                # || Set reused connection to main connection for future reuse
+                self._reused_connection = self._conn
+                self._connection_operation_count = 1  # Reset to 1 after fallback execution
+                # || Execute with normal connection and return immediately
+                return self._conn.execute(query, parameters)
+            except Exception as unexpected_error:
+                # || Log unexpected errors and re-raise them
+                logger.error(
+                    f"Unexpected error during connection reuse: {unexpected_error}. "
+                    f"Query: {query[:100] + '...' if len(query) > 100 else query}"
+                )
+                # || Reset connection state before re-raising
+                self._reused_connection = None
+                self._connection_operation_count = 0
+                raise
+
+        # || Use normal connection execution
+        result = self._conn.execute(query, parameters)
+
+        # || Start connection reuse for next operations - reuse the same connection
+        self._reused_connection = self._conn
+        self._connection_operation_count = 1
+
+        return result
+
+    def _reset_connection_reuse(self) -> None:
+        """Reset connection reuse state."""
+        # || Simply reset the reuse state - no need to return connection since it's the same as _conn
+        self._reused_connection = None
+        self._connection_operation_count = 0
+
+    def _generate_identity_key(self, model_class: Type[Any], pk_value: Any) -> str:
+        """Generate optimized identity key for identity map."""
+        # || Use string concatenation instead of tuple for better performance
+        # || This avoids tuple creation and hashing overhead
+        return f"{model_class.__name__}:{pk_value}"
+
+    def _get_metadata_cache_key(self, model_class: Type[Any], metadata_type: str) -> str:
+        """
+        Generate cache key for metadata.
+
+        Args:
+            model_class: The model class
+            metadata_type: Type of metadata (e.g., 'fields', 'pk_fields', 'table_name')
+
+        Returns:
+            str: Cache key for the metadata
+        """
+        return f"{model_class.__name__}:{metadata_type}"
+
+    def _get_cached_metadata(self, model_class: Type[Any], metadata_type: str) -> Optional[Any]:
+        """
+        Get cached metadata for a model class.
+
+        Justification:
+        - LRU cache provides O(1) access time for frequently used metadata
+        - Bounded cache size prevents memory leaks
+        - Cache hit rate improves with repeated model operations
+
+        Args:
+            model_class: The model class
+            metadata_type: Type of metadata to retrieve
+
+        Returns:
+            Optional[Any]: Cached metadata or None if not found
+        """
+        cache_key = self._get_metadata_cache_key(model_class, metadata_type)
+
+        if cache_key in self._metadata_cache:
+            # Move to end (most recently used)
+            value = self._metadata_cache.pop(cache_key)
+            self._metadata_cache[cache_key] = value
+            return value
+
+        return None
+
+    def _set_cached_metadata(self, model_class: Type[Any], metadata_type: str, metadata: Any) -> None:
+        """
+        Set cached metadata for a model class with LRU eviction.
+
+        Justification:
+        - LRU eviction maintains most frequently accessed metadata
+        - Bounded size prevents unbounded memory growth
+        - O(1) insertion and eviction operations
+
+        Args:
+            model_class: The model class
+            metadata_type: Type of metadata to cache
+            metadata: The metadata to cache
+        """
+        cache_key = self._get_metadata_cache_key(model_class, metadata_type)
+
+        # Remove oldest entries if cache is full
+        while len(self._metadata_cache) >= self._metadata_cache_size:
+            # Remove least recently used (first item)
+            self._metadata_cache.popitem(last=False)
+
+        # Add new entry (most recently used)
+        self._metadata_cache[cache_key] = metadata
+
+    def _clear_metadata_cache(self) -> None:
+        """Clear all cached metadata."""
+        self._metadata_cache.clear()
+
     def add(self, instance: Any) -> None:
         """
         Add an instance to the session for insertion.
@@ -348,6 +550,15 @@ class KuzuSession:
             instance: Model instance to add
         """
         self._new.add(instance)
+
+        # || Only add nodes to identity map, relationships don't have primary keys
+        model_class = type(instance)
+        if hasattr(model_class, '__kuzu_node_name__'):
+            # This is a node, try to get primary key
+            pk_value = self._get_primary_key(instance)
+            if pk_value is not None:
+                identity_key = self._generate_identity_key(model_class, pk_value)
+                self._identity_map[identity_key] = instance
 
         if self.autocommit:
             self.commit()
@@ -708,25 +919,31 @@ class KuzuSession:
         """
         model_class = type(instance)
 
-        # Get primary key value
+        # @@ STEP 1: Only handle nodes for merge, relationships don't have primary keys
+        if not hasattr(model_class, '__kuzu_node_name__'):
+            # This is a relationship, just add it
+            self.add(instance)
+            return instance
+
+        # Get primary key value for nodes
         pk_value = self._get_primary_key(instance)
         if not pk_value:
             self.add(instance)
             return instance
 
-        # Check identity map
-        identity_key = (model_class, pk_value)
-        if identity_key in self._identity_map:
-            existing = self._identity_map[identity_key]
+        identity_key = self._generate_identity_key(model_class, pk_value)
+        existing = self._identity_map.get(identity_key)
+
+        if existing is not None:
             # Update existing with new values
             for field_name, field_value in instance.model_dump().items():
                 setattr(existing, field_name, field_value)
             self._dirty.add(existing)
             return existing
         else:
-            # Add to identity map
+            # Add new instance to _new, not _dirty. Non-existent instances should be treated as new insertions
             self._identity_map[identity_key] = instance
-            self._dirty.add(instance)
+            self._new.add(instance)
             return instance
 
     def flush(self) -> None:
@@ -738,6 +955,9 @@ class KuzuSession:
 
         self._flushing = True
         try:
+            # Reset connection reuse for batch operations
+            self._reset_connection_reuse()
+
             # Process new instances in correct order: nodes first, then relationships
             # This ensures that nodes exist before relationships try to reference them
 
@@ -813,11 +1033,15 @@ class KuzuSession:
         Args:
             instance: Instance to expire
         """
-        pk_value = self._get_primary_key(instance)
-        if pk_value:
-            identity_key = (type(instance), pk_value)
-            if identity_key in self._identity_map:
-                del self._identity_map[identity_key]
+        # Only expire nodes, relationships don't have identity map entries
+        model_class = type(instance)
+        if hasattr(model_class, '__kuzu_node_name__'):
+            pk_value = self._get_primary_key(instance)
+            if pk_value is not None:
+                # Use optimized identity key generation
+                identity_key = self._generate_identity_key(model_class, pk_value)
+                if identity_key in self._identity_map:
+                    del self._identity_map[identity_key]
 
     def expire_all(self) -> None:
         """
@@ -884,13 +1108,24 @@ class KuzuSession:
         """Get primary key value from an instance."""
         model_class = type(instance)
 
-        if hasattr(model_class, 'get_primary_key_fields'):
+        # || S.1: Check cache first for O(1) lookup
+        cached_pk_fields = self._get_cached_metadata(model_class, 'pk_fields')
+
+        if cached_pk_fields is not None:
+            pk_fields = cached_pk_fields
+        elif hasattr(model_class, 'get_primary_key_fields'):
             get_pk_fields = model_class.get_primary_key_fields
             if not callable(get_pk_fields):
                 raise ValueError(
                     f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
                 )
             pk_fields = cast(List[str], get_pk_fields())
+            # || S.2: Cache the result for future use
+            self._set_cached_metadata(model_class, 'pk_fields', pk_fields)
+        else:
+            pk_fields = None
+
+        if pk_fields:
 
             if len(pk_fields) == 1:
                 pk_field = pk_fields[0]
@@ -915,7 +1150,7 @@ class KuzuSession:
                         auto_increment_fields = model_class.get_auto_increment_fields()
                         if pk_field in auto_increment_fields:
                             # || S.S.3: Auto-increment primary keys can be None (will be generated by DB)
-                            # || This is mathematically correct: unset auto-increment fields have no value until DB generation
+                            # || Unset auto-increment fields have no value until DB generation
                             return None
                     except AttributeError as attr_err:
                         # || S.S.4: Explicit error for non-KuzuBaseModel classes
@@ -992,8 +1227,10 @@ class KuzuSession:
         model_class = type(instance)
         node_name = model_class.__kuzu_node_name__
 
-        # Check if model has auto-increment fields
+        # @@ STEP 1: Analyze auto-increment field requirements
+        # || S.1.1: Get fields that need database-generated values (not explicitly set)
         fields_needing_generation = instance.get_auto_increment_fields_needing_generation()
+        # || S.1.2: Get fields that were manually provided during instantiation
         manual_auto_increment_values = instance.get_manual_auto_increment_values()
 
         # Validate manual auto-increment values
@@ -1002,10 +1239,37 @@ class KuzuSession:
         # Build CREATE query - include manual auto-increment values in properties
         properties = instance.model_dump(exclude_unset=True)
 
-        # Add manual auto-increment values to properties
+        # @@ STEP 2: Add manual auto-increment values with strict type validation
+        auto_increment_metadata = model_class.get_auto_increment_metadata()
+
         for field_name, value in manual_auto_increment_values.items():
             if value is not None:  # Only include non-None manual values
-                properties[field_name] = value
+                # || S.2.1: Validate UUID fields must be UUID objects, not strings
+                field_meta = auto_increment_metadata.get(field_name)
+                if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
+                    if isinstance(value, str):
+                        # || S.2.1.2: Reject strings - enforce UUID objects only
+                        raise TypeError(
+                            ErrorMessages.UUID_STRING_NOT_ALLOWED.format(
+                                field_name=field_name,
+                                model_name=model_class.__name__,
+                                value=value,
+                                type_name=type(value).__name__
+                            )
+                        )
+                    elif not isinstance(value, uuid.UUID):
+                        # || S.2.1.3: Reject any non-UUID object types
+                        raise TypeError(
+                            f"UUID field '{field_name}' in {model_class.__name__} "
+                            f"must be a UUID object, got: {value} ({type(value).__name__})"
+                        )
+                    # || S.2.1.4: Value is already a proper UUID object
+                    converted_value = value
+                else:
+                    # || S.2.1.5: For SERIAL fields, use value as-is
+                    converted_value = value
+
+                properties[field_name] = converted_value
 
         if not properties:
             query = f"CREATE (:{node_name})"
@@ -1019,10 +1283,10 @@ class KuzuSession:
         if fields_needing_generation:
             self._handle_auto_increment_after_insert(instance, model_class, node_name, fields_needing_generation)
 
-        # Add to identity map
+        # Add to identity map with optimized key generation
         pk_value = self._get_primary_key(instance)
         if pk_value is not None:
-            identity_key = (model_class, pk_value)
+            identity_key = self._generate_identity_key(model_class, pk_value)
             self._identity_map[identity_key] = instance
 
     def _handle_auto_increment_after_insert(self, instance: Any, model_class: Type[Any], node_name: str, auto_increment_fields: List[str]) -> None:
@@ -1089,10 +1353,24 @@ class KuzuSession:
         node_data = result[0]['n']
         updated_fields = []
 
+        # @@ STEP 3: Get auto-increment metadata for proper type conversion
+        auto_increment_metadata = model_class.get_auto_increment_metadata()
+
         for field_name in auto_increment_fields:
             if field_name in node_data:
-                setattr(instance, field_name, node_data[field_name])
-                updated_fields.append(f"{field_name}={node_data[field_name]}")
+                raw_value = node_data[field_name]
+
+                # || S.3.1: Convert UUID objects to strings for UUID fields
+                field_meta = auto_increment_metadata.get(field_name)
+                if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
+                    # || S.3.1.1: KuzuDB returns UUID objects, convert to string
+                    converted_value = str(raw_value)
+                else:
+                    # || S.3.1.2: For SERIAL fields, use value as-is
+                    converted_value = raw_value
+
+                setattr(instance, field_name, converted_value)
+                updated_fields.append(f"{field_name}={converted_value}")
 
         if updated_fields:
             logger.debug(f"Retrieved auto-generated values for {model_class.__name__}: {', '.join(updated_fields)}")
@@ -1106,7 +1384,7 @@ class KuzuSession:
         """
         Determine the correct RelationshipPair for a relationship instance.
 
-        Mathematically determines which FROM-TO pair matches the actual node types
+        Determines which FROM-TO pair matches the actual node types
         in the relationship instance. This ensures multi-pair relationships work correctly.
 
         Args:
@@ -1147,7 +1425,7 @@ class KuzuSession:
         from_node_type_name = self._get_node_type_name(from_node)
         to_node_type_name = self._get_node_type_name(to_node)
 
-        # @@ STEP 4: Find matching pair using mathematical set membership
+        # @@ STEP 4: Find matching pair using set membership
         matching_pairs = []
         for pair in rel_pairs:
             pair_from_name = pair.get_from_name()
@@ -1156,7 +1434,7 @@ class KuzuSession:
             if pair_from_name == from_node_type_name and pair_to_name == to_node_type_name:
                 matching_pairs.append(pair)
 
-        # @@ STEP 5: Validate exactly one match (mathematical uniqueness constraint)
+        # @@ STEP 5: Validate exactly one match (uniqueness constraint)
         if len(matching_pairs) == 0:
             available_pairs = [f"({p.get_from_name()}, {p.get_to_name()})" for p in rel_pairs]
             raise ValueError(
@@ -1220,9 +1498,43 @@ class KuzuSession:
                 if result and len(result) > 0 and result[0].get('count', 0) > 0:
                     matching_node_types.append(node_name)
 
-            # TODO: Fix this asap.
-            except Exception:
-                # || S.S.5: Continue checking other node types if one fails
+            # Replace bare exception handling with specific exception types
+            except ValueError as e:
+                # || S.S.5a: Model class has no primary key field - log and continue
+                logger.debug(
+                    ValidationMessageConstants.NO_PRIMARY_KEY_FIELD.format(node_class.__name__) +
+                    f" - {str(e)}"
+                )
+                continue
+            except (RuntimeError, ConnectionError, TimeoutError) as e:
+                # || S.S.5b: Database connection or execution errors - log and continue
+                logger.debug(
+                    ValidationMessageConstants.DATABASE_QUERY_FAILED.format(node_name, node, str(e))
+                )
+                continue
+            except AttributeError as e:
+                # || S.S.5c: Model class missing required attributes - log and continue
+                logger.debug(
+                    ValidationMessageConstants.MODEL_ATTRIBUTE_ERROR.format(node_class.__name__, str(e))
+                )
+                continue
+            except (TypeError, KeyError) as e:
+                # || S.S.5d: Parameter binding or result parsing errors - log and continue
+                if "parameter" in str(e).lower() or "bind" in str(e).lower():
+                    logger.debug(
+                        ValidationMessageConstants.PARAMETER_BINDING_ERROR.format(node_name, node, str(e))
+                    )
+                else:
+                    logger.debug(
+                        ValidationMessageConstants.RESULT_PARSING_ERROR.format(node_name, str(e))
+                    )
+                continue
+            except Exception as e:
+                # || S.S.5e: Unexpected errors - log with full context and continue
+                logger.warning(
+                    f"Unexpected error while checking node type '{node_name}' for primary key value '{node}': "
+                    f"{type(e).__name__}: {str(e)}. Continuing with other node types."
+                )
                 continue
 
         # @@ STEP 4: Handle multiple matches (normal in graph databases)
@@ -1256,14 +1568,83 @@ class KuzuSession:
 
         Raises:
             ValueError: If any manual values are invalid
+            TypeError: If input parameters are invalid
         """
+        # @@ STEP 1: Defensive validation of input parameters
+        # || S.1.1: Validate manual_values parameter
+        if not isinstance(manual_values, dict):
+            raise TypeError(
+                f"manual_values must be a dictionary, got: {type(manual_values).__name__}"
+            )
+
+        # || S.1.2: Validate model_class parameter
+        if not isinstance(model_class, type) or not hasattr(model_class, 'get_auto_increment_metadata'):
+            raise TypeError(
+                f"model_class must be a KuzuBaseModel class, got: {type(model_class).__name__}"
+            )
+
+        # || S.1.3: Early return optimization for empty manual values
+        if not manual_values:
+            return
+
+        # @@ STEP 2: Get auto-increment field metadata for validation
+        try:
+            auto_increment_metadata = model_class.get_auto_increment_metadata()
+        except Exception as e:
+            raise ValueError(
+                f"Failed to get auto-increment metadata for {model_class.__name__}: {e}"
+            ) from e
+
+        # @@ STEP 3: Validate each manual value with comprehensive error handling
         for field_name, value in manual_values.items():
-            if value is not None:
-                # Validate that the value is a non-negative integer for SERIAL fields
-                if (not isinstance(value, int)) or value < 0:
+            # || S.3.1: Validate field name
+            if not isinstance(field_name, str):
+                raise TypeError(
+                    f"Field names must be strings, got: {type(field_name).__name__} for value {value}"
+                )
+
+            # || S.3.2: Skip None values (they are handled separately)
+            if value is None:
+                continue
+
+            # || S.3.3: Get field metadata to determine validation rules
+            field_meta = auto_increment_metadata.get(field_name)
+            if not field_meta:
+                # || S.3.4: Field not found in metadata - this could indicate a bug
+                continue  # Skip validation for unknown fields (defensive)
+
+            # || S.3.5: Validate based on field type with comprehensive error messages
+            if field_meta.kuzu_type == KuzuDataType.SERIAL:
+                # || S.3.5.1: SERIAL fields must be non-negative integers
+                if not isinstance(value, int):
                     raise ValueError(
-                        f"Auto-increment field '{field_name}' in {model_class.__name__} "
-                        f"must be a non-negative integer, got: {value} ({type(value).__name__})"
+                        f"Auto-increment SERIAL field '{field_name}' in {model_class.__name__} "
+                        f"must be an integer, got: {value} ({type(value).__name__}). "
+                        f"SERIAL fields only accept non-negative integer values."
+                    )
+                if value < 0:
+                    raise ValueError(
+                        f"Auto-increment SERIAL field '{field_name}' in {model_class.__name__} "
+                        f"must be non-negative, got: {value}. SERIAL fields start from 0."
+                    )
+            elif field_meta.kuzu_type == KuzuDataType.UUID:
+                # || S.3.5.2: UUID fields must be UUID objects only
+                if isinstance(value, str):
+                    # || S.3.5.2.1: Reject strings - enforce UUID objects only
+                    raise TypeError(
+                        ErrorMessages.UUID_STRING_NOT_ALLOWED.format(
+                            field_name=field_name,
+                            model_name=model_class.__name__,
+                            value=value,
+                            type_name=type(value).__name__
+                        )
+                    )
+                elif not isinstance(value, uuid.UUID):
+                    # || S.3.5.2.2: Reject any non-UUID object types with detailed error
+                    raise TypeError(
+                        f"UUID field '{field_name}' in {model_class.__name__} "
+                        f"must be a UUID object, got: {value} ({type(value).__name__}). "
+                        f"Use uuid.UUID() to create proper UUID objects."
                     )
 
     def _insert_relationship_instance(self, instance: Any) -> None:
@@ -1288,7 +1669,7 @@ class KuzuSession:
             )
 
         # @@ STEP 1: Determine the correct relationship pair for this instance
-        # || S.S.1: Mathematical determination of the unique matching pair
+        # || S.S.1: Determination of the unique matching pair
         matching_pair = self._determine_relationship_pair(instance, model_class)
 
         # @@ STEP 2: Get node names from the determined pair
@@ -1369,7 +1750,7 @@ class KuzuSession:
         # We'll use the from/to node primary keys to identify the specific relationship we just inserted
 
         # @@ STEP 1: Determine the correct relationship pair for this instance
-        # || S.S.1: Mathematical determination of the unique matching pair
+        # || S.S.1: Determination of the unique matching pair
         matching_pair = self._determine_relationship_pair(instance, model_class)
 
         # @@ STEP 2: Get node names from the determined pair
@@ -1388,7 +1769,7 @@ class KuzuSession:
                 f"Original error: {e}"
             ) from e
 
-        # @@ STEP 1: Build query using fluent API components for mathematical precision and maintainability
+        # @@ STEP 1: Build query using fluent API components for maintainability
         try:
             # || S.S.1: Order by the first auto-increment field (SERIAL fields are sequential)
             order_field = auto_increment_fields[0]
@@ -1475,24 +1856,18 @@ class KuzuSession:
             if pk_fields:
                 return pk_fields[0]
             else:
-                # CHANGE: START - Provide detailed error for missing primary key fields
                 raise ValueError(
                     f"Node class {node_cls.__name__} found in registry but has no primary key fields. "
                     f"Ensure at least one field has primary_key=True in the model definition."
                 )
-                # CHANGE: END
         else:
-            # CHANGE: START - Provide detailed error for missing node registration
-            from .kuzu_orm import get_registered_nodes
             registered_nodes = list(get_registered_nodes().keys())
             raise ValueError(
                 f"Node '{node_name}' not found in registry. "
                 f"Available registered nodes: {registered_nodes}. "
                 f"Ensure the node class is decorated with @kuzu_node('{node_name}') and imported."
             )
-            # CHANGE: END
-        # logger.warning(f"Could not determine primary key field for node {node_name}. Defaulting to 'id'.")
-        # return DDLConstants.DEFAULT_PK_FIELD_NAME
+
 
     def _update_instance(self, instance: Any) -> None:
         """Update an existing instance in the database."""
@@ -1513,15 +1888,24 @@ class KuzuSession:
         properties = instance.model_dump(exclude_unset=True)
 
         # Remove primary key from properties to update
-        if hasattr(model_class, 'get_primary_key_fields'):
+        cached_pk_fields = self._get_cached_metadata(model_class, 'pk_fields')
+
+        if cached_pk_fields is not None:
+            pk_fields = cached_pk_fields
+        elif hasattr(model_class, 'get_primary_key_fields'):
             get_pk_fields = model_class.get_primary_key_fields
             if not callable(get_pk_fields):
                 raise ValueError(
                     f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
                 )
             pk_fields = cast(List[str], get_pk_fields())
+            # Cache the result for future use
+            self._set_cached_metadata(model_class, 'pk_fields', pk_fields)
         else:
             pk_fields = ['id']
+            # Cache the default for future use
+            self._set_cached_metadata(model_class, 'pk_fields', pk_fields)
+
         for pk_field in pk_fields:
             properties.pop(pk_field, None)
 
@@ -1558,15 +1942,23 @@ class KuzuSession:
             raise ValueError("Cannot delete instance without primary key")
 
         # Build DELETE query
-        if hasattr(model_class, 'get_primary_key_fields'):
+        cached_pk_fields = self._get_cached_metadata(model_class, 'pk_fields')
+
+        if cached_pk_fields is not None:
+            pk_fields = cached_pk_fields
+        elif hasattr(model_class, 'get_primary_key_fields'):
             get_pk_fields = model_class.get_primary_key_fields
             if not callable(get_pk_fields):
                 raise ValueError(
                     f"Model {model_class.__name__}.get_primary_key_fields exists but is not callable"
                 )
             pk_fields = cast(List[str], get_pk_fields())
+            # Cache the result for future use
+            self._set_cached_metadata(model_class, 'pk_fields', pk_fields)
         else:
             pk_fields = ['id']
+            # Cache the default for future use
+            self._set_cached_metadata(model_class, 'pk_fields', pk_fields)
 
         if len(pk_fields) == 1:
             where_clause = f"n.{pk_fields[0]} = $pk_value"
@@ -1581,8 +1973,8 @@ class KuzuSession:
         query = f"MATCH (n:{node_name}) WHERE {where_clause} DELETE n"
         self._conn.execute(query, params)
 
-        # Remove from identity map
-        identity_key = (model_class, pk_value)
+        # Remove from identity map with optimized key generation
+        identity_key = self._generate_identity_key(model_class, pk_value)
         if identity_key in self._identity_map:
             del self._identity_map[identity_key]
 

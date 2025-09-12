@@ -12,7 +12,7 @@ from typing import (
 )
 import logging
 
-from .constants import ValidationMessageConstants, DDLConstants, QueryReturnAliasConstants
+from .constants import ValidationMessageConstants, DDLConstants, QueryReturnAliasConstants, KuzuDataType
 from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType,
 )
@@ -711,6 +711,9 @@ class Query(Generic[ModelType]):
                     # Filter out Kuzu internal fields
                     cleaned_data = {k: v for k, v in node_data.items()
                                    if not k.startswith('_')}
+
+                    cleaned_data = self._convert_uuid_objects_to_strings(cleaned_data, result_model_class)
+
                     instance = result_model_class(**cleaned_data)
                     mapped.append(instance)
                 elif len(row) == 1 and type(list(row.values())[0]) is dict:
@@ -719,6 +722,9 @@ class Query(Generic[ModelType]):
                     # Filter out Kuzu internal fields
                     cleaned_data = {k: v for k, v in node_data.items()
                                    if not k.startswith('_')}
+
+                    cleaned_data = self._convert_uuid_objects_to_strings(cleaned_data, result_model_class)
+
                     instance = result_model_class(**cleaned_data)
                     mapped.append(instance)
                 else:
@@ -740,6 +746,39 @@ class Query(Generic[ModelType]):
                         mapped.append(row)
 
         return mapped
+
+    def _convert_uuid_objects_to_strings(self, data: Dict[str, Any], model_class: Type[Any]) -> Dict[str, Any]:
+        """
+        Convert UUID objects to strings for UUID fields in the model.
+
+        Args:
+            data: Dictionary of field names to values
+            model_class: The model class to check field types against
+
+        Returns:
+            Dictionary with UUID objects converted to strings for UUID fields
+        """
+        # @@ STEP 1: Get field metadata to identify UUID fields
+        from .kuzu_orm import _kuzu_registry
+        converted_data = {}
+        for field_name, value in data.items():
+            # || S.1.1: Get field metadata
+            if hasattr(model_class, 'model_fields') and field_name in model_class.model_fields:
+                field_info = model_class.model_fields[field_name]
+                meta = _kuzu_registry.get_field_metadata(field_info)
+                # || S.1.2: Convert UUID objects to strings for UUID fields
+                if meta and meta.kuzu_type == KuzuDataType.UUID and hasattr(value, '__class__'):
+                    # Check if it's a UUID object (avoid importing uuid if not needed)
+                    if value.__class__.__name__ == 'UUID':
+                        converted_data[field_name] = str(value)
+                    else:
+                        converted_data[field_name] = value
+                else:
+                    converted_data[field_name] = value
+            else:
+                converted_data[field_name] = value
+        return converted_data
+
 
     def __iter__(self) -> Iterator[Union[ModelType, Dict[str, Any]]]:
         """Iterate over query results."""
