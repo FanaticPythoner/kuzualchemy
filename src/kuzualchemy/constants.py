@@ -14,7 +14,7 @@ used throughout the KuzuAlchemy codebase. No magic values are allowed elsewhere.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Final, Any
 
 from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
@@ -104,7 +104,7 @@ class RelationshipMultiplicity(Enum):
 # DDL GENERATION CONSTANTS
 # ============================================================================
 
-class DDLConstants:
+class DDLConstants(StrEnum):
     """DDL generation constants."""
 
     # @@ STEP 1: Define DDL keywords
@@ -636,7 +636,7 @@ class RelationshipDirection:
 # KUZU DATA TYPE CONSTANTS
 # ============================================================================
 
-class KuzuDataType:
+class KuzuDataType(StrEnum):
     """Constants for Kuzu data types."""
 
     # @@ STEP 1: Define integer types

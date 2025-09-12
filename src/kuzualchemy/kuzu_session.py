@@ -19,8 +19,9 @@ from collections import defaultdict, OrderedDict
 import ahocorasick
 import logging
 import uuid
+from enum import Enum
 
-import polars as pl
+import pyarrow as pa
 
 from .kuzu_query import Query
 from .constants import (
@@ -575,7 +576,7 @@ class KuzuSession:
 
     def bulk_insert(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
         """
-        Perform fast bulk insert using Polars DataFrames and Kuzu's COPY FROM.
+        Perform fast bulk insert using PyArrow and Kuzu's COPY FROM.
 
         This method is orders of magnitude faster than individual add() calls
         for large datasets (1000+ records).
@@ -615,7 +616,7 @@ class KuzuSession:
 
     def _bulk_insert_model_type(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
         """
-        Bulk insert instances of a single model type using Polars DataFrame.
+        Bulk insert instances of a single model type using PyArrow.
 
         Args:
             model_class: The model class type
@@ -624,117 +625,175 @@ class KuzuSession:
         """
         for i in range(0, len(instances), batch_size):
             batch = instances[i:i + batch_size]
-            self._process_batch_with_polars(model_class, batch)
+            self._process_batch_with_pyarrow(model_class, batch)
 
-    def _process_batch_with_polars(self, model_class: Type[Any], instances: List[Any]) -> None:
+    def _process_batch_with_pyarrow(self, model_class: Type[Any], instances: List[Any]) -> None:
         """
-        Process a batch of instances using Polars DataFrame and Kuzu's COPY FROM.
-
-        Args:
-            model_class: The model class type
-            instances: List of instances to process
+        Process a batch of instances using PyArrow table with explicit UUID schema.
         """
         if not instances:
             return
 
         # Convert instances to dictionary format
         data_dict = {}
-        df = None
+        schema_fields = []
 
         from .kuzu_orm import KuzuRelationshipBase
         is_relationship = issubclass(model_class, KuzuRelationshipBase)
 
         if is_relationship:
-            # For relationships, we need to include from_node_pk and to_node_pk
-            # Use class attribute instead of instance attribute to avoid deprecation warning
+            # Handle relationships
             all_field_names = list(model_class.model_fields.keys())
-
-            # Filter out internal relationship fields for bulk insert
             internal_fields = {
-                DDLConstants.REL_FROM_NODE_FIELD,  # 'from_node'
-                DDLConstants.REL_TO_NODE_FIELD,    # 'to_node'
-                DDLConstants.REL_FROM_NODE_PK_FIELD,  # Private field for from_node primary key cache
-                DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
+                DDLConstants.REL_FROM_NODE_FIELD,
+                DDLConstants.REL_TO_NODE_FIELD, 
+                DDLConstants.REL_FROM_NODE_PK_FIELD,
+                DDLConstants.REL_TO_NODE_PK_FIELD,
             }
             field_names = [f for f in all_field_names if f not in internal_fields]
 
-            # Add node reference columns for relationships
+            # Add node reference columns
             data_dict['from_node_pk'] = []
             data_dict['to_node_pk'] = []
+            schema_fields.extend([
+                pa.field('from_node_pk', pa.string()),  # Use string for UUID compatibility
+                pa.field('to_node_pk', pa.string()),    # Use string for UUID compatibility
+            ])
 
-            # Initialize property columns
+            # Initialize property columns with proper types
+            auto_increment_metadata = model_class.get_auto_increment_metadata()
             for field_name in field_names:
                 data_dict[field_name] = []
+                
+                # Determine PyArrow type for this field
+                field_meta = auto_increment_metadata.get(field_name)
+                if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
+                    # Use string type for UUID fields to avoid BLOB conversion issues
+                    schema_fields.append(pa.field(field_name, pa.string()))
 
             # Extract data from relationship instances
             for instance in instances:
-                # Add node references
-                data_dict['from_node_pk'].append(instance.from_node_pk)
-                data_dict['to_node_pk'].append(instance.to_node_pk)
+                # || Convert primary keys to strings to match pa.string() schema
+                from_pk = instance.from_node_pk
+                to_pk = instance.to_node_pk
 
-                # Add relationship properties with proper type conversion
+                # || Ensure primary keys are strings for PyArrow string schema
+                data_dict['from_node_pk'].append(str(from_pk) if from_pk is not None else None)
+                data_dict['to_node_pk'].append(str(to_pk) if to_pk is not None else None)
+
                 instance_data = instance.model_dump()
                 for field_name in field_names:
                     value = instance_data.get(field_name)
-                    # Convert datetime/date objects to proper string format for Kuzu
-                    if hasattr(value, 'isoformat'):
-                        # datetime or date object
+                    
+                    # Convert based on field type
+                    field_meta = auto_increment_metadata.get(field_name)
+                    if field_meta and field_meta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
+                        # Convert UUID objects to strings for KuzuDB UUID parsing
+                        value = str(value)
+                    elif hasattr(value, 'isoformat'):
                         value = value.isoformat()
-                    elif (hasattr(value, '__class__') and
-                          'KuzuDefaultFunction' in str(value.__class__)):
-                        # Handle KuzuDefaultFunction objects - generate actual values for bulk insert
-                        # COPY FROM doesn't support DEFAULT functions, so we must generate values
+                    elif (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
                         value = self._generate_default_function_value(value)
+                    
                     data_dict[field_name].append(value)
+
         else:
-            # For nodes, use regular field extraction but exclude auto-increment fields with None values
-            # Use class attribute instead of instance attribute to avoid deprecation warning
+            # Handle nodes
             all_field_names = list(model_class.model_fields.keys())
-
-            # @@ STEP 1: Get auto-increment fields to determine which to exclude
             auto_increment_fields = model_class.get_auto_increment_fields()
-
-            # @@ STEP 2: Determine which fields to include in the DataFrame
-            # || S.S.1: Check first instance to see which auto-increment fields have None values
+            
+            # Determine which fields to include
             sample_instance = instances[0]
             sample_data = sample_instance.model_dump()
-
-            # || S.S.2: Exclude auto-increment fields that have None values
+            
             field_names = []
             for field_name in all_field_names:
                 if field_name in auto_increment_fields and sample_data.get(field_name) is None:
-                    # || Skip auto-increment fields with None values - they'll be generated by DB
                     continue
                 field_names.append(field_name)
 
-            # Initialize columns
+            # Initialize columns with proper schema
+            auto_increment_metadata = model_class.get_auto_increment_metadata()
             for field_name in field_names:
                 data_dict[field_name] = []
+                
+                # Determine PyArrow type for this field
+                field_meta = auto_increment_metadata.get(field_name)
+                if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
+                    # Use string type for UUID fields to avoid BLOB conversion issues
+                    schema_fields.append(pa.field(field_name, pa.string()))
+                # Note: For other types, we'll let PyArrow infer from the data later
 
-            # Extract data from instances with proper type conversion
+            # Extract data from instances
             for instance in instances:
                 instance_data = instance.model_dump()
                 for field_name in field_names:
                     value = instance_data.get(field_name)
-                    # Convert datetime/date objects to proper string format for Kuzu
-                    if hasattr(value, 'isoformat'):
-                        # datetime or date object
+                    
+                    # Convert based on field type
+                    field_meta = auto_increment_metadata.get(field_name)
+                    if field_meta and field_meta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
+                        # Convert UUID objects to strings for KuzuDB UUID parsing
+                        value = str(value)
+                    elif isinstance(value, uuid.UUID):
+                        # Convert any UUID objects to strings for KuzuDB UUID parsing
+                        value = str(value)
+                    elif hasattr(value, 'isoformat'):
                         value = value.isoformat()
-                    elif (hasattr(value, '__class__') and
-                          'KuzuDefaultFunction' in str(value.__class__)):
-                        # Handle KuzuDefaultFunction objects - generate actual values for bulk insert
-                        # COPY FROM doesn't support DEFAULT functions, so we must generate values
+                    elif (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
                         value = self._generate_default_function_value(value)
+                    
                     data_dict[field_name].append(value)
 
-        # Create Polars DataFrame
-        df = pl.DataFrame(data_dict)
+        # Create PyArrow table with mixed explicit and inferred schema
+        if schema_fields:
+            # Build arrays with proper types for explicit fields, let PyArrow infer others
+            arrays = []
+            field_names_ordered = []
+            schema_field_names = {f.name for f in schema_fields}
 
-        # Clear data_dict to free memory immediately
+            # First, add arrays for fields with explicit types
+            for field in schema_fields:
+                arrays.append(pa.array(data_dict[field.name], type=field.type))
+                field_names_ordered.append(field.name)
+
+            # Then, add arrays for fields without explicit types (let PyArrow infer)
+            for field_name in field_names:
+                if field_name not in schema_field_names:
+                    # Convert any remaining UUID objects to strings before PyArrow inference
+                    field_data = data_dict[field_name]
+                    converted_data = []
+                    for value in field_data:
+                        if isinstance(value, uuid.UUID):
+                            converted_data.append(str(value))
+                        elif isinstance(value, list) and value and isinstance(value[0], uuid.UUID):
+                            converted_data.append([str(uuid_val) for uuid_val in value])
+                        else:
+                            converted_data.append(value)
+                    arrays.append(pa.array(converted_data))
+                    field_names_ordered.append(field_name)
+
+            # Create table with field names only, let PyArrow infer types for non-explicit fields
+            df = pa.table(arrays, names=field_names_ordered)
+        else:
+            # Fallback to full inference - convert all UUID objects to strings first
+            converted_dict = {}
+            for field_name, field_data in data_dict.items():
+                converted_data = []
+                for value in field_data:
+                    if isinstance(value, uuid.UUID):
+                        converted_data.append(str(value))
+                    elif isinstance(value, list) and value and isinstance(value[0], uuid.UUID):
+                        converted_data.append([str(uuid_val) for uuid_val in value])
+                    else:
+                        converted_data.append(value)
+                converted_dict[field_name] = converted_data
+            df = pa.table(converted_dict)
+
         data_dict.clear()
         del data_dict
 
-        # Determine table name
+        # Determine table name and execute COPY
         if hasattr(model_class, '__kuzu_node_name__'):
             table_name = model_class.__kuzu_node_name__
         elif hasattr(model_class, '__kuzu_rel_name__'):
@@ -744,13 +803,10 @@ class KuzuSession:
         else:
             raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
         
-        # Execute COPY using the Polars DataFrame
         self._conn.execute(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
         
-        # @@ STEP 1: Handle auto-increment value retrieval for nodes
         if not is_relationship:
             self._retrieve_auto_increment_values_after_bulk_insert(model_class, instances, field_names)
-
 
     def _retrieve_auto_increment_values_after_bulk_insert(self, model_class: Type[Any], instances: List[Any], included_field_names: List[str]) -> None:
         """
@@ -1686,6 +1742,11 @@ class KuzuSession:
             DDLConstants.REL_TO_NODE_PK_FIELD,    # Private field for to_node primary key cache
         }
         properties = {k: v for k, v in properties.items() if k not in internal_fields}
+
+        # KuzuDB doesn't handle Python enum objects directly, so convert them to their underlying values
+        for key, value in properties.items():
+            if isinstance(value, Enum):
+                properties[key] = value.value
 
         # Add manual auto-increment values to properties
         for field_name, value in manual_auto_increment_values.items():

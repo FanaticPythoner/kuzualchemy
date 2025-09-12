@@ -956,7 +956,7 @@ class TestReadinessComprehensive:
                 )
                 batch_users.append(user)
 
-            # Use ultra-fast bulk insert with Polars DataFrame
+            # Use ultra-fast bulk insert with Arrow
             start_time = time.time()
             session.bulk_insert(batch_users)
             batch_time = time.time() - start_time
@@ -997,7 +997,7 @@ class TestReadinessComprehensive:
             )
             items.append(item)
 
-        # Use ultra-fast bulk insert with Polars DataFrame
+        # Use ultra-fast bulk insert with Arrow
         start_time = time.time()
         session.bulk_insert(items)
         item_insert_time = time.time() - start_time
@@ -1023,7 +1023,7 @@ class TestReadinessComprehensive:
             )
             interactions.append(interaction)
 
-        # Use ultra-fast bulk insert with Polars DataFrame
+        # Use ultra-fast bulk insert with Arrow
         start_time = time.time()
         session.bulk_insert(interactions)
         relationship_insert_time = time.time() - start_time

@@ -856,8 +856,13 @@ def kuzu_field(
     if auto_increment:
         # Auto-increment fields should be optional during instantiation since KuzuDB auto-generates them
         # Allow both None (explicit) and unset (auto-generate) values
-        # Use None as default to make field optional, distinguish in session logic
-        return Field(default=None, **field_kwargs)
+        # For UUID auto-increment primary keys, use default_factory to generate UUIDs immediately
+        if kuzu_type == KuzuDataType.UUID and primary_key and default_factory is not None:
+            # UUID auto-increment primary keys should use default_factory for immediate generation
+            return Field(default_factory=default_factory, **field_kwargs)
+        else:
+            # Use None as default to make field optional, distinguish in session logic
+            return Field(default=None, **field_kwargs)
     elif default_factory is not None:
         return Field(default_factory=default_factory, **field_kwargs)
     else:

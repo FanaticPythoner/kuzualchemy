@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kuzualchemy"
-version = "0.3.12"
+version = "0.3.13"
 description = "SQLAlchemy-like ORM for Kuzu graph database"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,7 +35,6 @@ dependencies = [
     "pydantic>=2.0.0",
     "kuzu",
     "typing-extensions",
-    "polars",
     "pyarrow",
     "pyahocorasick",
 ]
