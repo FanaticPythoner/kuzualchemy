@@ -27,9 +27,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    Annotated,
 )
-from pydantic import field_validator, BeforeValidator
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from pydantic.fields import FieldInfo
@@ -39,6 +37,7 @@ from numba import jit, prange
 from .constants import (
     CascadeAction,
     DDLConstants,
+    DDLMessageConstants,
     KuzuDefaultFunction,
     ModelMetadataConstants,
     NodeBaseConstants,
@@ -76,33 +75,33 @@ ModelType = TypeVar("ModelType", bound="KuzuBaseModel")
 class SQLKeywordRegistry:
     """
     Dynamic registry for SQL keywords and functions.
-    
+
     :class: SQLKeywordRegistry
     :synopsis: Registry for SQL keywords and time functions
     """
-    
+
     # @@ STEP 1: Dynamically build time keywords from KuzuDefaultFunction enum
     # || S.S.1: Extract time-related functions from the enum
     _time_keywords: Set[str] = set()
-    
+
     # @@ STEP 2: Initialize time keywords from enum at class definition time
     # || S.S.2: This will be populated by the _initialize_time_keywords method
-    
+
     _null_keywords: Set[str] = {DefaultValueConstants.NULL_KEYWORD}
 
     _boolean_keywords: Set[str] = {DefaultValueConstants.TRUE_KEYWORD, DefaultValueConstants.FALSE_KEYWORD}
-    
+
     @classmethod
     def _initialize_time_keywords(cls) -> None:
         """
         Initialize time keywords using pure inheritance checks.
-        
+
         No patterns, no hardcoding - just isinstance checks on the class hierarchy.
         """
         # @@ STEP: Use isinstance to detect TimeFunction instances
         from .constants import KuzuDefaultFunction
         from .kuzu_function_types import TimeFunction
-        
+
         for func in KuzuDefaultFunction:
             # || S.1: Check if this enum value is a TimeFunction instance
             if isinstance(func.value, TimeFunction):
@@ -113,33 +112,33 @@ class SQLKeywordRegistry:
                 else:
                     func_keyword = func_str.upper()
                 cls._time_keywords.add(func_keyword)
-    
+
     @classmethod
     def add_keyword(cls, keyword: str) -> None:
         """
         Add a new SQL keyword.
-        
+
         :param keyword: Keyword to add
         :type keyword: str
         """
         # @@ STEP 3: Add keyword to registry
         cls._time_keywords.add(keyword.upper())
-    
+
     @classmethod
     def register_null_keyword(cls, keyword: str) -> None:
         """Register a new null-related SQL keyword."""
         cls._null_keywords.add(keyword.upper())
-    
+
     @classmethod
     def register_boolean_keyword(cls, keyword: str) -> None:
         """Register a new boolean SQL keyword."""
         cls._boolean_keywords.add(keyword.upper())
-    
+
     @classmethod
     def is_sql_keyword(cls, value: str) -> bool:
         """
         Check if a value is a SQL keyword.
-        
+
         :param value: Value to check
         :type value: str
         :returns: True if value is a SQL keyword
@@ -148,24 +147,24 @@ class SQLKeywordRegistry:
         # @@ STEP 2: Check if value is a SQL keyword
         # || S.2.1: Use type() instead of isinstance
         return value.upper() in cls._time_keywords
-    
+
     @classmethod
     def is_time_keyword(cls, value: str) -> bool:
         """
         Check if value is a time-related SQL keyword.
-        
+
         :param value: Value to check
         :type value: str
         :returns: True if value is a time keyword
         :rtype: bool
         """
         return value.upper().strip() in cls._time_keywords
-    
+
     @classmethod
     def is_null_keyword(cls, value: str) -> bool:
         """Check if value is a null-related SQL keyword."""
         return value.upper().strip() in cls._null_keywords
-    
+
     @classmethod
     def is_boolean_keyword(cls, value: str) -> bool:
         """Check if value is a boolean SQL keyword."""
@@ -178,20 +177,20 @@ class SQLKeywordRegistry:
 
 class DefaultValueHandlerRegistry:
     """Registry for type-specific default value handlers."""
-    
+
     _handlers: Dict[type, Callable[[Any], str]] = {}
-    
+
     @classmethod
     def register_handler(cls, value_type: type, handler: Callable[[Any], str]) -> None:
         """Register a handler for a specific type."""
         cls._handlers[value_type] = handler
-    
+
     @classmethod
     def get_handler(cls, value: Any) -> Optional[Callable[[Any], str]]:
         """Get the handler for a value's type."""
         value_type = type(value)
         return cls._handlers.get(value_type)
-    
+
     @classmethod
     def render(cls, value: Any) -> str:
         """Render a value using the appropriate handler."""
@@ -200,7 +199,7 @@ class DefaultValueHandlerRegistry:
         if not handler:
             raise ValueError(ErrorMessages.INVALID_FIELD_TYPE.format(field_name=type(value).__name__, error="No handler registered. Register a handler using DefaultValueHandlerRegistry.register_handler()"))
         return handler(value)
-    
+
 
     @staticmethod
     def _bool_handler(value: bool) -> str:
@@ -229,12 +228,12 @@ class DefaultValueHandlerRegistry:
     def _string_handler(value: str) -> str:
         """
         Handler for string values with SQL keyword detection.
-        
+
         NOTE: Function calls should be KuzuDefaultFunction enum values, not strings.
         If you need a function default, use the proper enum from constants.py.
         """
         up = value.upper().strip()
-        
+
         # @@ STEP: Handle time keywords - Kuzu doesn't support these as DEFAULT
         # || S.1: CURRENT_TIMESTAMP, NOW(), etc. are not supported in Kuzu DEFAULT clauses
         # || S.2: Raise explicit error for unsupported time keywords
@@ -244,7 +243,7 @@ class DefaultValueHandlerRegistry:
                 f"Kuzu does not support time function '{value}' in DEFAULT clause. "
                 f"Use KuzuDefaultFunction enum values for function defaults."
             )
-        
+
         if SQLKeywordRegistry.is_null_keyword(value):
             return f"{DefaultValueConstants.DEFAULT_PREFIX} {DefaultValueConstants.NULL_KEYWORD}"
 
@@ -372,7 +371,7 @@ BulkInsertValueGeneratorRegistry.register_generator(SequenceFunction, BulkInsert
 class CheckConstraintMetadata:
     """
     Metadata for check constraints.
-    
+
     :class: CheckConstraintMetadata
     :synopsis: Dataclass for check constraint metadata
     """
@@ -542,7 +541,7 @@ class ForeignKeyReference:
 class IndexMetadata:
     """
     Metadata for index definitions.
-    
+
     :class: IndexMetadata
     :synopsis: Dataclass for index metadata storage
     """
@@ -628,7 +627,7 @@ class PropertyMetadata:
 class ArrayTypeSpecification:
     """Specification for array/list types with element type."""
     element_type: Union[KuzuDataType, str]
-    
+
     def to_ddl(self) -> str:
         """Convert to DDL string like 'INT64[]' or 'STRING[]'."""
         if isinstance(self.element_type, KuzuDataType):
@@ -664,7 +663,7 @@ class KuzuFieldMetadata:
     def to_ddl(self, field_name: str) -> str:
         """Generate DDL for field definition."""
         return self.to_ddl_column_definition(field_name)
-    
+
     # ---- Column-level DDL renderer used by tests directly ----
     def to_ddl_column_definition(self, field_name: str, is_node_table: bool = True) -> str:
         """
@@ -710,7 +709,7 @@ class KuzuFieldMetadata:
             # If it's a KuzuDataType constant string, return it directly
             # If it's a custom type string, return it directly
             return dt
-        
+
         # For actual attribute access (when dt is like KuzuDataType.INT64)
         # This shouldn't happen with the new code
         raise ValueError(f"Unsupported type: {dt}")
@@ -745,7 +744,7 @@ def kuzu_field(
 ) -> Any:
     """
     Create a Pydantic Field with attached Kùzu metadata.
-    
+
     Args:
         default: Default value for the field
         kuzu_type: Kuzu data type (can be ARRAY/LIST for array types or a string like 'INT64[]')
@@ -827,7 +826,7 @@ def kuzu_field(
             "Arrays cannot be used as primary keys. "
             "Primary keys must be scalar types."
         )
-    
+
     # @@ STEP 2: Set appropriate default value for UUID auto-increment fields
     field_default_value = None if default is ... else default
     if auto_increment and kuzu_type == KuzuDataType.UUID:
@@ -899,13 +898,13 @@ def foreign_key(
 class RelationshipPair:
     """
     Specification for a single FROM-TO pair in a relationship.
-    
+
     :class: RelationshipPair
     :synopsis: Container for a specific FROM node to TO node connection
     """
     from_node: Union[Type[Any], str]
     to_node: Union[Type[Any], str]
-    
+
     def get_from_name(self) -> str:
         """Get the name of the FROM node."""
         if isinstance(self.from_node, str):
@@ -928,19 +927,19 @@ class RelationshipPair:
                 raise ValueError(
                     f"Target model {self.from_node} is not a decorated node - missing __kuzu_node_name__ attribute"
                 ) from e
-    
+
     def get_to_name(self) -> str:
         """Get the name of the TO node."""
         if isinstance(self.to_node, str):
             return self.to_node
-        
+
         # Strict validation - sets must be expanded before reaching here
         if isinstance(self.to_node, (set, frozenset)):
             raise TypeError(
                 f"RelationshipPair.to_node received a set {self.to_node}. "
                 f"Sets must be expanded in _process_relationship_pairs before creating RelationshipPair instances."
             )
-        
+
         # Try to get the kuzu node name first, fall back to __name__ for backward compatibility
         try:
             return self.to_node.__kuzu_node_name__
@@ -951,11 +950,11 @@ class RelationshipPair:
                 raise ValueError(
                     f"Target model {self.to_node} is not a decorated node - missing __kuzu_node_name__ attribute"
                 ) from e
-    
+
     def to_ddl_component(self) -> str:
         """Convert to DDL component for CREATE REL TABLE."""
         return f"{DDLConstants.REL_TABLE_GROUP_FROM} {self.get_from_name()} {DDLConstants.REL_TABLE_GROUP_TO} {self.get_to_name()}"
-    
+
     def __repr__(self) -> str:
         return f"RelationshipPair(from={self.from_node}, to={self.to_node})"
 
@@ -1463,21 +1462,21 @@ def _process_relationship_pairs(
             if not isinstance(pair, tuple) or len(pair) != 2:
                 raise ValueError(f"Relationship {rel_name}: Each pair must be a 2-tuple (from_type, to_type)")
             from_type, to_type = pair
-            
+
             # Handle sets in FROM position
             from_types = []
             if isinstance(from_type, (set, frozenset)):
                 from_types = list(from_type)
             else:
                 from_types = [from_type]
-            
+
             # Handle sets in TO position
             to_types = []
             if isinstance(to_type, (set, frozenset)):
                 to_types = list(to_type)
             else:
                 to_types = [to_type]
-            
+
             # Create Cartesian product of FROM and TO types
             for ft in from_types:
                 for tt in to_types:
@@ -1548,7 +1547,7 @@ def kuzu_relationship(
 ) -> Callable[[Type[T]], Type[T]]:
     """
     Decorator for Kùzu relationship models supporting multiple FROM-TO pairs.
-    
+
     :param name: Relationship table name. If not provided, uses the class name.
     :param pairs: List of (from_node, to_node) tuples defining the relationship pairs.
                   Each tuple specifies a FROM-TO connection between node types.
@@ -1573,7 +1572,7 @@ def kuzu_relationship(
         # @@ STEP 1: Build relationship pairs
         rel_name = name if name is not None else cls.__name__
         rel_pairs = []
-        
+
         if pairs is not None and len(pairs) > 0:
             rel_pairs = _process_relationship_pairs(pairs, rel_name)
         elif not abstract:
@@ -1581,14 +1580,14 @@ def kuzu_relationship(
                 f"Relationship {rel_name} must have 'pairs' parameter defined. "
                 f"Example: pairs=[(User, User), (User, City)]"
             )
-        
+
         # @@ STEP 2: Store relationship metadata
         cls.__kuzu_relationship_name__ = rel_name # type: ignore
         cls.__kuzu_rel_name__ = rel_name # type: ignore  # Keep for backward compatibility
-        
+
         # Store relationship pairs
         cls.__kuzu_relationship_pairs__ = rel_pairs # type: ignore
-        
+
         cls.__kuzu_multiplicity__ = multiplicity # type: ignore
         cls.__kuzu_compound_indexes__ = compound_indexes or [] # type: ignore
         cls.__kuzu_table_constraints__ = table_constraints or [] # type: ignore
@@ -1596,7 +1595,7 @@ def kuzu_relationship(
         cls.__kuzu_direction__ = direction # type: ignore
         cls.__kuzu_is_abstract__ = abstract # type: ignore
         cls.__is_kuzu_relationship__ = True # type: ignore
-        
+
         # @@ STEP 3: Flag for multi-pair relationship
         cls.__kuzu_is_multi_pair__ = len(rel_pairs) > 1 # type: ignore
 
@@ -1687,15 +1686,15 @@ class KuzuBaseModel(BaseModel):
                 )
         logger.warning(f"Cannot compare {self.__class__.__name__} instances: no primary key field")
         return id(self) == id(other)
-    
+
     @classmethod
     def query(cls, session: Optional["KuzuSession"] = None) -> "Query":
         """
         Create a query for this model.
-        
+
         Args:
             session: Optional session to execute queries with
-            
+
         Returns:
             Query object for this model
         """
@@ -1961,17 +1960,17 @@ class KuzuBaseModel(BaseModel):
                     errors.append(f"Field {field_name}: unknown target type '{target_type}'")
 
         return errors
-    
+
     def save(self, session: "KuzuSession") -> None:
         """
         Save this instance to the database.
-        
+
         Args:
             session: Session to use for saving
         """
         session.add(self)
         session.commit()
-    
+
     def delete(self, session: "KuzuSession") -> None:
         """
         Delete this instance from the database.
@@ -2169,7 +2168,7 @@ class RelationshipNodeTypeQuery:
     def __init__(self, relationship_class: Type[Any], query_type: str, node_types: Tuple[Type[Any], ...]) -> None:
         """
         Ultra-fast initialization with immediate result computation.
-        
+
         No deferred computation - results are available instantly.
 
         Args:
@@ -2182,20 +2181,61 @@ class RelationshipNodeTypeQuery:
             TypeError: If node types are invalid
         """
         self._query_type = query_type
-        
+
         # Get pre-built cache with zero validation overhead
         cache = relationship_class._direct_cache
-        
+
         # Single optimized path for result computation
         if len(node_types) == 1:
             # Single node path - fastest possible
             cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE
             self._result = cache[cache_key].get(node_types[0], frozenset())
         else:
-            # Multi-node path with pre-computed frozenset key
+            # Multi-node path with ULTRA-FAST vectorized union computation
             key = frozenset(node_types)
             cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP
-            self._result = cache[cache_key].get(key, frozenset())
+
+            # @@ STEP: Try cache first for performance
+            cached_result = cache[cache_key].get(key)
+            if cached_result is not None:
+                self._result = cached_result
+            else:
+                # @@ STEP: VECTORIZED union computation using adjacency matrix operations
+                # || S.S: Foundation: {t | ∃f ∈ {A,B,C}, (f,t) ∈ relationship_pairs}
+                # || Uses NumPy boolean OR operations for maximum performance
+                adjacency_data = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_ADJACENCY_DATA]
+
+                # @@ STEP: PURE VECTORIZED computation using set intersection and adjacency matrix
+                # || S.S: Approach - find intersection of input nodes with available nodes
+                if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM:
+                    adj_matrix = adjacency_data[RelationshipNodeTypeQueryConstants.ADJ_FROM_TO]
+                    target_list = adjacency_data[RelationshipNodeTypeQueryConstants.TO_LIST]
+                    source_list = adjacency_data[RelationshipNodeTypeQueryConstants.FROM_LIST]
+                else:
+                    adj_matrix = adjacency_data[RelationshipNodeTypeQueryConstants.ADJ_TO_FROM]
+                    target_list = adjacency_data[RelationshipNodeTypeQueryConstants.FROM_LIST]
+                    source_list = adjacency_data[RelationshipNodeTypeQueryConstants.TO_LIST]
+
+                # @@ STEP: Find intersection of input node_types with available source nodes
+                input_set = set(node_types)
+                available_set = set(source_list)
+                valid_nodes = input_set & available_set
+
+                if valid_nodes:
+                    # @@ STEP: PURE VECTORIZED approach using boolean masking
+                    # || S.S: Create boolean mask for source nodes, then use advanced indexing
+                    source_mask = np.isin(source_list, list(valid_nodes))
+                    valid_row_indices = np.where(source_mask)[0]
+
+                    # @@ STEP: VECTORIZED union using NumPy boolean OR across selected rows
+                    union_row = np.any(adj_matrix[valid_row_indices], axis=0)
+                    target_indices = np.where(union_row)[0]
+                    self._result = frozenset(target_list[target_indices])
+                else:
+                    self._result = frozenset()
+
+                # @@ STEP: Cache the computed result for future queries
+                cache[cache_key][key] = self._result
 
     # @@ STEP: Properties enforce correct-direction access with zero-logic fast-path
     @property
@@ -2224,13 +2264,13 @@ class KuzuRelationshipBase(KuzuBaseModel):
 
     _priv_from_node_pk: Optional[Any] = None
     _priv_to_node_pk: Optional[Any] = None
-    
+
     @property
     def _from_node_pk(self) -> Optional[Any]:
         if self._priv_from_node_pk is None:
             self._priv_from_node_pk = self._extract_node_pk(self.from_node)
         return self._priv_from_node_pk
-    
+
     @property
     def _to_node_pk(self) -> Optional[Any]:
         if self._priv_to_node_pk is None:
@@ -2449,7 +2489,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
     @classmethod
     def get_direction(cls) -> RelationshipDirection:
         return cls.__dict__.get("__kuzu_direction__", RelationshipDirection.FORWARD)
-    
+
     @classmethod
     def is_multi_pair(cls) -> bool:
         """Check if this relationship has multiple FROM-TO pairs."""
@@ -2472,17 +2512,17 @@ class KuzuRelationshipBase(KuzuBaseModel):
     @classmethod
     def generate_ddl(cls) -> str:
         return generate_relationship_ddl(cls)
-    
+
     def save(self, session: "KuzuSession") -> None:
         """
         Save this relationship to the database.
-        
+
         Args:
             session: Session to use for saving
         """
         session.add(self)
         session.commit()
-    
+
     def delete(self, session: "KuzuSession") -> None:
         """
         Delete this relationship from the database.
@@ -2497,7 +2537,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
     def _build_node_type_cache(cls) -> None:
         """
         ULTRA-FAST cache building with vectorized NumPy operations and Numba JIT compilation.
-        
+
         This method provides 100-1000x performance improvements over the original implementation
         by eliminating ALL Python loops and using vectorized operations throughout.
 
@@ -2554,15 +2594,16 @@ class KuzuRelationshipBase(KuzuBaseModel):
             all_to_nodes.add(to_node)
 
         # @@ STEP: Use ultra-fast vectorized cache builder with Numba JIT
-        from_to_map, to_from_map, from_to_single, to_from_single = cls.cache_bitset_builder_vectorized(
+        from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data = cls.cache_bitset_builder_vectorized(
             resolved_pairs, all_from_nodes, all_to_nodes)
 
-        # @@ STEP: Store cache with minimal dictionary nesting
+        # @@ STEP: Store cache with minimal dictionary nesting including adjacency matrices
         cache_dict = {
             RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP: from_to_map,
             RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP: to_from_map,
             RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE: from_to_single,
             RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE: to_from_single,
+            RelationshipNodeTypeQueryConstants.CACHE_KEY_ADJACENCY_DATA: adjacency_data,
         }
         cls._node_type_cache[cls.__name__] = cache_dict
 
@@ -2574,33 +2615,33 @@ class KuzuRelationshipBase(KuzuBaseModel):
     def _vectorized_subset_unions(cls, adjacency_matrix: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Ultra-fast computation of ALL subset unions using parallel Numba JIT.
-        
+
         This is the performance-critical core that provides 100-1000x speedup
         by compiling to native machine code with parallel execution.
-        
+
         Args:
             adjacency_matrix: Boolean adjacency matrix (n_nodes x n_targets)
             n_nodes: Number of source nodes
-            
+
         Returns:
             Tuple of (union_results, subset_masks) for efficient processing
         """
         n_subsets = 1 << n_nodes
         n_targets = adjacency_matrix.shape[1]
-        
+
         # Pre-allocate results for maximum performance
         union_results = np.zeros((n_subsets, n_targets), dtype=np.bool_)
         subset_masks = np.zeros(n_subsets, dtype=np.uint64)
-        
+
         # Parallel computation across all CPU cores
         for mask in prange(1, n_subsets):
             subset_masks[mask] = mask
-            
+
             # Vectorized union computation using NumPy boolean OR
             for i in range(n_nodes):
                 if mask & (1 << i):
                     union_results[mask] |= adjacency_matrix[i]
-        
+
         return union_results, subset_masks
 
     @classmethod
@@ -2613,7 +2654,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
         - Numba JIT compilation to native code
         - Parallel processing across CPU cores
         - Memory-efficient sparse computation for large relationship sets
-        - Mathematical optimization preventing exponential memory explosion
+        - Optimization preventing exponential memory explosion
 
         Args:
             resolved_pairs: List of (from_node, to_node) tuples
@@ -2621,7 +2662,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
             all_to_nodes: Set of all TO node types
 
         Returns:
-            Tuple of (from_to_map, to_from_map, from_to_single, to_from_single)
+            Tuple of (from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data)
         """
         # SAFETY CHECK: Handle edge cases
         if not resolved_pairs or not all_from_nodes or not all_to_nodes:
@@ -2637,23 +2678,24 @@ class KuzuRelationshipBase(KuzuBaseModel):
         # Build index maps using fastest Python method
         from_index = {from_list[i]: i for i in range(n_from)}
         to_index = {to_list[j]: j for j in range(n_to)}
-        
+
         # Build adjacency matrices with vectorized NumPy operations
         adj_from_to = np.zeros((n_from, n_to), dtype=np.bool_)
         adj_to_from = np.zeros((n_to, n_from), dtype=np.bool_)
-        
+
         # Vectorized adjacency matrix construction
         if resolved_pairs:
             from_indices = np.array([from_index[pair[0]] for pair in resolved_pairs])
             to_indices = np.array([to_index[pair[1]] for pair in resolved_pairs])
-            
+
             adj_from_to[from_indices, to_indices] = True
             adj_to_from[to_indices, from_indices] = True
-        
+
         # Use adjacency matrix representation
         # This provides O(1) lookup with O(n*m) memory instead of O(2^n * m) like before
-        from_to_adj, from_indices = _vectorized_subset_unions_jit(adj_from_to, n_from)
-        to_from_adj, to_indices = _vectorized_subset_unions_jit(adj_to_from, n_to)
+
+        from_to_adj, from_indices = adj_from_to, np.arange(n_from, dtype=np.uint64)
+        to_from_adj, to_indices = adj_to_from, np.arange(n_to, dtype=np.uint64)
 
         # Build BLAZINGLY FAST lookup dictionaries using direct adjacency matrix access
         from_to_map = {}
@@ -2685,7 +2727,18 @@ class KuzuRelationshipBase(KuzuBaseModel):
                 # Multi-node subsets computed on-demand
                 to_from_map[frozenset([to_node])] = connected_from_nodes
 
-        return from_to_map, to_from_map, from_to_single, to_from_single
+        # @@ STEP: Store adjacency matrices and index mappings for vectorized multi-node queries
+        # || S.S: These enable O(1) vectorized union computation instead of O(n) Python loops
+        adjacency_data = {
+            RelationshipNodeTypeQueryConstants.ADJ_FROM_TO: adj_from_to,
+            RelationshipNodeTypeQueryConstants.ADJ_TO_FROM: adj_to_from,
+            RelationshipNodeTypeQueryConstants.FROM_LIST: from_list,
+            RelationshipNodeTypeQueryConstants.TO_LIST: to_list,
+            RelationshipNodeTypeQueryConstants.FROM_INDEX: from_index,
+            RelationshipNodeTypeQueryConstants.TO_INDEX: to_index,
+        }
+
+        return from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data
 
     @classmethod
     def _resolve_node_type(cls, node_ref: Union[Type[Any], str]) -> Type[Any]:
@@ -2802,36 +2855,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
             RelationshipNodeTypeQueryConstants.QUERY_TYPE_TO,
             node_types
         )
-
-
-@jit(nopython=True, parallel=True, cache=True, fastmath=True)
-def _vectorized_subset_unions_jit(adjacency_matrix: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Direct adjacency matrix representation with O(1) lookup.
-
-    Instead of computing 2^n subsets, we return the adjacency matrix
-    itself as the "union results" since ANY subset union can be computed on-demand using
-    bitwise operations on the adjacency matrix rows. This uses O(n*m) memory instead
-    of O(2^n * m) like before.
-    Args:
-        adjacency_matrix: Boolean adjacency matrix (n_nodes x n_targets)
-        n_nodes: Number of source nodes
-
-    Returns:
-        Tuple of (adjacency_matrix, node_indices) for O(1) subset union computation
-    """
-    # Any subset union can be computed as: OR of adjacency_matrix[i] for i in subset
-    # This gives us O(1) access with O(n*m) memory instead of O(2^n * m) like before
-
-    # Return the adjacency matrix itself as "union results"
-    # Each row represents the union result for the single-node subset {i}
-    # Multi-node subsets are computed on-demand by ORing the relevant rows
-
-    # Create node index mapping for efficient lookup
-    node_indices = np.arange(n_nodes, dtype=np.uint64)
-
-    # The adjacency matrix rows are the "union results" for single-node subsets
-    return adjacency_matrix, node_indices
 
 # @@ STEP: Class-level cache for node type mappings (performance-critical)
 # || S.S: Using module-level variable to avoid Pydantic private attribute conflicts
@@ -2976,7 +2999,7 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
         is_relationship = cls.__is_kuzu_relationship__ # type: ignore
     except AttributeError:
         is_relationship = False
-    
+
     if not is_relationship:
         try:
             _ = cls.__kuzu_relationship_name__ # type: ignore
@@ -2984,23 +3007,36 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
             raise ValueError(f"Class {cls.__name__} not decorated with @kuzu_relationship") from None
 
     rel_name = cls.__kuzu_relationship_name__ # type: ignore
-    
+
     # @@ STEP 2: Get relationship pairs
     rel_pairs = cls.__kuzu_relationship_pairs__ # type: ignore
     if not rel_pairs:
         raise ValueError(f"{rel_name}: No relationship pairs defined. Use pairs=[(FromNode, ToNode), ...]")
-    
-    # @@ STEP 3: Validate that all referenced nodes exist and build FROM-TO components
-    from_to_components = []
-    for pair in rel_pairs:
-        from_name = pair.get_from_name()
-        to_name = pair.get_to_name()
 
-        # Note: Registry validation is optional for DDL generation
-        # This allows for more flexible testing and usage patterns
-        # The actual database will validate node existence at runtime
+    # @@ STEP 3: Build deterministic, de-duplicated FROM-TO components; validation deferred to DB (warnings only)
+    step3_comments: List[str] = []
 
-        from_to_components.append(pair.to_ddl_component())
+    # Preserve declared order; de-duplicate while keeping first occurrence
+    from_to_components: List[str] = []
+    seen: Set[tuple[str, str]] = set()
+    for p in rel_pairs:
+        fn = p.get_from_name()
+        tn = p.get_to_name()
+        key = (fn, tn)
+
+        # Deduplicate
+        if key in seen:
+            step3_comments.append(DDLMessageConstants.WARN_DUPLICATE_REL_PAIR.format(fn, tn))
+            continue
+        seen.add(key)
+
+        # Optional validation: warn if nodes are not registered; do not raise here
+        if fn not in _kuzu_registry.nodes:
+            step3_comments.append(DDLMessageConstants.WARN_UNKNOWN_FROM_NODE.format(fn))
+        if tn not in _kuzu_registry.nodes:
+            step3_comments.append(DDLMessageConstants.WARN_UNKNOWN_TO_NODE.format(tn))
+
+        from_to_components.append(p.to_ddl_component())
 
     # @@ STEP 4: Property columns - minimal + comments for rich view
     prop_cols_min: List[str] = []
@@ -3029,6 +3065,10 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
 
         if full_def != " ".join(parts):
             comment_lines.append(full_def)
+
+    # @@ STEP: Merge Step 3 warnings into comment_lines for visibility in emitted DDL
+    if step3_comments:
+        comment_lines.extend(step3_comments)
 
     # @@ STEP 5: Build DDL items list
     items: List[str] = from_to_components  # Start with FROM-TO pairs
@@ -3087,25 +3127,25 @@ def get_ddl_for_node(node_cls: Type[Any]) -> str:
             ValidationMessageConstants.MISSING_KUZU_NODE_NAME.format(node_cls.__name__)
         )
     fields = []
-    
+
     for field_name, field_info in node_cls.model_fields.items():
         meta = _kuzu_registry.get_field_metadata(field_info)
         if meta:
             field_ddl = meta.to_ddl(field_name)
             fields.append(field_ddl)
-    
+
     if not fields:
         raise ValueError(
             f"Node {node_name} has no Kuzu fields defined. "
             f"At least one field with Kuzu metadata is required."
         )
-    
+
     return f"{DDLConstants.CREATE_NODE_TABLE} {node_name} (\n    {', '.join(fields)}\n);"
 
 
 def get_ddl_for_relationship(rel_cls: Type[Any]) -> str:
     """Generate DDL for a relationship.
-    
+
     :param rel_cls: Relationship class.
     :return: DDL statement.
     """
@@ -3117,7 +3157,7 @@ def get_ddl_for_relationship(rel_cls: Type[Any]) -> str:
         raise ValueError(
             ValidationMessageConstants.MISSING_KUZU_REL_NAME.format(rel_cls.__name__)
         )
-    
+
     # Multi-pair or new single-pair format
     return generate_relationship_ddl(rel_cls)
 

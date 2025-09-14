@@ -17,6 +17,7 @@ object is created per database file, with multiple connections sharing it.
 
 from __future__ import annotations
 
+import os
 import threading
 import weakref
 from pathlib import Path
@@ -56,14 +57,14 @@ class DatabaseManager:
         self._manager_lock = threading.RLock()
         self._initialized = True
     
-    def get_database(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = 512 * 1024 * 1024) -> kuzu.Database:
+    def get_database(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE) -> kuzu.Database:
         """
         Get or create a Database object for the given path.
 
         Args:
             db_path: Path to the database file
             read_only: Whether to open in read-only mode
-            buffer_pool_size: Buffer pool size in bytes (default: 512MB)
+            buffer_pool_size: Buffer pool size in bytes. When 0, Kuzu auto-selects (~80% RAM).
 
         Returns:
             Shared Database object
@@ -73,14 +74,9 @@ class DatabaseManager:
         """
         db_path_str = str(Path(db_path).resolve())
 
-        # Validate and sanitize buffer_pool_size to prevent massive memory allocation
-        if buffer_pool_size is None or buffer_pool_size <= 0 or buffer_pool_size > 2**63:
-            buffer_pool_size = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE  # Default to 512MB
-
-        # Cap buffer pool size to reasonable maximum (2GB) to prevent system crashes
-        max_buffer_size = 2 * 1024 * 1024 * 1024  # 2GB
-        if buffer_pool_size > max_buffer_size:
-            buffer_pool_size = max_buffer_size
+        # Normalize buffer_pool_size: allow 0 to delegate sizing to Kuzu
+        if buffer_pool_size is None or buffer_pool_size < 0 or buffer_pool_size > 2**63:
+            buffer_pool_size = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE
 
         with self._manager_lock:
             if db_path_str in self._databases:
@@ -91,15 +87,17 @@ class DatabaseManager:
 
             # Create new database with validated buffer pool size
             try:
-                # IMPORTANT: Pass explicit safe parameters to avoid huge allocations on some platforms.
+                # IMPORTANT: Pass parameters that let Kuzu manage memory adaptively.
+                # Dynamic max_db_size based on filesystem free space
+                computed_max_db_size = DatabaseConstants.resolve_max_db_size_for_path(db_path_str)
                 database = kuzu.Database(
                     db_path_str,
                     buffer_pool_size=buffer_pool_size,
-                    max_db_size=DatabaseConstants.DEFAULT_MAX_DB_SIZE,
+                    max_db_size=computed_max_db_size,
                     read_only=read_only,
                     compression=True,
                     lazy_init=False,
-                    max_num_threads=DatabaseConstants.DEFAULT_MAX_THREADS,
+                    max_num_threads=os.environ.get("KUZUALCHEMY_MAX_THREADS", DatabaseConstants.DEFAULT_MAX_THREADS),
                     auto_checkpoint=True,
                     checkpoint_threshold=DatabaseConstants.DEFAULT_CHECKPOINT_THRESHOLD,
                 )

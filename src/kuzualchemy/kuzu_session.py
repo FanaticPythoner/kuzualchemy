@@ -20,6 +20,8 @@ import ahocorasick
 import logging
 import uuid
 from enum import Enum
+import time
+import gc
 
 import pyarrow as pa
 
@@ -29,13 +31,15 @@ from .constants import (
     QueryFieldConstants,
     ErrorMessages,
     KuzuDataType,
-    LoggingConstants
+    LoggingConstants,
+    DatabaseConstants,
 )
 from .connection_pool import get_shared_connection_pool
 from .constants import PerformanceConstants
 from .constants import DDLConstants
 from .kuzu_orm import get_node_by_name, KuzuRelationshipBase, get_registered_nodes
 
+# TODO: TESTS ARE FALING SINCE I MADE THE BATCH SIZES DYNAMIC ACCORDING TO KUZU, EVEN THOUGH MY IMPLEM ENTATION FIXED A SHIT LOAD OF ISSUES IN OTHER PRODUCTION PROJECTS. FIX THE ISSUES RIGHT NOW HERE AND INT HE CONNECTION POOL OR WHEREEVER.
 
 ModelType = TypeVar("ModelType")
 
@@ -63,14 +67,14 @@ class KuzuConnection:
 
         return cls._KEYWORD_AUTOMATON
 
-    def __init__(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = 512 * 1024 * 1024, **kwargs):
+    def __init__(self, db_path: Union[str, Path], read_only: bool = False, buffer_pool_size: int = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE, **kwargs):
         """
         Initialize connection to Kuzu database using connection pool.
 
         Args:
             db_path: Path to the Kuzu database file or directory
             read_only: Whether to open database in read-only mode
-            buffer_pool_size: Size of buffer pool in bytes (default: 512MB)
+            buffer_pool_size: Size of buffer pool in bytes. When 0, Kuzu auto-selects (~80% RAM).
             **kwargs: Additional connection parameters (unused but maintained for compatibility)
 
         Raises:
@@ -83,14 +87,9 @@ class KuzuConnection:
         self.db_path = Path(db_path)
         self.read_only = read_only
 
-        # Validate buffer_pool_size to prevent system crashes
-        if buffer_pool_size is None or buffer_pool_size <= 0 or buffer_pool_size > 2**63:
-            buffer_pool_size = 512 * 1024 * 1024  # Default to 512MB
-
-        # Cap buffer pool size to reasonable maximum (2GB)
-        max_buffer_size = 2 * 1024 * 1024 * 1024  # 2GB
-        if buffer_pool_size > max_buffer_size:
-            buffer_pool_size = max_buffer_size
+        # Normalize buffer_pool_size: allow 0 to delegate sizing to Kuzu (recommended)
+        if buffer_pool_size is None or buffer_pool_size < 0 or buffer_pool_size > 2**63:
+            buffer_pool_size = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE
 
         self.buffer_pool_size = buffer_pool_size
         # Acquire a shared connection pool instead of a dedicated connection to avoid
@@ -246,7 +245,7 @@ class KuzuSession:
         connection: Optional[KuzuConnection] = None,
         db_path: Optional[Union[str, Path]] = None,
         read_only: bool = False,
-        buffer_pool_size: int = 512 * 1024 * 1024,
+        buffer_pool_size: int = DatabaseConstants.DEFAULT_BUFFER_POOL_SIZE,
         autoflush: bool = True,
         autocommit: bool = False,
         expire_on_commit: bool = True,
@@ -416,53 +415,81 @@ class KuzuSession:
 
     def _execute_with_connection_reuse(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
         """
-        Execute query with connection reuse optimization.
+        Execute query with connection reuse optimization and resilient backoff on buffer exhaustion.
 
-        :param query: SQL query to execute
-        :param parameters: Optional query parameters
-        :return: Query execution result
-        :raises: Re-raises any unexpected exceptions after logging
+        This method attempts a small, bounded retry with exponential backoff if Kuzu's buffer
+        manager reports exhaustion ("No more frame groups can be added to the allocator").
+        The retry path is intentionally tight (up to 3 attempts) and resets connection reuse
+        state to encourage fresh allocation from the pool between attempts.
         """
-        # || Reuse connection if we're within the threshold
-        if (self._reused_connection is not None and
-            self._connection_operation_count < PerformanceConstants.CONNECTION_REUSE_THRESHOLD):
-            try:
+        def is_buffer_exhaustion_error(err: BaseException) -> bool:
+            msg = str(err).lower()
+            return (
+                "buffer manager exception" in msg
+                or "no more frame groups" in msg
+                or "out of memory" in msg
+            )
+
+        # Helper to run a single execution call using either reused or regular connection
+        def _do_exec(use_reused: bool) -> Any:
+            if use_reused and (self._reused_connection is not None and self._connection_operation_count < PerformanceConstants.CONNECTION_REUSE_THRESHOLD):
                 result = self._reused_connection.execute(query, parameters)
                 self._connection_operation_count += 1
                 return result
-            except (ConnectionError, OSError, RuntimeError, ValueError) as connection_error:
-                # || Log the specific connection error before falling back
+            # Fallback to main connection
+            result = self._conn.execute(query, parameters)
+            self._reused_connection = self._conn
+            self._connection_operation_count = 1
+            return result
+
+        # First attempt: try reused connection when eligible
+        try:
+            return _do_exec(use_reused=True)
+        except (ConnectionError, OSError, ValueError, RuntimeError) as e:
+            # If not a buffer exhaustion error, try a single fall back to normal execution
+            if not is_buffer_exhaustion_error(e):
                 logger.warning(
                     LoggingConstants.CONNECTION_REUSE_ERROR_MSG.format(
                         query=query[:100] + "..." if len(query) > 100 else query,
-                        error=str(connection_error)
+                        error=str(e)
                     )
                 )
-                # || Connection might be stale, fall back to normal execution
-                # || Set reused connection to main connection for future reuse
-                self._reused_connection = self._conn
-                self._connection_operation_count = 1  # Reset to 1 after fallback execution
-                # || Execute with normal connection and return immediately
-                return self._conn.execute(query, parameters)
-            except Exception as unexpected_error:
-                # || Log unexpected errors and re-raise them
-                logger.error(
-                    f"Unexpected error during connection reuse: {unexpected_error}. "
-                    f"Query: {query[:100] + '...' if len(query) > 100 else query}"
-                )
-                # || Reset connection state before re-raising
-                self._reused_connection = None
-                self._connection_operation_count = 0
-                raise
-
-        # || Use normal connection execution
-        result = self._conn.execute(query, parameters)
-
-        # || Start connection reuse for next operations - reuse the same connection
-        self._reused_connection = self._conn
-        self._connection_operation_count = 1
-
-        return result
+                try:
+                    # Reset reuse state then execute normally once
+                    self._reused_connection = None
+                    self._connection_operation_count = 0
+                    return _do_exec(use_reused=False)
+                except Exception as e:
+                    raise e
+            # Buffer exhaustion path: bounded exponential backoff retries
+            backoff_s = 0.05
+            max_attempts = 3
+            last_exc: BaseException = e
+            # Reset reuse state to encourage a fresh pooled connection
+            self._reused_connection = None
+            self._connection_operation_count = 0
+            for attempt in range(1, max_attempts + 1):
+                time.sleep(backoff_s)
+                gc.collect()
+                try:
+                    return _do_exec(use_reused=False)
+                except (ConnectionError, OSError, ValueError, RuntimeError) as e2:
+                    last_exc = e2
+                    if not is_buffer_exhaustion_error(e2):
+                        # Different error type: stop retrying and raise immediately
+                        raise
+                    backoff_s = min(backoff_s * 2.0, 0.5)
+            # All retries failed; re-raise the last exception
+            raise last_exc
+        except Exception as unexpected_error:
+            # Unexpected error type: reset and re-raise
+            logger.error(
+                f"Unexpected error during connection reuse: {unexpected_error}. "
+                f"Query: {query[:100] + '...' if len(query) > 100 else query}"
+            )
+            self._reused_connection = None
+            self._connection_operation_count = 0
+            raise
 
     def _reset_connection_reuse(self) -> None:
         """Reset connection reuse state."""
@@ -616,16 +643,54 @@ class KuzuSession:
 
     def _bulk_insert_model_type(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
         """
-        Bulk insert instances of a single model type using PyArrow.
+        Bulk insert instances of a single model type using PyArrow with dynamic batch sizing.
+
+        Implements adaptive halving on buffer exhaustion errors to respect Kuzu's buffer pool
+        capacity without hard-failing the entire operation. When the batch size reaches 1 and
+        still fails, the method escalates the error to the caller.
 
         Args:
             model_class: The model class type
             instances: List of instances of the same model type
-            batch_size: Number of records per batch
+            batch_size: Initial number of records per batch (upper bound)
         """
-        for i in range(0, len(instances), batch_size):
-            batch = instances[i:i + batch_size]
-            self._process_batch_with_pyarrow(model_class, batch)
+        if not instances:
+            return
+
+        start = 0
+        n = len(instances)
+        # Clamp batch size to positive
+        cur_batch = max(1, int(batch_size))
+
+        def is_buffer_exhaustion_error(err: BaseException) -> bool:
+            msg = str(err).lower()
+            return (
+                "buffer manager exception" in msg
+                or "no more frame groups" in msg
+                or "out of memory" in msg
+            )
+
+        while start < n:
+            # Fit the current batch within remaining items
+            cur_batch = min(cur_batch, n - start)
+            try:
+                self._process_batch_with_pyarrow(model_class, instances[start:start + cur_batch])
+                start += cur_batch
+                # Attempt to gradually increase batch size back up (gentle ramp-up)
+                if cur_batch < batch_size:
+                    cur_batch = min(batch_size, int(cur_batch * 2))
+            except (RuntimeError, ValueError) as e:
+                if not is_buffer_exhaustion_error(e):
+                    # Non-buffer error: bubble up immediately
+                    raise
+                # Buffer exhaustion: halve the batch and back off
+                if cur_batch <= 1:
+                    # Cannot reduce further; re-raise to signal unrecoverable capacity issue
+                    raise
+                cur_batch = max(1, cur_batch // 2)
+                time.sleep(0.02)
+                gc.collect()
+                # Do not advance 'start'; retry with smaller batch
 
     def _process_batch_with_pyarrow(self, model_class: Type[Any], instances: List[Any]) -> None:
         """
@@ -803,8 +868,16 @@ class KuzuSession:
         else:
             raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
         
-        self._conn.execute(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
-        
+        try:
+            self._execute_with_connection_reuse(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
+        finally:
+            # Ensure PyArrow buffers are released promptly
+            try:
+                del df
+            except Exception:
+                pass
+            gc.collect()
+
         if not is_relationship:
             self._retrieve_auto_increment_values_after_bulk_insert(model_class, instances, field_names)
 
@@ -876,7 +949,7 @@ class KuzuSession:
                 """
 
                 # || S.S.5: Execute query and update instance
-                result = self._conn.execute(query, params)
+                result = self._execute_with_connection_reuse(query, params)
 
                 if result and len(result) > 0:
                     record = result[0]
@@ -1329,11 +1402,11 @@ class KuzuSession:
 
         if not properties:
             query = f"CREATE (:{node_name})"
-            self._conn.execute(query)
+            self._execute_with_connection_reuse(query)
         else:
             prop_str = ", ".join(f"{k}: ${k}" for k in properties.keys())
             query = f"CREATE (:{node_name} {{{prop_str}}})"
-            self._conn.execute(query, properties)
+            self._execute_with_connection_reuse(query, properties)
 
         # Handle auto-increment fields that need generation: retrieve generated values and update instance
         if fields_needing_generation:
@@ -1381,12 +1454,12 @@ class KuzuSession:
                 order_field = auto_increment_fields[0]
                 query = f"MATCH (n:{node_name}) WHERE {where_clause} RETURN n ORDER BY n.{order_field} DESC LIMIT 1"
 
-                result = self._conn.execute(query, params)
+                result = self._execute_with_connection_reuse(query, params)
             else:
                 # If no non-auto fields, get the most recent node by the first auto-increment field
                 order_field = auto_increment_fields[0]
                 query = f"MATCH (n:{node_name}) RETURN n ORDER BY n.{order_field} DESC LIMIT 1"
-                result = self._conn.execute(query)
+                result = self._execute_with_connection_reuse(query)
 
         except Exception as e:
             # Re-raise with context about the failed operation
@@ -1549,7 +1622,7 @@ class KuzuSession:
 
                 # || S.S.4: Query to check if this node type contains the primary key value
                 query = f"MATCH (n:{node_name}) WHERE n.{pk_field} = $pk_value RETURN count(n) as count"
-                result = self._conn.execute(query, {'pk_value': node})
+                result = self._execute_with_connection_reuse(query, {'pk_value': node})
 
                 if result and len(result) > 0 and result[0].get('count', 0) > 0:
                     matching_node_types.append(node_name)
@@ -1785,7 +1858,7 @@ class KuzuSession:
             """
             params = {'from_pk': from_pk, 'to_pk': to_pk}
 
-        self._conn.execute(query, params)
+        self._execute_with_connection_reuse(query, params)
 
         # Handle auto-increment fields that need generation: retrieve generated values and update instance
         if fields_needing_generation:
@@ -1857,7 +1930,7 @@ class KuzuSession:
             query = "\n".join(query_parts)
             params = {'from_pk': from_pk, 'to_pk': to_pk}
 
-            result = self._conn.execute(query, params)
+            result = self._execute_with_connection_reuse(query, params)
         except Exception as e:
             # Re-raise with context about the failed operation
             raise RuntimeError(
@@ -1985,7 +2058,7 @@ class KuzuSession:
                     params[f"pk_{i}"] = value
 
             query = f"MATCH (n:{node_name}) WHERE {where_clause} SET {set_clause}"
-            self._conn.execute(query, params)
+            self._execute_with_connection_reuse(query, params)
 
     def _delete_instance(self, instance: Any) -> None:
         """Delete an instance from the database."""
@@ -2032,7 +2105,7 @@ class KuzuSession:
                 params[f"pk_{i}"] = value
 
         query = f"MATCH (n:{node_name}) WHERE {where_clause} DELETE n"
-        self._conn.execute(query, params)
+        self._execute_with_connection_reuse(query, params)
 
         # Remove from identity map with optimized key generation
         identity_key = self._generate_identity_key(model_class, pk_value)

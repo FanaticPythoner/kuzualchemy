@@ -15,7 +15,10 @@ used throughout the KuzuAlchemy codebase. No magic values are allowed elsewhere.
 from __future__ import annotations
 
 from enum import Enum, StrEnum
+import os
+from pathlib import Path
 from typing import Final, Any
+import shutil
 
 from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
 
@@ -28,12 +31,70 @@ class DatabaseConstants:
 
     DEFAULT_DB_NAME: Final[str] = "kuzu.db"
     MEMORY_DB_PATH: Final[str] = ":memory:"
-    DEFAULT_BUFFER_POOL_SIZE: Final[int] = 64 * 1024 * 1024   # 64MB (bytes) moderate default
-    DEFAULT_MAX_DB_SIZE: Final[int] = 512 * 1024 * 1024       # 512MB (bytes) — avoid huge VirtualAlloc on Windows
-    PAGE_SIZE_BYTES: Final[int] = 16 * 1024  # 16KB Kuzu buffer manager page size
-    DEFAULT_MAX_THREADS: Final[int] = 8
+    # Let Kuzu choose an optimal buffer pool size (~80% of system memory) when 0 is passed.
+    DEFAULT_BUFFER_POOL_SIZE: Final[int] = 0
+
+    # Minimum max DB size Kuzu accepts (8 MiB)
+    MIN_MAX_DB_SIZE_BYTES: Final[int] = 8 * 1024 * 1024
+    # Fraction of free disk space to allow the DB to grow to by default
+    MAX_DB_SIZE_FRACTION_OF_FREE_DISK: Final[float] = 0.90
+    # Absolute cap to avoid pathological mmap requests on constrained environments
+    MAX_DB_SIZE_ABSOLUTE_CAP_BYTES: Final[int] = 1 << 39  # 512 GiB
+
+    DEFAULT_MAX_THREADS: Final[int] = os.cpu_count()
     DEFAULT_CHECKPOINT_THRESHOLD: Final[int] = 1000000
-    DEFAULT_COMPRESSION: Final[bool] = True
+
+    @staticmethod
+    def resolve_max_db_size_for_path(db_path: str | Path) -> int:
+        """
+        Compute a safe, high default for Kuzu's ``max_db_size`` based on the host system.
+
+        Strategy
+        --------
+        - Base on the filesystem containing ``db_path``: use ~90% of free space.
+        - Clamp to an absolute cap (512 GiB) to avoid oversized mmap reservations
+          that can fail on some CI/container environments despite 64-bit address space.
+        - Round DOWN to the nearest power of two (Kuzu requires power-of-two size).
+        - Enforce Kuzu's minimum (8 MiB).
+
+        Parameters
+        ----------
+        db_path:
+            Target database file path (may not exist yet). Its parent directory
+            is used to measure available free space.
+
+        Returns
+        -------
+        int
+            Computed ``max_db_size`` in bytes.
+        """
+        # @@ STEP: Resolve the mount point and measure free space
+        path_obj = Path(db_path).resolve()
+        target_dir = path_obj.parent if path_obj.suffix else path_obj
+        # Walk up to the nearest existing parent (handles non-existent temp paths)
+        while not target_dir.exists():
+            if target_dir.parent == target_dir:
+                # Root reached; fallback to root filesystem
+                break
+            target_dir = target_dir.parent
+        usage = shutil.disk_usage(target_dir)
+        free_bytes = usage.free
+
+        # @@ STEP: Compute candidate based on free space fraction and cap
+        candidate = int(free_bytes * DatabaseConstants.MAX_DB_SIZE_FRACTION_OF_FREE_DISK)
+        capped = min(candidate, DatabaseConstants.MAX_DB_SIZE_ABSOLUTE_CAP_BYTES)
+        at_least_min = max(capped, DatabaseConstants.MIN_MAX_DB_SIZE_BYTES)
+
+        # @@ STEP: Round down to nearest power of two
+        # Ensure >0 before bit_length; MIN ensures this.
+        rounded = 1 << (at_least_min.bit_length() - 1)
+
+        # @@ STEP: Guard against rounding below MIN
+        # When at_least_min is already a power of two, it stays the same
+        if rounded < DatabaseConstants.MIN_MAX_DB_SIZE_BYTES:
+            rounded = DatabaseConstants.MIN_MAX_DB_SIZE_BYTES
+
+        return rounded
 
 
 # ============================================================================
@@ -657,6 +718,22 @@ class RelationshipDirection:
 # ============================================================================
 # KUZU DATA TYPE CONSTANTS
 # ============================================================================
+class DDLMessageConstants:
+    """Message templates used during DDL generation for warnings and info."""
+
+    # Warnings related to relationship DDL generation
+    WARN_UNKNOWN_FROM_NODE: Final[str] = (
+        "Warning: Unknown FROM node referenced in "
+        "relationship DDL: {}"
+    )
+    WARN_UNKNOWN_TO_NODE: Final[str] = (
+        "Warning: Unknown TO node referenced in "
+        "relationship DDL: {}"
+    )
+    WARN_DUPLICATE_REL_PAIR: Final[str] = (
+        "Warning: Duplicate relationship pair (FROM {} TO {}) "
+        "removed from emitted DDL"
+    )
 
 class KuzuDataType(StrEnum):
     """Constants for Kuzu data types."""
@@ -899,6 +976,15 @@ class RelationshipNodeTypeQueryConstants:
     CACHE_KEY_FROM_TO_SINGLE: Final[str] = "from_to_single"
     CACHE_KEY_TO_FROM_SINGLE: Final[str] = "to_from_single"
 
+    # @@ STEP 2.1: Adjacency storage keys for vectorized multi-node queries
+    CACHE_KEY_ADJACENCY_DATA: Final[str] = "adjacency_data"
+    ADJ_FROM_TO: Final[str] = "adj_from_to"
+    ADJ_TO_FROM: Final[str] = "adj_to_from"
+    FROM_LIST: Final[str] = "from_list"
+    TO_LIST: Final[str] = "to_list"
+    FROM_INDEX: Final[str] = "from_index"
+    TO_INDEX: Final[str] = "to_index"
+
     # @@ STEP 3: Define error messages
     NO_RELATIONSHIP_PAIRS: Final[str] = "Relationship class '{}' has no relationship pairs defined"
     INVALID_NODE_TYPE: Final[str] = "Invalid node type '{}': must be a class, not {}"
@@ -940,6 +1026,7 @@ __all__ = [
     "DatabaseConstants",
     "KuzuDefaultFunction",
     "DDLConstants",
+    "DDLMessageConstants",
     "CypherConstants",
     "ModelMetadataConstants",
     "NodeBaseConstants",
