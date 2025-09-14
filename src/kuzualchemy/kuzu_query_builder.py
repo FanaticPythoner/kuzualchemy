@@ -288,22 +288,7 @@ class CypherQueryBuilder:
         rel_name = rel_class.__kuzu_rel_name__
         
         # @@ STEP 1: Get relationship pairs from the model class
-        if not hasattr(rel_class, '__kuzu_relationship_pairs__'):
-            # || S.S.1: Fallback to legacy single-pair attributes for backward compatibility
-            from_node = rel_class.__dict__.get('__kuzu_from_node__')
-            to_node = rel_class.__dict__.get('__kuzu_to_node__')
-            
-            if not from_node or not to_node:
-                raise ValueError(
-                    f"Relationship {rel_name} missing relationship pairs. "
-                    f"Must have __kuzu_relationship_pairs__ or legacy __kuzu_from_node__/__kuzu_to_node__"
-                )
-            
-            # || S.S.2: Create a RelationshipPair from legacy attributes
-            rel_pairs = [RelationshipPair(from_node=from_node, to_node=to_node)]
-        else:
-            # || S.S.3: Use the modern relationship pairs
-            rel_pairs = rel_class.__kuzu_relationship_pairs__
+        rel_pairs = rel_class.__kuzu_relationship_pairs__
         
         if not rel_pairs:
             raise ValueError(f"Relationship {rel_name} has no relationship pairs defined")

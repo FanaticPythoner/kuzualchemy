@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from typing import List
 
-from kuzualchemy.kuzu_orm import kuzu_node, kuzu_relationship, kuzu_field, KuzuDataType, KuzuBaseModel, KuzuRelationshipBase, ArrayTypeSpecification, get_ddl_for_node, get_ddl_for_relationship
+from kuzualchemy.kuzu_orm import kuzu_node, kuzu_relationship, kuzu_field, KuzuDataType, KuzuNodeBase, KuzuRelationshipBase, ArrayTypeSpecification, get_ddl_for_node, get_ddl_for_relationship
 from kuzualchemy.kuzu_query_expressions import AggregateFunction, OrderDirection
 from kuzualchemy.kuzu_session import KuzuSession
 from kuzualchemy.kuzu_query_fields import QueryField
@@ -33,7 +33,7 @@ from kuzualchemy.test_utilities import initialize_schema
 # ============================================================================
 
 @kuzu_node("ProdUser")
-class ProdUser(KuzuBaseModel):
+class ProdUser(KuzuNodeBase):
     """User model for validation."""
     user_id: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
     username: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
@@ -47,7 +47,7 @@ class ProdUser(KuzuBaseModel):
 
 
 @kuzu_node("ProdCompany")
-class ProdCompany(KuzuBaseModel):
+class ProdCompany(KuzuNodeBase):
     """Company model for validation."""
     company_id: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
@@ -59,7 +59,7 @@ class ProdCompany(KuzuBaseModel):
 
 
 @kuzu_node("ProdProject")
-class ProdProject(KuzuBaseModel):
+class ProdProject(KuzuNodeBase):
     """Project model for validation."""
     project_id: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)

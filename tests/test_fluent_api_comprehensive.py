@@ -36,7 +36,7 @@ from kuzualchemy.kuzu_query_expressions import (
     OrderDirection,
 )
 from kuzualchemy import (
-    KuzuBaseModel,
+    KuzuNodeBase,
     KuzuRelationshipBase,
     kuzu_node,
     kuzu_relationship,
@@ -48,7 +48,7 @@ from kuzualchemy.test_utilities import initialize_schema
 
 
 @kuzu_node("TestPerson")
-class TestPerson(KuzuBaseModel):
+class TestPerson(KuzuNodeBase):
     """Person node for testing."""
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -68,7 +68,7 @@ class TestPerson(KuzuBaseModel):
 
 
 @kuzu_node("TestCompany")
-class TestCompany(KuzuBaseModel):
+class TestCompany(KuzuNodeBase):
     """Company node for testing."""
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True, unique=True)
@@ -80,7 +80,7 @@ class TestCompany(KuzuBaseModel):
 
 
 @kuzu_node("TestProject")
-class TestProject(KuzuBaseModel):
+class TestProject(KuzuNodeBase):
     """Project node for testing."""
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)

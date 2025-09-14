@@ -66,7 +66,7 @@ class Device(KuzuBaseModel):
     device_type: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
 
 
-# @@ STEP 2: Test single-pair relationships (backward compatibility)
+# @@ STEP 2: Test single-pair relationships
 class TestSinglePairRelationships:
     """Test relationships with a single FROM-TO pair."""
     

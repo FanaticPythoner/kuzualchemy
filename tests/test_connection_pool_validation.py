@@ -21,7 +21,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from kuzualchemy import (
-    KuzuBaseModel,
+    KuzuNodeBase,
     KuzuRelationshipBase,
     kuzu_node,
     kuzu_relationship,
@@ -34,7 +34,7 @@ from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
 
 
 @kuzu_node("TestUser")
-class TestUser(KuzuBaseModel):
+class TestUser(KuzuNodeBase):
     """Test user model."""
     user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -43,7 +43,7 @@ class TestUser(KuzuBaseModel):
 
 
 @kuzu_node("TestProduct")
-class TestProduct(KuzuBaseModel):
+class TestProduct(KuzuNodeBase):
     """Test product model."""
     product_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)

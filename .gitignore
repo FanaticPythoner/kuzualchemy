@@ -209,3 +209,4 @@ __marimo__/
 pytest_output.txt
 .github/workflows/test.yml.backup
 .actrc
+get_commit_context.sh

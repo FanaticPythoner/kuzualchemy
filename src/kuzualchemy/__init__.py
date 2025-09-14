@@ -244,7 +244,10 @@ from .kuzu_functions import (
 from .kuzu_orm import (
     # Base models
     KuzuBaseModel,
+    KuzuNodeBase,
     KuzuRelationshipBase,
+    # Relationship querying
+    RelationshipNodeTypeQuery,
     # Decorators
     kuzu_node,
     kuzu_relationship,
@@ -253,10 +256,9 @@ from .kuzu_orm import (
     foreign_key,
     # Metadata classes
     KuzuFieldMetadata,
-    ForeignKeyMetadata,
+    ForeignKeyReference,
     CheckConstraintMetadata,
     IndexMetadata,
-    ForeignKeyReference,
     CompoundIndex,
     # Enums
     KuzuDataType,
@@ -269,7 +271,6 @@ from .kuzu_orm import (
     get_all_ddl,
     get_ddl_for_node,
     get_ddl_for_relationship,
-    validate_all_models,
     clear_registry,
     KuzuRegistry,
     # Enhanced registry functions
@@ -329,8 +330,11 @@ __url__ = "https://kuzualchemy.com"  # From pyproject.toml urls
 __all__ = [
     # Base model
     "KuzuBaseModel",
+    "KuzuNodeBase",
     "KuzuRelationshipBase",
     "BaseModel",
+    # Relationship querying
+    "RelationshipNodeTypeQuery",
     # Main Decorators
     "kuzu_node",
     "kuzu_relationship",
@@ -341,9 +345,8 @@ __all__ = [
     "RelationshipDirection",
     "RelationshipMultiplicity",
     "CascadeAction",
-    "ForeignKeyReference",
     "CompoundIndex",
-    "ForeignKeyMetadata",
+    "ForeignKeyReference",
     "CheckConstraintMetadata",
     "IndexMetadata",
     "KuzuFieldMetadata",
@@ -384,7 +387,6 @@ __all__ = [
     "get_all_ddl",
     "get_ddl_for_node",
     "get_ddl_for_relationship",
-    "validate_all_models",
     "clear_registry",
     "KuzuRegistry",
     # Enhanced registry functions

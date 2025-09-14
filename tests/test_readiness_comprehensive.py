@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
 from kuzualchemy import (
-    KuzuBaseModel,
+    KuzuNodeBase,
     KuzuRelationshipBase,
     kuzu_node,
     kuzu_relationship,
@@ -50,7 +50,7 @@ from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
 # ============================================================================
 
 @kuzu_node("SocialUser")
-class SocialUser(KuzuBaseModel):
+class SocialUser(KuzuNodeBase):
     """social network user model."""
     user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -67,7 +67,7 @@ class SocialUser(KuzuBaseModel):
 
 
 @kuzu_node("SocialPost")
-class SocialPost(KuzuBaseModel):
+class SocialPost(KuzuNodeBase):
     """social media post model."""
     post_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     content: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -80,7 +80,7 @@ class SocialPost(KuzuBaseModel):
 
 
 @kuzu_node("SocialComment")
-class SocialComment(KuzuBaseModel):
+class SocialComment(KuzuNodeBase):
     """comment model."""
     comment_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     content: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -122,7 +122,7 @@ class Commented(KuzuRelationshipBase):
 # ============================================================================
 
 @kuzu_node("EcomCustomer")
-class EcomCustomer(KuzuBaseModel):
+class EcomCustomer(KuzuNodeBase):
     """e-commerce customer model."""
     customer_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     email: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -137,7 +137,7 @@ class EcomCustomer(KuzuBaseModel):
 
 
 @kuzu_node("EcomProduct")
-class EcomProduct(KuzuBaseModel):
+class EcomProduct(KuzuNodeBase):
     """product model."""
     product_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -154,7 +154,7 @@ class EcomProduct(KuzuBaseModel):
 
 
 @kuzu_node("EcomOrder")
-class EcomOrder(KuzuBaseModel):
+class EcomOrder(KuzuNodeBase):
     """order model."""
     order_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     order_number: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -311,11 +311,8 @@ class TestReadinessComprehensive:
 
         Validates data integrity, query performance, and relationship consistency.
         """
-        # CRITICAL: Registry cleanup to prevent access violations
-        from kuzualchemy import clear_registry
         clear_registry()
-        import gc
-        gc.collect()
+
         session = KuzuSession(db_path=str(self.db_path))
 
         # Generate DDL for social network models
@@ -574,9 +571,7 @@ class TestReadinessComprehensive:
 
         Validates transactional integrity, complex aggregations, and business logic.
         """
-        # CRITICAL: Registry cleanup to prevent access violations
-        from kuzualchemy import clear_registry
-        clear_registry()  # Already includes gc.collect() internally
+        clear_registry()
         session = KuzuSession(db_path=str(self.db_path))
 
         # Generate DDL for e-commerce models
@@ -903,15 +898,13 @@ class TestReadinessComprehensive:
 
         Precision in performance measurement and validation.
         """
-        # CRITICAL: Registry cleanup to prevent access violations
-        from kuzualchemy import clear_registry
-        clear_registry()  # Already includes gc.collect() internally
+        clear_registry()
 
         session = KuzuSession(db_path=str(self.db_path))
 
         # Use simplified models for performance testing
         @kuzu_node("PerfUser")
-        class PerfUser(KuzuBaseModel):
+        class PerfUser(KuzuNodeBase):
             user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             email: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -919,7 +912,7 @@ class TestReadinessComprehensive:
             created_at: datetime = kuzu_field(kuzu_type=KuzuDataType.TIMESTAMP)
 
         @kuzu_node("PerfItem")
-        class PerfItem(KuzuBaseModel):
+        class PerfItem(KuzuNodeBase):
             item_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             value: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, not_null=True)
@@ -1108,15 +1101,13 @@ class TestReadinessComprehensive:
 
         Validation of consistency and performance.
         """
-        # CRITICAL: Registry cleanup to prevent access violations
-        from kuzualchemy import clear_registry
-        clear_registry()  # Already includes gc.collect() internally
+        clear_registry()
 
         session = KuzuSession(db_path=str(self.db_path))
 
         # Simple model for concurrency testing
         @kuzu_node("ConcUser")
-        class ConcUser(KuzuBaseModel):
+        class ConcUser(KuzuNodeBase):
             user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             counter: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
@@ -1327,21 +1318,20 @@ class TestReadinessComprehensive:
 
         Validation of ACID properties.
         """
-        # Clear registry to prevent memory corruption
-        clear_registry()  # Already includes gc.collect() internally
+        clear_registry()
 
         session = KuzuSession(db_path=str(self.db_path))
 
         # Models for transaction testing
         @kuzu_node("TxnUser")
-        class TxnUser(KuzuBaseModel):
+        class TxnUser(KuzuNodeBase):
             user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             balance: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
             status: str = kuzu_field(kuzu_type=KuzuDataType.STRING, default="active")
 
         @kuzu_node("TxnAccount")
-        class TxnAccount(KuzuBaseModel):
+        class TxnAccount(KuzuNodeBase):
             account_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             account_number: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             balance: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
@@ -1533,14 +1523,13 @@ class TestReadinessComprehensive:
 
         Validation of error boundaries and recovery.
         """
-        # Clear registry to prevent memory corruption
-        clear_registry()  # Already includes gc.collect() internally
+        clear_registry()
 
         session = KuzuSession(db_path=str(self.db_path))
 
         # Models for edge case testing
         @kuzu_node("EdgeUser")
-        class EdgeUser(KuzuBaseModel):
+        class EdgeUser(KuzuNodeBase):
             user_id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
             username: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             bio: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)

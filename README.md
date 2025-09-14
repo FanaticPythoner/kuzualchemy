@@ -639,7 +639,7 @@ class User(KuzuBaseModel):
         pass
 
     @classmethod
-    def get_foreign_key_fields(cls) -> Dict[str, ForeignKeyMetadata]:
+    def get_foreign_key_fields(cls) -> Dict[str, ForeignKeyReference]:
         """Get foreign key fields"""
         pass
 ```
@@ -695,7 +695,7 @@ field = kuzu_field(
     check_constraint="LENGTH(field_name) > 0",
 
     # Foreign keys
-    foreign_key=ForeignKeyMetadata(
+    foreign_key=ForeignKeyReference(
         target_model=TargetModel,
         target_field="id",
         on_delete=CascadeAction.CASCADE,
@@ -1010,7 +1010,7 @@ class Account(BaseModel):  # Automatic enum conversion
 ### Foreign Key Support
 
 ```python
-from kuzualchemy import ForeignKeyMetadata, CascadeAction
+from kuzualchemy import ForeignKeyReference, CascadeAction
 
 @kuzu_node("Post")
 class Post(KuzuBaseModel):
@@ -1018,7 +1018,7 @@ class Post(KuzuBaseModel):
     title: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
     author_id: int = kuzu_field(
         kuzu_type=KuzuDataType.INT64,
-        foreign_key=ForeignKeyMetadata(
+        foreign_key=ForeignKeyReference(
             target_model=User,
             target_field="id",
             on_delete=CascadeAction.CASCADE
@@ -1070,7 +1070,7 @@ Base class for all node models with built-in ORM functionality.
 - `get_kuzu_metadata(field_name: str) -> KuzuFieldMetadata`: Get field metadata
 - `get_all_kuzu_metadata() -> Dict[str, KuzuFieldMetadata]`: Get all field metadata
 - `get_primary_key_fields() -> List[str]`: Get primary key field names
-- `get_foreign_key_fields() -> Dict[str, ForeignKeyMetadata]`: Get foreign key fields
+- `get_foreign_key_fields() -> Dict[str, ForeignKeyReference]`: Get foreign key fields
 
 #### KuzuRelationshipBase
 Base class for relationship models.
@@ -1123,7 +1123,7 @@ kuzu_field(
     default: Any = ...,                                    # Default value
     kuzu_type: Union[KuzuDataType, str, ArrayTypeSpecification], # Kuzu data type
     primary_key: bool = False,                            # Primary key flag
-    foreign_key: ForeignKeyMetadata = None,               # Foreign key metadata
+    foreign_key: ForeignKeyReference = None,               # Foreign key metadata
     unique: bool = False,                                 # Unique constraint
     not_null: bool = False,                              # NOT NULL constraint
     index: bool = False,                                 # Index flag

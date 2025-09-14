@@ -21,7 +21,7 @@ from typing import Optional
 from pydantic import ValidationError
 
 from kuzualchemy import (
-    KuzuBaseModel,
+    KuzuNodeBase,
     KuzuRelationshipBase,
     kuzu_node,
     kuzu_relationship,
@@ -41,7 +41,7 @@ class TestAutoIncrementFields:
         """Set up test models with auto-increment fields."""
         
         @kuzu_node("AutoUser")
-        class AutoUser(KuzuBaseModel):
+        class AutoUser(KuzuNodeBase):
             """User model with auto-increment primary key."""
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
@@ -49,14 +49,14 @@ class TestAutoIncrementFields:
             age: int = kuzu_field(kuzu_type=KuzuDataType.INT32, default=0)
 
         @kuzu_node("AutoProduct")
-        class AutoProduct(KuzuBaseModel):
+        class AutoProduct(KuzuNodeBase):
             """Product model with auto-increment field (not primary key)."""
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
             product_id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, auto_increment=True)
             price: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
 
         @kuzu_node("AutoOrder")
-        class AutoOrder(KuzuBaseModel):
+        class AutoOrder(KuzuNodeBase):
             """Order model with multiple auto-increment fields."""
             order_id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             tracking_number: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, auto_increment=True)
@@ -78,14 +78,14 @@ class TestAutoIncrementFields:
             amount: float = kuzu_field(kuzu_type=KuzuDataType.DOUBLE, default=0.0)
 
         @kuzu_node("AutoUUIDUser")
-        class AutoUUIDUser(KuzuBaseModel):
+        class AutoUUIDUser(KuzuNodeBase):
             """User model with UUID auto-increment primary key."""
             id: Optional[uuid.UUID] = kuzu_field(kuzu_type=KuzuDataType.UUID, primary_key=True, auto_increment=True)
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
             email: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, unique=True, default=None)
 
         @kuzu_node("AutoUUIDProduct")
-        class AutoUUIDProduct(KuzuBaseModel):
+        class AutoUUIDProduct(KuzuNodeBase):
             """Product model with UUID auto-increment field (not primary key)."""
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True)
             product_uuid: Optional[uuid.UUID] = kuzu_field(kuzu_type=KuzuDataType.UUID, auto_increment=True)
@@ -631,17 +631,17 @@ class TestAutoIncrementFields:
 
         # Create complex node hierarchy
         @kuzu_node("BaseEntity")
-        class BaseEntity(KuzuBaseModel):
+        class BaseEntity(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
         @kuzu_node("SpecializedEntity")
-        class SpecializedEntity(KuzuBaseModel):
+        class SpecializedEntity(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             special_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
         @kuzu_node("ComplexEntity")
-        class ComplexEntity(KuzuBaseModel):
+        class ComplexEntity(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             complex_data: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
@@ -726,12 +726,12 @@ class TestAutoIncrementFields:
 
         # Create multiple node types with overlapping primary key ranges
         @kuzu_node("TypeA")
-        class TypeA(KuzuBaseModel):
+        class TypeA(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             type_a_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
         @kuzu_node("TypeB")
-        class TypeB(KuzuBaseModel):
+        class TypeB(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             type_b_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
@@ -780,17 +780,17 @@ class TestAutoIncrementFields:
 
         # Create a relationship with intentionally problematic pair definition
         @kuzu_node("NodeX")
-        class NodeX(KuzuBaseModel):
+        class NodeX(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             x_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
         @kuzu_node("NodeY")
-        class NodeY(KuzuBaseModel):
+        class NodeY(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             y_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
         @kuzu_node("NodeZ")
-        class NodeZ(KuzuBaseModel):
+        class NodeZ(KuzuNodeBase):
             id: Optional[int] = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True, auto_increment=True)
             z_field: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 
@@ -1092,7 +1092,7 @@ class TestAutoIncrementFields:
         # Should raise error for unsupported auto-increment types
         with pytest.raises(ValueError, match="Auto-increment is only supported for INT64/SERIAL and UUID fields"):
             @kuzu_node("InvalidAutoIncrement")
-            class InvalidAutoIncrement(KuzuBaseModel):
+            class InvalidAutoIncrement(KuzuNodeBase):
                 id: Optional[str] = kuzu_field(kuzu_type=KuzuDataType.STRING, primary_key=True, auto_increment=True)
                 name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
 

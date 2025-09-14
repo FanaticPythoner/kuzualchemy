@@ -282,6 +282,25 @@ class ModelMetadataConstants:
 
 
 # ============================================================================
+# NODE BASE CLASS CONSTANTS
+# ============================================================================
+
+class NodeBaseConstants:
+    """Constants for the KuzuNodeBase class and node-specific functionality."""
+
+    # @@ STEP 1: Define node base class identification
+    IS_KUZU_NODE_BASE: Final[str] = "__is_kuzu_node_base__"
+
+    # @@ STEP 2: Define node-specific error messages
+    NOT_A_NODE_INSTANCE: Final[str] = "Expected a KuzuNodeBase instance or primary key value, got: {}"
+    INVALID_NODE_REFERENCE: Final[str] = "Invalid node reference: must be a KuzuNodeBase instance or a valid primary key value"
+
+    # @@ STEP 3: Define node validation messages
+    NODE_MISSING_DECORATOR: Final[str] = "Node class '{}' must be decorated with @kuzu_node"
+    NODE_MISSING_PRIMARY_KEY: Final[str] = "Node class '{}' must have at least one primary key field"
+
+
+# ============================================================================
 # SESSION CONSTANTS
 # ============================================================================
 
@@ -398,6 +417,9 @@ class ErrorMessages:
     VALIDATION_FAILED: Final[str] = "Validation failed: {errors}"
     TYPE_VALIDATION_FAILED: Final[str] = "Type validation failed for {field}: expected {expected}, got {actual}"
     CONSTRAINT_VIOLATION: Final[str] = "Constraint violation: {constraint}"
+
+    # @@ STEP 8: Define foreign key validation errors
+    FOREIGN_KEY_VALIDATION_FAILED: Final[str] = "Foreign key validation failed for {model_name}: {errors}"
 
     # @@ STEP 8: Define generic errors
     INVALID_ARGUMENT: Final[str] = "Invalid argument: {argument}"
@@ -861,6 +883,56 @@ class ValidationMessageConstants:
 
 
 # ============================================================================
+# RELATIONSHIP NODE TYPE QUERY CONSTANTS
+# ============================================================================
+
+class RelationshipNodeTypeQueryConstants:
+    """Constants for relationship node type querying functionality."""
+
+    # @@ STEP 1: Define query type identifiers
+    QUERY_TYPE_FROM: Final[str] = "from"
+    QUERY_TYPE_TO: Final[str] = "to"
+
+    # @@ STEP 2: Define cache keys
+    CACHE_KEY_FROM_TO_MAP: Final[str] = "from_to_map"
+    CACHE_KEY_TO_FROM_MAP: Final[str] = "to_from_map"
+    CACHE_KEY_FROM_TO_SINGLE: Final[str] = "from_to_single"
+    CACHE_KEY_TO_FROM_SINGLE: Final[str] = "to_from_single"
+
+    # @@ STEP 3: Define error messages
+    NO_RELATIONSHIP_PAIRS: Final[str] = "Relationship class '{}' has no relationship pairs defined"
+    INVALID_NODE_TYPE: Final[str] = "Invalid node type '{}': must be a class, not {}"
+    ABSTRACT_RELATIONSHIP_QUERY: Final[str] = (
+        "Cannot query node types on abstract relationship class '{}'"
+    )
+
+
+# ============================================================================
+# FOREIGN KEY VALIDATION CONSTANTS
+# ============================================================================
+
+class ForeignKeyValidationConstants:
+    """Constants for foreign key validation system."""
+
+    # @@ STEP 1: Define cache configuration
+    CACHE_MAX_SIZE: Final[int] = 1000
+    CACHE_KEY_SEPARATOR: Final[str] = ":"
+
+
+# ============================================================================
+# RELATIONSHIP NODE TYPE QUERY ERROR CONSTANTS
+# ============================================================================
+
+class RelationshipNodeTypeQueryErrorConstants:
+    """Error constants for relationship node type queries."""
+
+    ABSTRACT_RELATIONSHIP_QUERY: Final[str] = (
+        "Cannot query node types on abstract relationship class '{}'"
+    )
+    INVALID_NODE_TYPE: Final[str] = "Invalid node type '{}': must be a class, not {}"
+
+
+# ============================================================================
 # EXPORT ALL CONSTANTS
 # ============================================================================
 
@@ -870,6 +942,7 @@ __all__ = [
     "DDLConstants",
     "CypherConstants",
     "ModelMetadataConstants",
+    "NodeBaseConstants",
     "SessionConstants",
     "QueryConstants",
     "ErrorMessages",
@@ -889,4 +962,7 @@ __all__ = [
     "JoinPatternConstants",
     "ValidationMessageConstants",
     "QueryReturnAliasConstants",
+    "RelationshipNodeTypeQueryConstants",
+    "ForeignKeyValidationConstants",
+    "RelationshipNodeTypeQueryErrorConstants",
 ]
