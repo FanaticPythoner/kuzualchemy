@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kuzualchemy"
-version = "0.3.16"
+version = "0.3.17"
 description = "SQLAlchemy-like ORM for Kuzu graph database"
 readme = "README.md"
 license = { file = "LICENSE" }
