@@ -862,13 +862,6 @@ class KuzuSession:
                 return None
             return pa.list_(element_type)
 
-        if isinstance(kuzu_type, str):
-            try:
-                canonical = KuzuDataType[kuzu_type.upper()]
-            except KeyError:
-                return None
-            return self._map_kuzu_type_to_arrow(canonical)
-
         if isinstance(kuzu_type, KuzuDataType):
             if kuzu_type == KuzuDataType.INT8:
                 return pa.int8()
@@ -910,6 +903,13 @@ class KuzuSession:
                 return pa.bool_()
             if kuzu_type == KuzuDataType.BLOB:
                 return pa.binary()
+
+        if isinstance(kuzu_type, str):
+            try:
+                canonical = KuzuDataType[kuzu_type.upper()]
+            except KeyError:
+                return None
+            return self._map_kuzu_type_to_arrow(canonical)
 
         return None
 
