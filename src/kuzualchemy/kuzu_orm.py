@@ -3101,11 +3101,11 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
 # Registry accessors and utilities
 # -----------------------------------------------------------------------------
 
-def get_registered_nodes() -> Dict[str, Type[Any]]:
+def get_registered_nodes() -> Dict[str, Type[KuzuNodeBase]]:
     return _kuzu_registry.nodes.copy()
 
 
-def get_registered_relationships() -> Dict[str, Type[Any]]:
+def get_registered_relationships() -> Dict[str, Type[KuzuRelationshipBase]]:
     return _kuzu_registry.relationships.copy()
 
 
