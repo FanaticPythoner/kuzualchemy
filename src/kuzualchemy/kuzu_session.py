@@ -627,18 +627,8 @@ class KuzuSession:
 
         # Process each model type separately
         for model_class, model_instances in model_groups.items():
-            # Check if this is a multi-pair relationship
-            if (hasattr(model_class, '__kuzu_rel_name__') or
-                hasattr(model_class, '__kuzu_relationship_name__')):
-                # Check if it has multiple pairs
-                pairs = getattr(model_class, '__kuzu_relationship_pairs__', [])
-                if len(pairs) > 1:
-                    # Multi-pair relationships cannot use bulk insert
-                    # Fall back to individual inserts
-                    for instance in model_instances:
-                        self._insert_instance(instance)
-                    continue
-
+            # Always use bulk insert; multi-pair relationships are handled via
+            # pair-qualified COPY in _process_batch_with_pyarrow().
             self._bulk_insert_model_type(model_class, model_instances, effective_batch_size)
 
     def _bulk_insert_model_type(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
@@ -707,6 +697,157 @@ class KuzuSession:
         is_relationship = issubclass(model_class, KuzuRelationshipBase)
 
         if is_relationship:
+            # Resolve relationship pairs
+            pairs = getattr(model_class, '__kuzu_relationship_pairs__', [])
+
+            # If multi-pair, group instances by (FROM label, TO label) and COPY per pair
+            if pairs and len(pairs) > 1:
+                # Determine property fields (exclude internal fields)
+                all_field_names = list(model_class.model_fields.keys())
+                internal_fields = {
+                    DDLConstants.REL_FROM_NODE_FIELD,
+                    DDLConstants.REL_TO_NODE_FIELD,
+                    DDLConstants.REL_FROM_NODE_PK_FIELD,
+                    DDLConstants.REL_TO_NODE_PK_FIELD,
+                }
+                field_names = [f for f in all_field_names if f not in internal_fields]
+
+                # Cached metadata for type conversions
+                auto_increment_metadata = model_class.get_auto_increment_metadata()
+
+                # Helper to resolve node label from node instance/reference
+                def _resolve_node_label(node_obj: Any) -> str:
+                    # Prefer explicit kuzu node name on class or instance
+                    if hasattr(node_obj, '__kuzu_node_name__'):
+                        return getattr(node_obj, '__kuzu_node_name__')
+                    cls = getattr(node_obj, '__class__', None)
+                    if cls is not None and hasattr(cls, '__kuzu_node_name__'):
+                        return getattr(cls, '__kuzu_node_name__')
+                    # Fallback to class name if available; otherwise this is an error
+                    if cls is not None and hasattr(cls, '__name__'):
+                        return cls.__name__
+                    raise ValueError(
+                        "Multi-pair relationship bulk insert requires concrete node instances for from_node/to_node to resolve labels."
+                    )
+
+                # Group by (from_label, to_label)
+                grouped: Dict[tuple[str, str], List[Any]] = {}
+                for inst in instances:
+                    try:
+                        from_label = _resolve_node_label(inst.from_node)
+                        to_label = _resolve_node_label(inst.to_node)
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to resolve endpoint labels for {model_class.__name__} instance during bulk insert: {e}"
+                        ) from e
+                    grouped.setdefault((from_label, to_label), []).append(inst)
+
+                # Determine table name for relationship
+                if hasattr(model_class, '__kuzu_rel_name__'):
+                    table_name = model_class.__kuzu_rel_name__
+                elif hasattr(model_class, '__kuzu_relationship_name__'):
+                    table_name = model_class.__kuzu_relationship_name__
+                else:
+                    raise ValueError(
+                        f"Model {model_class.__name__} is not a registered relationship"
+                    )
+
+                # Execute COPY per (FROM, TO) group
+                for (from_label, to_label), group_instances in grouped.items():
+                    # Build per-group data dict and schema
+                    g_data: Dict[str, List[Any]] = {
+                        'from_node_pk': [],
+                        'to_node_pk': [],
+                    }
+                    g_schema: List[pa.Field] = [
+                        pa.field('from_node_pk', pa.string()),
+                        pa.field('to_node_pk', pa.string()),
+                    ]
+
+                    # Initialize property columns
+                    for fname in field_names:
+                        g_data[fname] = []
+                        fmeta = auto_increment_metadata.get(fname)
+                        if fmeta and fmeta.kuzu_type == KuzuDataType.UUID:
+                            g_schema.append(pa.field(fname, pa.string()))
+
+                    # Fill rows
+                    for inst in group_instances:
+                        from_pk = inst.from_node_pk
+                        to_pk = inst.to_node_pk
+                        g_data['from_node_pk'].append(str(from_pk) if from_pk is not None else None)
+                        g_data['to_node_pk'].append(str(to_pk) if to_pk is not None else None)
+
+                        inst_dict = inst.model_dump()
+                        for fname in field_names:
+                            val = inst_dict.get(fname)
+                            fmeta = auto_increment_metadata.get(fname)
+                            if fmeta and fmeta.kuzu_type == KuzuDataType.UUID and isinstance(val, uuid.UUID):
+                                val = str(val)
+                            elif isinstance(val, uuid.UUID):
+                                val = str(val)
+                            elif hasattr(val, 'isoformat'):
+                                val = val.isoformat()
+                            elif (hasattr(val, '__class__') and 'KuzuDefaultFunction' in str(val.__class__)):
+                                val = self._generate_default_function_value(val)
+                            g_data[fname].append(val)
+
+                    # Build PyArrow table
+                    arrays = []
+                    names = []
+                    schema_names = {f.name for f in g_schema}
+
+                    # from_node_pk/to_node_pk remain strings
+                    for f in g_schema:
+                        arrays.append(pa.array(g_data[f.name], type=f.type))
+                        names.append(f.name)
+
+                    # For property fields without explicit schema, coerce to string arrays.
+                    # This avoids the prepared-statement INT128 binder path for numeric types
+                    # while keeping the COPY in-memory via $dataframe.
+                    for fname in field_names:
+                        if fname not in schema_names:
+                            col = g_data[fname]
+                            conv: list[str | list[str] | None] = []
+                            for v in col:
+                                if isinstance(v, uuid.UUID):
+                                    conv.append(str(v))
+                                elif isinstance(v, list) and v and isinstance(v[0], uuid.UUID):
+                                    conv.append([str(u) for u in v])
+                                else:
+                                    # Coerce numerics, enums, bools to strings; leave None as-is
+                                    if v is None:
+                                        conv.append(None)
+                                    else:
+                                        try:
+                                            # Enum -> underlying value, then to str
+                                            from enum import Enum as _E
+                                            if isinstance(v, _E):
+                                                conv.append(str(getattr(v, 'value', v)))
+                                            else:
+                                                conv.append(str(v))
+                                        except Exception:
+                                            conv.append(str(v))
+                            arrays.append(pa.array(conv, type=pa.string()))
+                            names.append(fname)
+
+                    g_df = pa.table(arrays, names=names)
+
+                    try:
+                        self._execute_with_connection_reuse(
+                            f"COPY {table_name} FROM $dataframe (FROM='{from_label}', TO='{to_label}')",
+                            {"dataframe": g_df},
+                        )
+                    finally:
+                        try:
+                            del g_df
+                        except Exception:
+                            pass
+                        gc.collect()
+
+                # Multi-pair relationships handled; no node auto-increment retrieval
+                return
+
             # Handle relationships
             all_field_names = list(model_class.model_fields.keys())
             internal_fields = {
