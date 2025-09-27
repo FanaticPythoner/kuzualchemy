@@ -1541,6 +1541,34 @@ class KuzuSession:
 
                 properties[field_name] = converted_value
 
+        # @@ STEP 2.5: Normalize property values for prepared statement binding
+        # Convert Enums to their underlying values, UUIDs to strings, and lists of UUIDs to list[str]
+        all_meta = model_class.get_all_kuzu_metadata()
+
+        normalized_props: Dict[str, Any] = {}
+        for k, v in properties.items():
+            meta = all_meta.get(k)
+            # Enum -> underlying value
+            if isinstance(v, Enum):
+                v = getattr(v, 'value', v)
+            # UUID -> string
+            if isinstance(v, uuid.UUID):
+                v = str(v)
+            # datetime-like -> isoformat
+            if hasattr(v, 'isoformat'):
+                v = v.isoformat()
+            # Handle ARRAY(UUID) -> list[str]
+            if meta is not None:
+                from .kuzu_orm import ArrayTypeSpecification, KuzuDataType as _KDT
+                ktype = meta.kuzu_type
+                if isinstance(ktype, ArrayTypeSpecification):
+                    elem_t = ktype.element_type
+                    is_uuid_elem = (elem_t == _KDT.UUID) or (isinstance(elem_t, str) and str(elem_t).upper() == 'UUID')
+                    if is_uuid_elem and isinstance(v, list):
+                        v = [str(x) if isinstance(x, uuid.UUID) else x for x in v]
+            normalized_props[k] = v
+        properties = normalized_props
+
         if not properties:
             query = f"CREATE (:{node_name})"
             self._execute_with_connection_reuse(query)
