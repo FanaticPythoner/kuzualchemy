@@ -263,6 +263,9 @@ class KuzuSession:
             autocommit: Whether to auto-commit after operations
             expire_on_commit: Whether to expire objects after commit
         """
+        # Optional performance knob: force GC after batch operations (defaults to False)
+        local_force_gc = bool(kwargs.pop("force_gc", False))
+
         if connection:
             self._conn = connection
             self._owns_connection = False
@@ -278,6 +281,8 @@ class KuzuSession:
         self.bulk_batch_size = bulk_batch_size
         self._dirty = set()
         self._new = set()
+        self._force_gc = local_force_gc
+
         self._deleted = set()
         self._flushing = False
 
@@ -470,7 +475,8 @@ class KuzuSession:
             self._connection_operation_count = 0
             for attempt in range(1, max_attempts + 1):
                 time.sleep(backoff_s)
-                gc.collect()
+                if self._force_gc:
+                    gc.collect()
                 try:
                     return _do_exec(use_reused=False)
                 except (ConnectionError, OSError, ValueError, RuntimeError) as e2:
@@ -679,7 +685,8 @@ class KuzuSession:
                     raise
                 cur_batch = max(1, cur_batch // 2)
                 time.sleep(0.02)
-                gc.collect()
+                if self._force_gc:
+                    gc.collect()
                 # Do not advance 'start'; retry with smaller batch
 
     def _process_batch_with_pyarrow(self, model_class: Type[Any], instances: List[Any]) -> None:
@@ -771,26 +778,52 @@ class KuzuSession:
                         if fmeta and fmeta.kuzu_type == KuzuDataType.UUID:
                             g_schema.append(pa.field(fname, pa.string()))
 
-                    # Fill rows
-                    for inst in group_instances:
-                        from_pk = inst.from_node_pk
-                        to_pk = inst.to_node_pk
-                        g_data['from_node_pk'].append(str(from_pk) if from_pk is not None else None)
-                        g_data['to_node_pk'].append(str(to_pk) if to_pk is not None else None)
+                    # Fill columns (column-first to minimize Python overhead)
+                    # Primary keys as strings for Arrow string schema
+                    g_data['from_node_pk'] = [
+                        (str(inst.from_node_pk) if inst.from_node_pk is not None else None)
+                        for inst in group_instances
+                    ]
+                    g_data['to_node_pk'] = [
+                        (str(inst.to_node_pk) if inst.to_node_pk is not None else None)
+                        for inst in group_instances
+                    ]
 
-                        inst_dict = inst.model_dump()
-                        for fname in field_names:
-                            val = inst_dict.get(fname)
-                            fmeta = auto_increment_metadata.get(fname)
-                            if fmeta and fmeta.kuzu_type == KuzuDataType.UUID and isinstance(val, uuid.UUID):
-                                val = str(val)
-                            elif isinstance(val, uuid.UUID):
-                                val = str(val)
-                            elif hasattr(val, 'isoformat'):
-                                val = val.isoformat()
-                            elif (hasattr(val, '__class__') and 'KuzuDefaultFunction' in str(val.__class__)):
-                                val = self._generate_default_function_value(val)
-                            g_data[fname].append(val)
+                    # Precompute simple per-field converters based on metadata
+                    def _conv_uuid(v: Any) -> Any:
+                        return None if v is None else (str(v) if isinstance(v, uuid.UUID) else v)
+
+                    def _conv_default(v: Any) -> Any:
+                        # Datetime-like -> ISO; Enums -> value; UUID -> str; list-of-UUID/Enums -> mapped; else pass-through
+                        if v is None:
+                            return None
+                        if isinstance(v, uuid.UUID):
+                            return str(v)
+                        if isinstance(v, list) and v:
+                            first = v[0]
+                            if isinstance(first, uuid.UUID):
+                                return [str(u) for u in v]
+                            from enum import Enum as _E
+                            if isinstance(first, _E):
+                                return [getattr(u, 'value', u) for u in v]
+                        from enum import Enum as _E
+                        if isinstance(v, _E):
+                            return getattr(v, 'value', v)
+                        if hasattr(v, 'isoformat'):
+                            try:
+                                return v.isoformat()
+                            except Exception:
+                                return str(v)
+                        return v
+
+                    for fname in field_names:
+                        fmeta = auto_increment_metadata.get(fname)
+                        vals = [getattr(inst, fname, None) for inst in group_instances]
+                        if fmeta and fmeta.kuzu_type == KuzuDataType.UUID:
+                            g_data[fname] = [_conv_uuid(v) for v in vals]
+                        else:
+                            # Preserve semantics: coerce most values toward strings later
+                            g_data[fname] = [_conv_default(v) for v in vals]
 
                     # Build PyArrow table
                     arrays = []
@@ -802,33 +835,11 @@ class KuzuSession:
                         arrays.append(pa.array(g_data[f.name], type=f.type))
                         names.append(f.name)
 
-                    # For property fields without explicit schema, coerce to string arrays.
-                    # This avoids the prepared-statement INT128 binder path for numeric types
-                    # while keeping the COPY in-memory via $dataframe.
+                    # For property fields without explicit schema, let Arrow infer native types
+                    # (we already normalized UUIDs/enums/datetimes in g_data).
                     for fname in field_names:
                         if fname not in schema_names:
-                            col = g_data[fname]
-                            conv: list[str | list[str] | None] = []
-                            for v in col:
-                                if isinstance(v, uuid.UUID):
-                                    conv.append(str(v))
-                                elif isinstance(v, list) and v and isinstance(v[0], uuid.UUID):
-                                    conv.append([str(u) for u in v])
-                                else:
-                                    # Coerce numerics, enums, bools to strings; leave None as-is
-                                    if v is None:
-                                        conv.append(None)
-                                    else:
-                                        try:
-                                            # Enum -> underlying value, then to str
-                                            from enum import Enum as _E
-                                            if isinstance(v, _E):
-                                                conv.append(str(getattr(v, 'value', v)))
-                                            else:
-                                                conv.append(str(v))
-                                        except Exception:
-                                            conv.append(str(v))
-                            arrays.append(pa.array(conv, type=pa.string()))
+                            arrays.append(pa.array(g_data[fname]))
                             names.append(fname)
 
                     g_df = pa.table(arrays, names=names)
@@ -843,7 +854,8 @@ class KuzuSession:
                             del g_df
                         except Exception:
                             pass
-                        gc.collect()
+                        if self._force_gc:
+                            gc.collect()
 
                 # Multi-pair relationships handled; no node auto-increment retrieval
                 return
@@ -852,7 +864,7 @@ class KuzuSession:
             all_field_names = list(model_class.model_fields.keys())
             internal_fields = {
                 DDLConstants.REL_FROM_NODE_FIELD,
-                DDLConstants.REL_TO_NODE_FIELD, 
+                DDLConstants.REL_TO_NODE_FIELD,
                 DDLConstants.REL_FROM_NODE_PK_FIELD,
                 DDLConstants.REL_TO_NODE_PK_FIELD,
             }
@@ -870,48 +882,63 @@ class KuzuSession:
             auto_increment_metadata = model_class.get_auto_increment_metadata()
             for field_name in field_names:
                 data_dict[field_name] = []
-                
+
                 # Determine PyArrow type for this field
                 field_meta = auto_increment_metadata.get(field_name)
                 if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
                     # Use string type for UUID fields to avoid BLOB conversion issues
                     schema_fields.append(pa.field(field_name, pa.string()))
 
-            # Extract data from relationship instances
-            for instance in instances:
-                # || Convert primary keys to strings to match pa.string() schema
-                from_pk = instance.from_node_pk
-                to_pk = instance.to_node_pk
+            # Extract columns from relationship instances (column-first for speed)
+            data_dict['from_node_pk'].extend([
+                (str(inst.from_node_pk) if inst.from_node_pk is not None else None)
+                for inst in instances
+            ])
+            data_dict['to_node_pk'].extend([
+                (str(inst.to_node_pk) if inst.to_node_pk is not None else None)
+                for inst in instances
+            ])
 
-                # || Ensure primary keys are strings for PyArrow string schema
-                data_dict['from_node_pk'].append(str(from_pk) if from_pk is not None else None)
-                data_dict['to_node_pk'].append(str(to_pk) if to_pk is not None else None)
-
-                instance_data = instance.model_dump()
-                for field_name in field_names:
-                    value = instance_data.get(field_name)
-                    
-                    # Convert based on field type
-                    field_meta = auto_increment_metadata.get(field_name)
-                    if field_meta and field_meta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
-                        # Convert UUID objects to strings for KuzuDB UUID parsing
-                        value = str(value)
-                    elif hasattr(value, 'isoformat'):
-                        value = value.isoformat()
-                    elif (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
-                        value = self._generate_default_function_value(value)
-                    
-                    data_dict[field_name].append(value)
+            from enum import Enum as _E
+            for field_name in field_names:
+                fmeta = auto_increment_metadata.get(field_name)
+                col = []
+                append = col.append
+                for inst in instances:
+                    value = getattr(inst, field_name, None)
+                    if value is None:
+                        append(None)
+                        continue
+                    if fmeta and fmeta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
+                        append(str(value))
+                        continue
+                    if isinstance(value, uuid.UUID):
+                        append(str(value))
+                        continue
+                    if isinstance(value, _E):
+                        append(getattr(value, 'value', value))
+                        continue
+                    if hasattr(value, 'isoformat'):
+                        try:
+                            append(value.isoformat())
+                        except Exception:
+                            append(str(value))
+                        continue
+                    if (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
+                        append(self._generate_default_function_value(value))
+                        continue
+                    append(value)
+                data_dict[field_name].extend(col)
 
         else:
             # Handle nodes
             all_field_names = list(model_class.model_fields.keys())
             auto_increment_fields = model_class.get_auto_increment_fields()
-            
+
             # Determine which fields to include
             sample_instance = instances[0]
             sample_data = sample_instance.model_dump()
-            
+
             field_names = []
             for field_name in all_field_names:
                 if field_name in auto_increment_fields and sample_data.get(field_name) is None:
@@ -922,7 +949,7 @@ class KuzuSession:
             auto_increment_metadata = model_class.get_auto_increment_metadata()
             for field_name in field_names:
                 data_dict[field_name] = []
-                
+
                 # Determine PyArrow type for this field
                 field_meta = auto_increment_metadata.get(field_name)
                 if field_meta and field_meta.kuzu_type == KuzuDataType.UUID:
@@ -930,26 +957,37 @@ class KuzuSession:
                     schema_fields.append(pa.field(field_name, pa.string()))
                 # Note: For other types, we'll let PyArrow infer from the data later
 
-            # Extract data from instances
-            for instance in instances:
-                instance_data = instance.model_dump()
-                for field_name in field_names:
-                    value = instance_data.get(field_name)
-                    
-                    # Convert based on field type
-                    field_meta = auto_increment_metadata.get(field_name)
-                    if field_meta and field_meta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
-                        # Convert UUID objects to strings for KuzuDB UUID parsing
-                        value = str(value)
-                    elif isinstance(value, uuid.UUID):
-                        # Convert any UUID objects to strings for KuzuDB UUID parsing
-                        value = str(value)
-                    elif hasattr(value, 'isoformat'):
-                        value = value.isoformat()
-                    elif (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
-                        value = self._generate_default_function_value(value)
-                    
-                    data_dict[field_name].append(value)
+            # Extract data from instances (column-first for speed)
+            from enum import Enum as _E
+            for field_name in field_names:
+                fmeta = auto_increment_metadata.get(field_name)
+                col = []
+                append = col.append
+                for inst in instances:
+                    value = getattr(inst, field_name, None)
+                    if value is None:
+                        append(None)
+                        continue
+                    if fmeta and fmeta.kuzu_type == KuzuDataType.UUID and isinstance(value, uuid.UUID):
+                        append(str(value))
+                        continue
+                    if isinstance(value, uuid.UUID):
+                        append(str(value))
+                        continue
+                    if isinstance(value, _E):
+                        append(getattr(value, 'value', value))
+                        continue
+                    if hasattr(value, 'isoformat'):
+                        try:
+                            append(value.isoformat())
+                        except Exception:
+                            append(str(value))
+                        continue
+                    if (hasattr(value, '__class__') and 'KuzuDefaultFunction' in str(value.__class__)):
+                        append(self._generate_default_function_value(value))
+                        continue
+                    append(value)
+                data_dict[field_name].extend(col)
 
         # Create PyArrow table with mixed explicit and inferred schema
         if schema_fields:
@@ -1008,7 +1046,7 @@ class KuzuSession:
             table_name = model_class.__kuzu_relationship_name__
         else:
             raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
-        
+
         try:
             self._execute_with_connection_reuse(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
         finally:
@@ -1017,7 +1055,8 @@ class KuzuSession:
                 del df
             except Exception:
                 pass
-            gc.collect()
+            if self._force_gc:
+                gc.collect()
 
         if not is_relationship:
             self._retrieve_auto_increment_values_after_bulk_insert(model_class, instances, field_names)
