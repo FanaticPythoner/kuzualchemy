@@ -825,24 +825,9 @@ class KuzuSession:
                             # Preserve semantics: coerce most values toward strings later
                             g_data[fname] = [_conv_default(v) for v in vals]
 
-                    # Build PyArrow table
-                    arrays = []
-                    names = []
-                    schema_names = {f.name for f in g_schema}
-
-                    # from_node_pk/to_node_pk remain strings
-                    for f in g_schema:
-                        arrays.append(pa.array(g_data[f.name], type=f.type))
-                        names.append(f.name)
-
-                    # For property fields without explicit schema, let Arrow infer native types
-                    # (we already normalized UUIDs/enums/datetimes in g_data).
-                    for fname in field_names:
-                        if fname not in schema_names:
-                            arrays.append(pa.array(g_data[fname]))
-                            names.append(fname)
-
-                    g_df = pa.table(arrays, names=names)
+                    # Build PyArrow table directly from dict; Arrow will infer types.
+                    # UUIDs and PKs are already normalized to strings; enums/datetimes handled.
+                    g_df = pa.table(g_data)
 
                     try:
                         self._execute_with_connection_reuse(
@@ -1004,17 +989,8 @@ class KuzuSession:
             # Then, add arrays for fields without explicit types (let PyArrow infer)
             for field_name in field_names:
                 if field_name not in schema_field_names:
-                    # Convert any remaining UUID objects to strings before PyArrow inference
-                    field_data = data_dict[field_name]
-                    converted_data = []
-                    for value in field_data:
-                        if isinstance(value, uuid.UUID):
-                            converted_data.append(str(value))
-                        elif isinstance(value, list) and value and isinstance(value[0], uuid.UUID):
-                            converted_data.append([str(uuid_val) for uuid_val in value])
-                        else:
-                            converted_data.append(value)
-                    arrays.append(pa.array(converted_data))
+                    # Values were normalized earlier (UUIDs/enums/datetimes). Avoid extra Python loops.
+                    arrays.append(pa.array(data_dict[field_name]))
                     field_names_ordered.append(field_name)
 
             # Create table with field names only, let PyArrow infer types for non-explicit fields
