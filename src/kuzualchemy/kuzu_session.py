@@ -332,18 +332,36 @@ class KuzuSession:
         """
         return Query(model_class, session=self, alias=alias)
 
-    def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def execute(
+        self,
+        query: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        *,
+        as_iterator: bool = False,
+        page_size: Optional[int] = None,
+        prefetch_pages: int = 1,
+    ) -> Union[List[Dict[str, Any]], Iterator[Dict[str, Any]]]:
         """
         Execute a raw Cypher query.
 
         Args:
             query: Cypher query string
             parameters: Query parameters
+            as_iterator: When True, return a lazy iterator over results using paging
+            page_size: Positive integer page size when as_iterator=True; defaults to 10 when omitted
+            prefetch_pages: 0 to disable; 1 for single-page lookahead (default)
 
         Returns:
-            List of result dictionaries
+            List of result dictionaries, or an iterator when as_iterator=True
 
         """
+        # Iterator mode: delegate to iterate() for paging behavior
+        if as_iterator:
+            eff_page_size = 10 if (page_size is None) else page_size
+            if eff_page_size <= 0:
+                raise ValueError("page_size must be > 0 when as_iterator=True")
+            return self.iterate(query, parameters, page_size=eff_page_size, prefetch_pages=prefetch_pages)
+
         # || Only flush if we have pending operations and autoflush is enabled
         if self.autoflush and not self._flushing and self._has_pending_operations():
             self.flush()
@@ -398,6 +416,72 @@ class KuzuSession:
                 ) from e
 
         return rows
+
+    def iterate(
+        self,
+        query: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        *,
+        page_size: int = 10,
+        prefetch_pages: int = 1,
+    ) -> Iterator[Dict[str, Any]]:
+        """Iterate over results of a raw Cypher query in pages, yielding rows lazily.
+
+        This appends SKIP/LIMIT for paging and executes the query per page, with optional
+        single-page lookahead prefetch to overlap I/O with consumption.
+
+        Args:
+            query: Raw Cypher string that returns rows
+            parameters: Optional parameter dict
+            page_size: Positive integer page size (default: 10)
+            prefetch_pages: 0 to disable; 1 for single-page lookahead (default)
+
+        Yields:
+            Row dictionaries for each result row.
+
+        Raises:
+            ValueError: If page_size <= 0, or if query already contains SKIP/LIMIT
+        """
+        if page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
+
+        base = query.strip().rstrip(';').strip()
+        q_lower = base.lower()
+        # Basic guard: avoid double-paginating queries that already include SKIP/LIMIT
+        if " skip " in f" {q_lower} " or " limit " in f" {q_lower} ":
+            raise ValueError("Raw query already contains SKIP/LIMIT; cannot auto-paginate. Remove them and retry.")
+
+        def fetch_page(offset: int) -> List[Dict[str, Any]]:
+            paged_q = f"{base} SKIP {offset} LIMIT {page_size}"
+            return self.execute(paged_q, parameters)
+
+        # First page
+        offset = 0
+        page = fetch_page(offset)
+        if prefetch_pages > 0:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                next_future = executor.submit(fetch_page, offset + page_size) if len(page) == page_size else None
+                while True:
+                    for row in page:
+                        yield row
+                    if len(page) < page_size:
+                        break
+                    next_page = next_future.result() if next_future is not None else fetch_page(offset + page_size)
+                    offset += page_size
+                    if len(next_page) == page_size:
+                        next_future = executor.submit(fetch_page, offset + page_size)
+                    else:
+                        next_future = None
+                    page = next_page
+        else:
+            while True:
+                for row in page:
+                    yield row
+                if len(page) < page_size:
+                    break
+                offset += page_size
+                page = fetch_page(offset)
 
     def _has_pending_operations(self) -> bool:
         """

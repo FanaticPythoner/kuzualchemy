@@ -11,6 +11,8 @@ from typing import (
     TYPE_CHECKING, Any, Dict, List, Optional, Type, Union, TypeVar, Tuple, Iterator, Generic
 )
 import logging
+from concurrent.futures import ThreadPoolExecutor
+
 
 from .constants import ValidationMessageConstants, DDLConstants, QueryReturnAliasConstants, KuzuDataType
 from .kuzu_query_expressions import (
@@ -401,8 +403,75 @@ class Query(Generic[ModelType]):
         cypher, params = self.to_cypher()
         return self._session.execute(cypher, params)
 
-    def all(self) -> Union[List[ModelType], List[Dict[str, Any]]]:
-        """Execute query and return all results."""
+    def iter(self, page_size: int = 10, prefetch_pages: int = 1) -> Iterator[Union[ModelType, Dict[str, Any]]]:
+        """Return an iterator that yields items across pages lazily.
+
+        Args:
+            page_size: Number of items to fetch per page (default: 10).
+            prefetch_pages: Prefetch lookahead pages (0 disables; 1 enables single-page lookahead).
+
+        Returns:
+            An iterator that yields one item at a time across all pages.
+        """
+        if page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
+        if not self._session:
+            raise RuntimeError("No session attached to query")
+
+        def fetch_page(offset: int) -> List[Union[ModelType, Dict[str, Any]]]:
+            q = self.offset(offset).limit(page_size)
+            raw = q._execute()
+            return q._map_results(raw)
+
+        # Fetch first page synchronously
+        offset = 0
+        page = fetch_page(offset)
+        offset += page_size
+
+        if prefetch_pages > 0:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                next_future = executor.submit(fetch_page, offset) if len(page) == page_size else None
+                while True:
+                    for item in page:
+                        yield item
+                    if len(page) < page_size:
+                        break
+                    next_page = next_future.result() if next_future is not None else fetch_page(offset)
+                    offset += page_size
+                    if len(next_page) == page_size:
+                        next_future = executor.submit(fetch_page, offset)
+                    else:
+                        next_future = None
+                    page = next_page
+        else:
+            while True:
+                for item in page:
+                    yield item
+                if len(page) < page_size:
+                    break
+                page = fetch_page(offset)
+                offset += page_size
+
+    def all(self, as_iterator: bool = False, page_size: Optional[int] = None, prefetch_pages: int = 1) -> Union[List[ModelType], List[Dict[str, Any]], Iterator[Union[ModelType, Dict[str, Any]]]]:
+        """Execute query and return all results or an iterator over results with paging.
+
+        Args:
+            as_iterator: When True, return an iterator that yields items one-by-one across pages.
+            page_size: Number of rows per page to fetch when as_iterator=True (defaults to 10 if omitted).
+            prefetch_pages: Number of pages to prefetch ahead (0 disables prefetch; values >1 are treated as 1).
+
+        Returns:
+            Either a list of results (default) or an iterator over results when as_iterator=True.
+        """
+        if as_iterator:
+            eff_page_size = 10 if (page_size is None) else page_size
+            if eff_page_size <= 0:
+                raise ValueError("When as_iterator=True, page_size must be a positive integer")
+            # Only single-page lookahead is currently supported.
+            pf = 1 if prefetch_pages and prefetch_pages > 0 else 0
+            return self.iter(page_size=eff_page_size, prefetch_pages=pf)
+
+        # Default eager behavior
         results = self._execute()
         return self._map_results(results)
 
@@ -704,6 +773,10 @@ class Query(Generic[ModelType]):
                         instance_data[field] = row[field]
                     elif result_alias in row and field in row[result_alias]:
                         instance_data[field] = row[result_alias][field]
+                    else:
+                        qualified = f"{result_alias}.{field}"
+                        if qualified in row:
+                            instance_data[field] = row[qualified]
 
                 # Create partial instance (node queries only)
                 instance = result_model_class.model_construct(**instance_data)
