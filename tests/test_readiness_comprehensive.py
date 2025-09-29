@@ -951,7 +951,7 @@ class TestReadinessComprehensive:
 
             # Use ultra-fast bulk insert with Arrow
             start_time = time.time()
-            session.bulk_insert(batch_users)
+            session._bulk_insert(batch_users)
             batch_time = time.time() - start_time
             insert_times.append(batch_time)
 
@@ -992,7 +992,7 @@ class TestReadinessComprehensive:
 
         # Use ultra-fast bulk insert with Arrow
         start_time = time.time()
-        session.bulk_insert(items)
+        session._bulk_insert(items)
         item_insert_time = time.time() - start_time
         items_per_second = item_count / item_insert_time
 
@@ -1018,7 +1018,7 @@ class TestReadinessComprehensive:
 
         # Use ultra-fast bulk insert with Arrow
         start_time = time.time()
-        session.bulk_insert(interactions)
+        session._bulk_insert(interactions)
         relationship_insert_time = time.time() - start_time
         relationships_per_second = relationship_count / relationship_insert_time
 
@@ -1147,7 +1147,7 @@ class TestReadinessComprehensive:
 
                 # Use bulk insert if available, otherwise add individually
                 if len(users) >= worker_session.bulk_insert_threshold:
-                    worker_session.bulk_insert(users)
+                    worker_session._bulk_insert(users)
                 else:
                     for user in users:
                         worker_session.add(user)

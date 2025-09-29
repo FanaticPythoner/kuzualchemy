@@ -20,12 +20,13 @@ class QueryField:
     def __init__(self, field_name: str, model_class: Optional[Type[Any]] = None):
         self.field_name = field_name
         self.model_class = model_class
-        
-        # @@ STEP: Use bare field name; aliasing is applied later during Cypher generation
-        # || S.S: Keeping field_path free of aliases ensures internal consistency and
-        # || aligns with tests expecting raw field names in expressions
-        self.field_path = field_name
-    
+
+        # Include model class hint in field_path if provided; the builder maps model name -> alias
+        if model_class is not None:
+            self.field_path = f"{model_class.__name__}.{field_name}"
+        else:
+            self.field_path = field_name
+
     def __eq__(self, value: Any) -> FilterExpression:
         return FieldFilterExpression(self.field_path, ComparisonOperator.EQ, value)
     

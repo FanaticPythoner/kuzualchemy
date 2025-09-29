@@ -80,10 +80,15 @@ class DatabaseManager:
 
         with self._manager_lock:
             if db_path_str in self._databases:
-                existing_db = self._databases[db_path_str]
-                # Check if the existing database mode matches the requested mode
-                # Note: KuzuDB doesn't expose read_only flag, so we track it separately
-                return existing_db
+                # If the on-disk path was removed (e.g., test creates a fresh DB by deleting the dir),
+                # the cached Database is invalid. Clean it up and recreate.
+                if not Path(db_path_str).exists():
+                    self._cleanup_database(db_path_str)
+                else:
+                    existing_db = self._databases[db_path_str]
+                    # Check if the existing database mode matches the requested mode
+                    # Note: KuzuDB doesn't expose read_only flag, so we track it separately
+                    return existing_db
 
             # Create new database with validated buffer pool size
             try:

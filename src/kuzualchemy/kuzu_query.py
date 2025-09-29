@@ -76,14 +76,9 @@ class Query(Generic[ModelType]):
         target_alias = self._state.return_alias or self._state.alias
 
         for field_name, value in kwargs.items():
-            # Create field with explicit alias for traversal context
-            if self._state.return_alias:
-                # In traversal context, use qualified field path
-                field_path = f"{target_alias}.{field_name}"
-                field = QueryField(field_path, target_model)
-            else:
-                # Normal context, use unqualified field name
-                field = QueryField(field_name, target_model)
+            # Create field using model-based resolution; the builder will map model -> alias
+            # NOTE: Do not pre-qualify with alias here; doing so would duplicate alias in Cypher
+            field = QueryField(field_name, target_model)
             expressions.append(field == value)
         return self.filter(*expressions)
 
@@ -167,6 +162,14 @@ class Query(Generic[ModelType]):
                 # It's a model class or None
                 target_model = condition_or_model
                 conditions = conditions or []
+            # Do not assign a relationship alias by default; only use if provided explicitly
+            # Provide deterministic target alias when user didn't specify any
+            if target_alias is None:
+                # If target model known, base alias on it; otherwise derive from relationship
+                target_alias = (
+                    f"{target_model.__name__.lower()}_joined" if target_model is not None
+                    else f"{relationship_class.__name__.lower()}_to"
+                )
         else:
             # Pattern 1: join(TargetModel, relationship_class, ...)
             if not isinstance(target_model_or_rel, type):
@@ -191,6 +194,7 @@ class Query(Generic[ModelType]):
 
         if target_model and not target_alias:
             target_alias = f"{target_model.__name__.lower()}_joined"
+        # Do not assign a relationship alias by default; keep None unless provided explicitly
 
         join_clause = JoinClause(
             relationship_class=relationship_class,

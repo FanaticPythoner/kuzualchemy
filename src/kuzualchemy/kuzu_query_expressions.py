@@ -180,10 +180,14 @@ class FieldFilterExpression(FilterExpression):
     
     def to_cypher(self, alias_map: Dict[str, str], param_prefix: str = "", relationship_alias: Optional[str] = None, post_with: bool = False) -> str:
         """Convert to Cypher WHERE clause fragment."""
+        # Resolve left-hand side field reference
         parts = self.field_path.split(".", 1)
         if len(parts) == 2:
             alias, field = parts
-            mapped_alias = alias_map.get(alias, alias)
+            if alias in alias_map:
+                mapped_alias = alias_map[alias]
+            else:
+                mapped_alias = next(iter(alias_map.values())) if alias_map else alias
             field_ref = f"{mapped_alias}.{field}"
         else:
             # @@ STEP: Handle post-WITH context (HAVING clauses)
@@ -198,9 +202,37 @@ class FieldFilterExpression(FilterExpression):
             else:
                 default_alias = next(iter(alias_map.values())) if alias_map else "n"
                 field_ref = f"{default_alias}.{self.field_path}"
-        
+
+        # Field-to-field comparisons: if RHS is a QueryField, inline it (no parameter)
+        from .kuzu_query_fields import QueryField as _QF
+        if isinstance(self.value, _QF):
+            rhs_parts = self.value.field_path.split(".", 1)
+            if len(rhs_parts) == 2:
+                r_alias, r_field = rhs_parts
+                if r_alias in alias_map:
+                    r_mapped = alias_map[r_alias]
+                else:
+                    r_mapped = next(iter(alias_map.values())) if alias_map else r_alias
+                rhs_ref = f"{r_mapped}.{r_field}"
+            else:
+                if relationship_alias:
+                    rhs_ref = f"{relationship_alias}.{self.value.field_path}"
+                elif post_with:
+                    rhs_ref = self.value.field_path
+                else:
+                    default_alias = next(iter(alias_map.values())) if alias_map else "n"
+                    rhs_ref = f"{default_alias}.{self.value.field_path}"
+
+            if not self.case_sensitive and self.operator in (
+                ComparisonOperator.EQ, ComparisonOperator.NEQ,
+                ComparisonOperator.LIKE, ComparisonOperator.NOT_LIKE,
+                ComparisonOperator.STARTS_WITH, ComparisonOperator.ENDS_WITH
+            ):
+                return f"LOWER({field_ref}) {self.operator.value} LOWER({rhs_ref})"
+            return f"{field_ref} {self.operator.value} {rhs_ref}"
+
         param_name = f"{param_prefix}{self.parameter_name}"
-        
+
         if not self.case_sensitive and self.operator in (
             ComparisonOperator.EQ, ComparisonOperator.NEQ,
             ComparisonOperator.LIKE, ComparisonOperator.NOT_LIKE,
@@ -208,7 +240,7 @@ class FieldFilterExpression(FilterExpression):
         ):
             field_ref = f"LOWER({field_ref})"
             param_name = f"LOWER(${param_name})"
-        
+
         if self.operator == ComparisonOperator.IS_NULL:
             return f"{field_ref} IS NULL"
         elif self.operator == ComparisonOperator.IS_NOT_NULL:
@@ -248,7 +280,7 @@ class FieldFilterExpression(FilterExpression):
             return f"NOT EXISTS({field_ref})"
         else:
             return f"{field_ref} {self.operator.value} ${param_name}"
-    
+
     def get_parameters(self) -> Dict[str, Any]:
         """Get query parameters."""
         if self.operator in (
@@ -266,7 +298,7 @@ class FieldFilterExpression(FilterExpression):
             value = value.lower()
 
         return {self.parameter_name: value}
-    
+
     def get_field_references(self) -> Set[str]:
         """Get field references."""
         return {self.field_path}
@@ -373,7 +405,7 @@ class BetweenExpression(FilterExpression):
         parts = self.field_path.split(".", 1)
         if len(parts) == 2:
             alias, field = parts
-            mapped_alias = alias_map.get(alias, alias)
+            mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
             field_ref = f"{mapped_alias}.{field}"
         else:
             # @@ STEP: Handle post-WITH context (HAVING clauses)
@@ -436,7 +468,7 @@ class ArithmeticExpression(FilterExpression):
             parts = operand.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:
@@ -625,7 +657,7 @@ class TemporalExpression(FilterExpression):
             parts = operand.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:
@@ -863,7 +895,7 @@ class PatternExpression(FilterExpression):
             parts = operand.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:
@@ -1007,7 +1039,7 @@ class FunctionExpression(FilterExpression):
             parts = arg.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:
@@ -1228,7 +1260,7 @@ class CastExpression(FilterExpression):
             parts = value.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:
@@ -1332,7 +1364,7 @@ class CaseExpression(FilterExpression):
             parts = operand.field_path.split(".", 1)
             if len(parts) == 2:
                 alias, field = parts
-                mapped_alias = alias_map.get(alias, alias)
+                mapped_alias = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
                 return f"{mapped_alias}.{field}"
             else:
                 if post_with:

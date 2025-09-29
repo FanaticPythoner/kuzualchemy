@@ -11,17 +11,19 @@ error handling with precision.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast, Callable
 from contextlib import contextmanager
-from threading import RLock
+from threading import RLock, Thread
 from pathlib import Path
 from collections import defaultdict, OrderedDict
 import ahocorasick
 import logging
 import uuid
 from enum import Enum
-import time
+import time as _time
 import gc
+import os
+from datetime import datetime, date, time
 
 import pyarrow as pa
 
@@ -279,9 +281,15 @@ class KuzuSession:
         self.expire_on_commit = expire_on_commit
         self.bulk_insert_threshold = bulk_insert_threshold
         self.bulk_batch_size = bulk_batch_size
+        # Optional: upper bound for adaptive ramp-up in pipelined COPY
+        self.bulk_batch_size_max = int(kwargs.pop("bulk_batch_size_max", max(bulk_batch_size, 65536)))
         self._dirty = set()
         self._new = set()
         self._force_gc = local_force_gc
+        # Debug timing flag (read once, no runtime env lookups)
+        self._debug_timing = str(os.getenv("KUZU_TIMING", "0")) in ("1", "true", "TRUE", "on", "ON")
+        # Allow disabling the pipelined bulk-insert marshalling via env for accurate single-thread profiling
+        self._disable_bulk_pipeline = str(os.getenv("KUZU_DISABLE_BULK_PIPELINE", "0")).lower() in ("1", "true", "on")
 
         self._deleted = set()
         self._flushing = False
@@ -334,6 +342,7 @@ class KuzuSession:
 
         Returns:
             List of result dictionaries
+
         """
         # || Only flush if we have pending operations and autoflush is enabled
         if self.autoflush and not self._flushing and self._has_pending_operations():
@@ -394,6 +403,7 @@ class KuzuSession:
         """
         Check if there are pending operations that require flushing based on batch size.
 
+
         Justification:
         - Batch flushing reduces I/O operations by factor of batch_size
         - Optimal batch size balances memory usage vs I/O efficiency
@@ -435,14 +445,31 @@ class KuzuSession:
                 or "out of memory" in msg
             )
 
+        # Normalize parameters for Kuzu binder (Enums only; keep native types for datetime/UUID)
+        bound_params: Optional[Dict[str, Any]] = None
+        if parameters:
+            bp: Dict[str, Any] = {}
+            for k, v in parameters.items():
+                # Enum -> underlying value
+                if isinstance(v, Enum):
+                    v = getattr(v, 'value', v)
+                # List of Enums -> list of underlying values
+                elif isinstance(v, list) and v and isinstance(v[0], Enum):
+                    v = [getattr(x, 'value', x) for x in v]
+                # Leave uuid.UUID and datetime/date/time as-is for typed binding
+                bp[k] = v
+            bound_params = bp
+        else:
+            bound_params = parameters
+
         # Helper to run a single execution call using either reused or regular connection
         def _do_exec(use_reused: bool) -> Any:
             if use_reused and (self._reused_connection is not None and self._connection_operation_count < PerformanceConstants.CONNECTION_REUSE_THRESHOLD):
-                result = self._reused_connection.execute(query, parameters)
+                result = self._reused_connection.execute(query, bound_params)
                 self._connection_operation_count += 1
                 return result
             # Fallback to main connection
-            result = self._conn.execute(query, parameters)
+            result = self._conn.execute(query, bound_params)
             self._reused_connection = self._conn
             self._connection_operation_count = 1
             return result
@@ -459,13 +486,11 @@ class KuzuSession:
                         error=str(e)
                     )
                 )
-                try:
-                    # Reset reuse state then execute normally once
-                    self._reused_connection = None
-                    self._connection_operation_count = 0
-                    return _do_exec(use_reused=False)
-                except Exception as e:
-                    raise e
+                # Reset reuse state then execute normally once
+                self._reused_connection = None
+                self._connection_operation_count = 0
+                return _do_exec(use_reused=False)
+
             # Buffer exhaustion path: bounded exponential backoff retries
             backoff_s = 0.05
             max_attempts = 3
@@ -576,6 +601,53 @@ class KuzuSession:
         """Clear all cached metadata."""
         self._metadata_cache.clear()
 
+    def _get_or_build_pk_extractor(self, node_cls: Type[Any]) -> Callable[[Any], Any]:
+        """
+        Return a fast primary-key value extractor for the given node class, building and caching it if needed.
+
+        The extractor reads from __dict__ first (avoids descriptor/property overhead) and
+        falls back to getattr only if necessary. We cache both the pk_field and the extractor
+        in the session's metadata cache to eliminate repeated introspection and lookups.
+        """
+        # Try cached extractor first
+        extractor = self._get_cached_metadata(node_cls, 'pk_extractor')
+        if extractor is not None:
+            return extractor  # type: ignore[return-value]
+
+        # Ensure pk_fields are cached
+        pk_fields = self._get_cached_metadata(node_cls, 'pk_fields')
+        if pk_fields is None:
+            if hasattr(node_cls, 'get_primary_key_fields'):
+                get_pk_fields = node_cls.get_primary_key_fields  # type: ignore[attr-defined]
+                if not callable(get_pk_fields):
+                    raise ValueError(
+                        f"Model {node_cls.__name__}.get_primary_key_fields exists but is not callable"
+                    )
+                pk_fields = cast(List[str], get_pk_fields())
+                self._set_cached_metadata(node_cls, 'pk_fields', pk_fields)
+            else:
+                pk_fields = []
+
+        if not pk_fields:
+            raise ValueError(f"No primary key found in node {node_cls.__name__}")
+
+        # Single-field fast path (dominant case)
+        pk_field = pk_fields[0]
+        self._set_cached_metadata(node_cls, 'pk_field', pk_field)
+
+        def _extract(inst: Any) -> Any:
+            d = getattr(inst, '__dict__', None)
+            if isinstance(d, dict):
+                v = d.get(pk_field)
+                if v is not None:
+                    return v
+            if hasattr(inst, pk_field):
+                return getattr(inst, pk_field)
+            return None
+
+        self._set_cached_metadata(node_cls, 'pk_extractor', _extract)
+        return _extract
+
     def add(self, instance: Any) -> None:
         """
         Add an instance to the session for insertion.
@@ -597,17 +669,21 @@ class KuzuSession:
         if self.autocommit:
             self.commit()
 
-    def add_all(self, instances: List[Any]) -> None:
+    def add_all(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
         """
         Add multiple instances to the session.
 
         Args:
             instances: List of model instances to add
         """
+        if len(instances) > self.bulk_insert_threshold:
+            self._bulk_insert(instances, batch_size)
+            return
+
         for instance in instances:
             self.add(instance)
 
-    def bulk_insert(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
+    def _bulk_insert(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
         """
         Perform fast bulk insert using PyArrow and Kuzu's COPY FROM.
 
@@ -650,6 +726,17 @@ class KuzuSession:
             instances: List of instances of the same model type
             batch_size: Initial number of records per batch (upper bound)
         """
+        # Fast-path: pipeline marshalling and COPY when multi-pair is not required
+        try:
+            from .kuzu_orm import KuzuRelationshipBase as _RelBase
+            pairs = getattr(model_class, '__kuzu_relationship_pairs__', []) if issubclass(model_class, _RelBase) else []
+            pipeline_enabled = (not issubclass(model_class, _RelBase)) or (not pairs or len(pairs) <= 1)
+        except Exception:
+            pipeline_enabled = False
+
+        if pipeline_enabled and not getattr(self, "_disable_bulk_pipeline", False):
+            return self._bulk_insert_model_type_pipelined(model_class, instances, batch_size)
+
         if not instances:
             return
 
@@ -688,6 +775,345 @@ class KuzuSession:
                 if self._force_gc:
                     gc.collect()
                 # Do not advance 'start'; retry with smaller batch
+
+    # --- Pure normalization helpers (no try/except; reusable; easy to port to Rust/PyO3) ---
+    def _normalize_scalar_for_arrow(self, value: Any, fmeta: Optional[Any]) -> Any:
+        """Normalize a scalar value to Arrow-friendly types.
+
+        - uuid.UUID -> str
+        - Enum -> enum.value
+        - datetime/date/time -> ISO string
+        - KuzuDefaultFunction -> evaluated via _generate_default_function_value
+        - otherwise: unchanged
+        """
+        if value is None:
+            return None
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        
+        from .kuzu_function_types import DefaultFunctionBase as _DFB
+        if isinstance(value, Enum):
+            enum_val = getattr(value, 'value', value)
+            if isinstance(enum_val, _DFB):
+                return self._generate_default_function_value(enum_val)
+            return enum_val
+        if isinstance(value, (datetime, date, time)):
+            return value.isoformat()
+        if isinstance(value, _DFB):
+            return self._generate_default_function_value(value)
+        # Backstop: detect by class name to cover enum-like wrappers
+        cls = getattr(value, '__class__', None)
+        if cls is not None and ('KuzuDefaultFunction' in str(cls) or 'Function' in getattr(cls, '__name__', '')):
+            return self._generate_default_function_value(value)
+        return value
+
+    def _normalize_list_for_arrow(self, seq: List[Any]) -> List[Any]:
+        """Normalize a list to Arrow-friendly types with a single decision from first elem.
+        Empty list preserved. Otherwise, apply per-type normalization without exceptions.
+        """
+        if not seq:
+            return []
+        first = seq[0]
+        if isinstance(first, uuid.UUID):
+            return [str(x) for x in seq]
+        if isinstance(first, Enum):
+            return [getattr(x, 'value', x) for x in seq]
+        if isinstance(first, (datetime, date, time)):
+            return [x.isoformat() for x in seq]
+        return seq
+
+    def _build_property_columns(
+        self,
+        instances: List[Any],
+        field_names: List[str],
+        auto_increment_metadata: Dict[str, Any],
+    ) -> Dict[str, List[Any]]:
+        """Build property columns (pure normalization)."""
+        data_dict: Dict[str, List[Any]] = {}
+        for fname in field_names:
+            fmeta = auto_increment_metadata.get(fname)
+            col: List[Any] = []
+            append = col.append
+            for inst in instances:
+                v = getattr(inst, fname, None)
+                if isinstance(v, list):
+                    append(self._normalize_list_for_arrow(v))
+                else:
+                    append(self._normalize_scalar_for_arrow(v, fmeta))
+            data_dict[fname] = col
+        return data_dict
+
+
+    def _build_df_for_batch_simple(self, model_class: Type[Any], instances: List[Any]):
+        """Build a PyArrow table for a batch when multi-pair relationship is NOT required.
+
+        Returns a tuple: (df, table_name, is_relationship, included_field_names_or_None, instances_ref_or_None)
+        """
+        if not instances:
+            raise ValueError("Empty batch provided to _build_df_for_batch_simple")
+
+        # Detect relationships by presence of relationship metadata set by @kuzu_relationship
+        is_relationship = (
+            hasattr(model_class, '__kuzu_rel_name__') or hasattr(model_class, '__kuzu_relationship_name__')
+        )
+
+        data_dict: Dict[str, List[Any]] = {}
+        schema_fields: List[pa.Field] = []
+
+        if is_relationship:
+            pairs = getattr(model_class, '__kuzu_relationship_pairs__', [])
+            if pairs and len(pairs) > 1:
+                # Caller must use the legacy path for multi-pair groups
+                raise ValueError("multi-pair relationship not supported in simple builder")
+
+            # Relationship property fields (exclude internal)
+            all_field_names = list(model_class.model_fields.keys())
+            internal_fields = {
+                DDLConstants.REL_FROM_NODE_FIELD,
+                DDLConstants.REL_TO_NODE_FIELD,
+                DDLConstants.REL_FROM_NODE_PK_FIELD,
+                DDLConstants.REL_TO_NODE_PK_FIELD,
+            }
+            field_names = [f for f in all_field_names if f not in internal_fields]
+
+            # PK columns as strings (use constants; no ad-hoc literals)
+            from_pk_key = DDLConstants.REL_FROM_NODE_PK_FIELD
+            to_pk_key = DDLConstants.REL_TO_NODE_PK_FIELD
+
+            def _extract_pk_value(val: Any) -> Any:
+                # Accept either a node instance or a raw primary key value
+                if hasattr(type(val), 'get_primary_key_fields') and hasattr(val, '__dict__'):
+                    extractor = self._get_or_build_pk_extractor(type(val))
+                    return extractor(val)
+                return val
+
+            def _get_rel_pk_pair(rel_inst: Any) -> tuple[Any, Any]:
+                # Access __dict__ directly to avoid triggering Pydantic/property resolvers
+                d = getattr(rel_inst, '__dict__', {})
+                fpk = d.get('from_node_pk', None)
+                tpk = d.get('to_node_pk', None)
+                if fpk is None and 'from_node' in d:
+                    fpk = _extract_pk_value(d.get('from_node'))
+                if tpk is None and 'to_node' in d:
+                    tpk = _extract_pk_value(d.get('to_node'))
+                return fpk, tpk
+
+            from_vals: List[Any] = []
+            to_vals: List[Any] = []
+            for inst in instances:
+                fpk, tpk = _get_rel_pk_pair(inst)
+                from_vals.append(None if fpk is None else str(fpk))
+                to_vals.append(None if tpk is None else str(tpk))
+            data_dict[from_pk_key] = from_vals
+            data_dict[to_pk_key] = to_vals
+
+            schema_fields.extend([
+                pa.field(from_pk_key, pa.string()),
+                pa.field(to_pk_key, pa.string()),
+            ])
+
+            # Property columns via reusable helper (no try/except; no duplication)
+            auto_increment_metadata = model_class.get_auto_increment_metadata()
+            props_dict = self._build_property_columns(instances, field_names, auto_increment_metadata)
+            for k, v in props_dict.items():
+                data_dict[k] = v
+            # Explicit schema for UUID property fields
+            for fname in field_names:
+                fmeta = auto_increment_metadata.get(fname)
+                if fmeta and getattr(fmeta, 'kuzu_type', None) == KuzuDataType.UUID:
+                    schema_fields.append(pa.field(fname, pa.string()))
+
+            # Build table
+            if schema_fields:
+                arrays: List[pa.Array] = []
+                names: List[str] = []
+                for field in schema_fields:
+                    arrays.append(pa.array(data_dict[field.name], type=field.type))
+                    names.append(field.name)
+                # Add inferred fields
+                explicit = {f.name for f in schema_fields}
+                for fname in data_dict.keys():
+                    if fname not in explicit:
+                        arrays.append(pa.array(data_dict[fname]))
+                        names.append(fname)
+                df = pa.table(arrays, names=names)
+            else:
+                df = pa.table(data_dict)
+
+            # Determine table name
+            if hasattr(model_class, '__kuzu_rel_name__'):
+                table_name = model_class.__kuzu_rel_name__
+            elif hasattr(model_class, '__kuzu_relationship_name__'):
+                table_name = model_class.__kuzu_relationship_name__
+            else:
+                raise ValueError(f"Model {model_class.__name__} is not a registered relationship")
+
+            return df, table_name, True, None, None
+
+        # Nodes path
+        all_field_names = list(model_class.model_fields.keys())
+        auto_increment_fields = model_class.get_auto_increment_fields()
+        sample_data = instances[0].model_dump()
+
+        field_names: List[str] = []
+        for fname in all_field_names:
+            if fname in auto_increment_fields and sample_data.get(fname) is None:
+                continue
+            field_names.append(fname)
+
+        auto_increment_metadata = model_class.get_auto_increment_metadata()
+        for fname in field_names:
+            # UUID columns get explicit string schema
+            fmeta = auto_increment_metadata.get(fname)
+            if fmeta and fmeta.kuzu_type == KuzuDataType.UUID:
+                schema_fields.append(pa.field(fname, pa.string()))
+
+        # Build property columns via reusable helper
+        props_dict = self._build_property_columns(instances, field_names, auto_increment_metadata)
+        data_dict = props_dict
+
+        # Build table
+        if schema_fields:
+            arrays: List[pa.Array] = []
+            names: List[str] = []
+            explicit = {f.name for f in schema_fields}
+            for field in schema_fields:
+                arrays.append(pa.array(data_dict[field.name], type=field.type))
+                names.append(field.name)
+            for fname in field_names:
+                if fname not in explicit:
+                    arrays.append(pa.array(data_dict[fname]))
+                    names.append(fname)
+            df = pa.table(arrays, names=names)
+        else:
+            df = pa.table(data_dict)
+
+        # Determine table name for nodes
+        if hasattr(model_class, '__kuzu_node_name__'):
+            table_name = model_class.__kuzu_node_name__
+        else:
+            raise ValueError(f"Model {model_class.__name__} is not a registered node")
+
+        return df, table_name, False, field_names, instances
+
+
+    def _bulk_insert_model_type_pipelined(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
+        """Pipelined bulk insert: build next Arrow table while current COPY runs.
+
+        Falls back to legacy loop on buffer exhaustion by reducing batch size.
+        Applies only to nodes and single-pair relationships.
+        """
+        if not instances:
+            return
+
+        n = len(instances)
+        start = 0
+        cur_batch = max(1, int(batch_size))
+
+        def is_buffer_exhaustion_error(err: BaseException) -> bool:
+            msg = str(err).lower()
+            return (
+                "buffer manager exception" in msg
+                or "no more frame groups" in msg
+                or "out of memory" in msg
+            )
+
+        # Build first job synchronously (measure marshalling time)
+        slice_len = min(cur_batch, n - start)
+        _t_b0 = _time.perf_counter_ns()
+        df, table_name, is_rel, included_fields, inst_ref = self._build_df_for_batch_simple(
+            model_class, instances[start:start + slice_len]
+        )
+        marshall_ns_current = _time.perf_counter_ns() - _t_b0
+
+        while start < n:
+            # Prefetch next job in background (bounded to one inflight)
+            next_info: Dict[str, Any] = {}
+
+            def _build_next():
+                ns = start + slice_len
+                if ns >= n:
+                    next_info['job'] = None
+                    next_info['marshall_ns'] = 0
+                    return
+                nb = min(cur_batch, n - ns)
+                tb = _time.perf_counter_ns()
+                job = self._build_df_for_batch_simple(model_class, instances[ns:ns + nb])
+                next_info['job'] = job
+                next_info['slice_len'] = nb
+                next_info['marshall_ns'] = _time.perf_counter_ns() - tb
+
+            t = Thread(target=_build_next)
+            t.daemon = True
+            t.start()
+
+            copy_ns = 0
+            ai_fetch_ns = 0
+            wait_ns = 0
+            try:
+                # Execute COPY for current job (measure copy time)
+                _t_c0 = _time.perf_counter_ns()
+                # If node table omitted auto-increment columns, specify included column list explicitly
+                if not is_rel and included_fields:
+                    cols = ",".join(included_fields)
+                    self._execute_with_connection_reuse(
+                        f"COPY {table_name}({cols}) FROM $dataframe", {"dataframe": df}
+                    )
+                else:
+                    self._execute_with_connection_reuse(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
+                copy_ns = _time.perf_counter_ns() - _t_c0
+                if not is_rel:
+                    # Retrieve auto-increment values for nodes (measure fetch time)
+                    _t_a0 = _time.perf_counter_ns()
+                    self._retrieve_auto_increment_values_after_bulk_insert(model_class, inst_ref, included_fields or [])
+                    ai_fetch_ns = _time.perf_counter_ns() - _t_a0
+            except (RuntimeError, ValueError) as e:
+                # Cancel prefetch and handle buffer exhaustion
+                t.join()
+                try:
+                    del df
+                except Exception:
+                    pass
+                if not is_buffer_exhaustion_error(e):
+                    raise
+                if cur_batch <= 1:
+                    raise
+                cur_batch = max(1, cur_batch // 2)
+                time.sleep(0.02)
+                if self._force_gc:
+                    gc.collect()
+                # Rebuild current job with smaller batch; do not advance start
+                slice_len = min(cur_batch, n - start)
+                df, table_name, is_rel, included_fields, inst_ref = self._build_df_for_batch_simple(
+                    model_class, instances[start:start + slice_len]
+                )
+                continue
+            finally:
+                try:
+                    del df
+                except Exception:
+                    pass
+                if self._force_gc:
+                    gc.collect()
+
+            # Success path: finalize next job and advance
+            t.join()
+            if 'error' in next_info:
+                raise next_info['error']
+
+            start += slice_len
+
+            # Gentle ramp-up after success
+            # Adaptive ramp-up: allow exceeding initial batch_size up to configured max
+            target_max = getattr(self, 'bulk_batch_size_max', batch_size)
+            if cur_batch < target_max:
+                cur_batch = min(target_max, int(cur_batch * 2))
+
+            job = next_info.get('job')
+            if job is None:
+                break
+            df, table_name, is_rel, included_fields, inst_ref = job
+            slice_len = next_info.get('slice_len', slice_len)
 
     def _process_batch_with_pyarrow(self, model_class: Type[Any], instances: List[Any]) -> None:
         """
@@ -741,8 +1167,9 @@ class KuzuSession:
                 grouped: Dict[tuple[str, str], List[Any]] = {}
                 for inst in instances:
                     try:
-                        from_label = _resolve_node_label(inst.from_node)
-                        to_label = _resolve_node_label(inst.to_node)
+                        d = getattr(inst, '__dict__', {})
+                        from_label = _resolve_node_label(d.get('from_node'))
+                        to_label = _resolve_node_label(d.get('to_node'))
                     except Exception as e:
                         raise ValueError(
                             f"Failed to resolve endpoint labels for {model_class.__name__} instance during bulk insert: {e}"
@@ -780,14 +1207,30 @@ class KuzuSession:
 
                     # Fill columns (column-first to minimize Python overhead)
                     # Primary keys as strings for Arrow string schema
-                    g_data['from_node_pk'] = [
-                        (str(inst.from_node_pk) if inst.from_node_pk is not None else None)
-                        for inst in group_instances
-                    ]
-                    g_data['to_node_pk'] = [
-                        (str(inst.to_node_pk) if inst.to_node_pk is not None else None)
-                        for inst in group_instances
-                    ]
+                    # Avoid property access; read values from instance __dict__ directly
+                    # If *_pk is missing, derive from *_node using cached primary key field
+                    def _node_pk(v: Any) -> Any:
+                        if v is None:
+                            return None
+                        if hasattr(type(v), 'get_primary_key_fields') and hasattr(v, '__dict__'):
+                            extractor = self._get_or_build_pk_extractor(type(v))
+                            return extractor(v)
+                        return v
+
+                    fn: List[Any] = []
+                    tn: List[Any] = []
+                    for _inst in group_instances:
+                        _d = getattr(_inst, '__dict__', {})
+                        _fpk = _d.get('from_node_pk')
+                        if _fpk is None:
+                            _fpk = _node_pk(_d.get('from_node'))
+                        _tpk = _d.get('to_node_pk')
+                        if _tpk is None:
+                            _tpk = _node_pk(_d.get('to_node'))
+                        fn.append(None if _fpk is None else str(_fpk))
+                        tn.append(None if _tpk is None else str(_tpk))
+                    g_data['from_node_pk'] = fn
+                    g_data['to_node_pk'] = tn
 
                     # Precompute simple per-field converters based on metadata
                     def _conv_uuid(v: Any) -> Any:
@@ -1024,7 +1467,12 @@ class KuzuSession:
             raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
 
         try:
-            self._execute_with_connection_reuse(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
+            # If node table omitted auto-increment columns, specify included column list explicitly
+            if not is_relationship and 'field_names' in locals() and field_names:
+                cols = ",".join(field_names)
+                self._execute_with_connection_reuse(f"COPY {table_name}({cols}) FROM $dataframe", {"dataframe": df})
+            else:
+                self._execute_with_connection_reuse(f"COPY {table_name} FROM $dataframe", {"dataframe": df})
         finally:
             # Ensure PyArrow buffers are released promptly
             try:
@@ -1263,14 +1711,14 @@ class KuzuSession:
             # Use session configuration for bulk insert threshold
             # Process nodes first - use bulk insert if many instances
             if len(nodes_to_insert) >= self.bulk_insert_threshold:
-                self.bulk_insert(nodes_to_insert)
+                self._bulk_insert(nodes_to_insert)
             else:
                 for instance in nodes_to_insert:
                     self._insert_instance(instance)
 
             # Then process relationships - use bulk insert if many instances
             if len(relationships_to_insert) >= self.bulk_insert_threshold:
-                self.bulk_insert(relationships_to_insert)
+                self._bulk_insert(relationships_to_insert)
             else:
                 for instance in relationships_to_insert:
                     self._insert_instance(instance)
@@ -1413,42 +1861,27 @@ class KuzuSession:
         if pk_fields:
 
             if len(pk_fields) == 1:
-                pk_field = pk_fields[0]
-                if not hasattr(instance, pk_field):
-                    raise ValueError(
-                        f"Primary key field '{pk_field}' not found on {model_class.__name__} instance"
-                    )
-                # @@ STEP 1: Check __dict__ first for performance (avoids descriptor overhead)
-                value = instance.__dict__.get(pk_field)
+                # Use fast extractor cached per class
+                extractor = self._get_cached_metadata(model_class, 'pk_extractor')
+                if extractor is None:
+                    extractor = self._get_or_build_pk_extractor(model_class)
+                value = extractor(instance)
 
-                # @@ STEP 2: If not in __dict__, try getattr for properties/descriptors
-                # || S.S.1: Only call getattr if we know the attribute exists
-                if value is None and hasattr(instance, pk_field):
-                    # || S.S.2: Safe to call getattr since hasattr confirmed existence
-                    value = getattr(instance, pk_field)
-
-                # @@ STEP 3: Validate that we got a non-None value (unless it's auto-increment)
+                # Validate non-None (unless auto-increment)
                 if value is None:
-                    # || S.S.1: All KuzuBaseModel instances have get_auto_increment_fields() method
-                    # || S.S.2: No fallbacks - direct method call with explicit error handling
                     try:
                         auto_increment_fields = model_class.get_auto_increment_fields()
+                        pk_field = self._get_cached_metadata(model_class, 'pk_field') or model_class.get_primary_key_fields()[0]
                         if pk_field in auto_increment_fields:
-                            # || S.S.3: Auto-increment primary keys can be None (will be generated by DB)
-                            # || Unset auto-increment fields have no value until DB generation
                             return None
                     except AttributeError as attr_err:
-                        # || S.S.4: Explicit error for non-KuzuBaseModel classes
                         raise TypeError(
                             f"Model class {model_class.__name__} does not implement get_auto_increment_fields() method. "
                             f"All model classes must inherit from KuzuBaseModel. "
                             f"Original error: {attr_err}"
                         ) from attr_err
-
-                    # || S.S.5: Explicit error with detailed context for non-auto-increment fields
                     raise ValueError(
-                        f"Primary key field '{pk_field}' is None on {model_class.__name__} instance. "
-                        f"The field exists but has no value. Non-auto-increment primary keys must have a non-None value."
+                        f"Primary key is None on {model_class.__name__} instance; non-auto-increment primary keys must be set."
                     )
                 return value
 
@@ -1557,7 +1990,9 @@ class KuzuSession:
                 properties[field_name] = converted_value
 
         # @@ STEP 2.5: Normalize property values for prepared statement binding
-        # Convert Enums to their underlying values, UUIDs to strings, and lists of UUIDs to list[str]
+        # IMPORTANT: Do NOT coerce Python-native temporal/UUID values to strings here.
+        # The Kuzu Python driver can bind datetime/date/time and uuid.UUID directly
+        # to TIMESTAMP/DATE/UUID parameters. Only convert Enums to their underlying values.
         all_meta = model_class.get_all_kuzu_metadata()
 
         normalized_props: Dict[str, Any] = {}
@@ -1566,13 +2001,8 @@ class KuzuSession:
             # Enum -> underlying value
             if isinstance(v, Enum):
                 v = getattr(v, 'value', v)
-            # UUID -> string
-            if isinstance(v, uuid.UUID):
-                v = str(v)
-            # datetime-like -> isoformat
-            if hasattr(v, 'isoformat'):
-                v = v.isoformat()
-            # Handle ARRAY(UUID) -> list[str]
+            # Leave uuid.UUID and datetime/date/time as-is for typed parameter binding
+            # Preserve arrays of UUIDs as list[uuid.UUID]
             if meta is not None:
                 from .kuzu_orm import ArrayTypeSpecification, KuzuDataType as _KDT
                 ktype = meta.kuzu_type
@@ -1580,7 +2010,8 @@ class KuzuSession:
                     elem_t = ktype.element_type
                     is_uuid_elem = (elem_t == _KDT.UUID) or (isinstance(elem_t, str) and str(elem_t).upper() == 'UUID')
                     if is_uuid_elem and isinstance(v, list):
-                        v = [str(x) if isinstance(x, uuid.UUID) else x for x in v]
+                        # Ensure all elements are uuid.UUID for correct binding
+                        v = [x if isinstance(x, uuid.UUID) else x for x in v]
             normalized_props[k] = v
         properties = normalized_props
 

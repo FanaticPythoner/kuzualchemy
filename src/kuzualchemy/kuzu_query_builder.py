@@ -170,8 +170,10 @@ class CypherQueryBuilder:
         node_name = self.state.model_class.__kuzu_node_name__
         
         self.alias_map[self.state.alias] = self.state.alias
+        # Map model class name to alias for QueryField(model=...) resolution
+        self.alias_map[self.state.model_class.__name__] = self.state.alias
         match_pattern = f"({self.state.alias}:{node_name})"
-        
+
         if self.state.with_clauses:
             clauses.extend(self.state.with_clauses)
         
@@ -181,16 +183,21 @@ class CypherQueryBuilder:
             join_cypher = join.to_cypher(self.state.alias, self.alias_map)
             if join.target_alias:
                 self.alias_map[join.target_alias] = join.target_alias
+                if join.target_model is not None:
+                    # Map target model class name to its alias
+                    self.alias_map[join.target_model.__name__] = join.target_alias
             if join.rel_alias:
                 self.alias_map[join.rel_alias] = join.rel_alias
-            
+                if join.relationship_class is not None:
+                    # Map relationship class name to its alias
+                    self.alias_map[join.relationship_class.__name__] = join.rel_alias
             if not join_cypher.startswith((CypherConstants.MATCH, "OPTIONAL")):
                 clauses.append(f"{CypherConstants.MATCH} {join_cypher}")
             else:
                 clauses.append(join_cypher)
-            
+
             self.state.filters.extend(join.conditions)
-        
+
         where_clause = self._build_where_clause()
         if where_clause:
             clauses.append(where_clause)
@@ -343,13 +350,19 @@ class CypherQueryBuilder:
         else:
             # || S.S.10: For multi-pair relationships, we use UNION ALL to match any valid pattern
             # || This creates a query that handles all relationship pair combinations
+            # Ensure relationship alias is registered for QueryField(model=RelClass) resolution in filters
+            self.alias_map[rel_alias] = rel_alias
+            self.alias_map[self.state.model_class.__name__] = rel_alias
             union_query = self._build_multi_pair_union_query(match_patterns, endpoint_aliases, rel_alias, rel_pairs)
             # Don't clear parameters - they're needed for WHERE clauses in UNION queries
             # Return the UNION query with parameters intact
             return union_query, self.parameters
-        
+
         self.alias_map[rel_alias] = rel_alias
-        
+        # Map relationship class name to alias for QueryField/filters referencing the class name
+        rel_cls_name = self.state.model_class.__name__
+        self.alias_map[rel_cls_name] = rel_alias
+
         where_clause = self._build_where_clause(relationship_alias=rel_alias)
         if where_clause:
             clauses.append(where_clause)

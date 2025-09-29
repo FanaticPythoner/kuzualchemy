@@ -295,16 +295,28 @@ class BulkInsertValueGeneratorRegistry:
     @classmethod
     def generate_value(cls, default_function: Any) -> str:
         """
-        Generate actual value from KuzuDefaultFunction enum.
+        Generate actual value from a Kuzu default function reference.
 
-        Args:
-            default_function: KuzuDefaultFunction enum value
+        Accepts either:
+        - KuzuDefaultFunction enum member; or
+        - a DefaultFunctionBase instance (e.g., TimeFunction/UUIDFunction/SequenceFunction)
 
         Returns:
             Generated value as string in Kuzu-compatible format
         """
-        # Get the actual function object from the enum value
-        func_obj = default_function.value
+        # Determine the function object to dispatch on
+        from .kuzu_function_types import DefaultFunctionBase as _DFB
+
+        if isinstance(default_function, _DFB):
+            func_obj = default_function
+        else:
+            # Expecting enum-like with `.value`
+            if not hasattr(default_function, "value"):
+                raise ValueError(
+                    f"Unsupported default_function reference of type {type(default_function)}; "
+                    f"expected KuzuDefaultFunction or DefaultFunctionBase instance"
+                )
+            func_obj = default_function.value
 
         # Get the appropriate generator
         generator = cls.get_generator(func_obj)
@@ -850,7 +862,9 @@ def kuzu_field(
 
     if type(json_schema_extra) is not dict:
         json_schema_extra = {}
-    json_schema_extra["kuzu_metadata"] = kuzu_metadata.__dict__
+    # Store the metadata object itself to preserve types (e.g., ArrayTypeSpecification, KuzuDefaultFunction)
+    # Downstream accessors handle both object and dict forms, but object preserves fidelity.
+    json_schema_extra["kuzu_metadata"] = kuzu_metadata
 
     field_kwargs = {
         "json_schema_extra": json_schema_extra,
@@ -1009,6 +1023,10 @@ class KuzuRegistry:
         # || S.S: Cache validation results to avoid double-validation and improve performance
         self._foreign_key_validation_cache: Dict[str, Tuple[str, List[str]]] = {}
         self._registry_state_hash: Optional[str] = None
+
+        # @@ STEP 5: Field metadata cache (hot path)
+        # Keyed by id(field_info) because FieldInfo may not be hashable; values are KuzuFieldMetadata or None
+        self._field_metadata_cache: Dict[int, Optional[KuzuFieldMetadata]] = {}
 
     def _cleanup_model_references(self, model_name: str) -> None:
         """
@@ -1399,27 +1417,38 @@ class KuzuRegistry:
 
     def get_field_metadata(self, field_info: FieldInfo) -> Optional[KuzuFieldMetadata]:
         """
-        Get Kuzu metadata from field info.
+        Get Kuzu metadata from field info with caching (hot path).
 
         :param field_info: Pydantic field info
         :type field_info: FieldInfo
         :returns: Kuzu field metadata or None
         :rtype: Optional[KuzuFieldMetadata]
         """
-        # @@ STEP: Extract kuzu metadata from field info
-        if field_info.json_schema_extra:
-            # || S.1: Check if json_schema_extra is a dict
-            if type(field_info.json_schema_extra) is dict:
-                kuzu_meta = field_info.json_schema_extra.get(ModelMetadataConstants.KUZU_FIELD_METADATA)
-                if kuzu_meta:
-                    # || S.2: Return KuzuFieldMetadata instance if it's already one
-                    if type(kuzu_meta) is KuzuFieldMetadata:
-                        return kuzu_meta
-                    # || S.3: Create KuzuFieldMetadata from dict
-                    elif type(kuzu_meta) is dict:
-                        return KuzuFieldMetadata(**kuzu_meta)
-        # No Kuzu metadata found - this is expected for non-Kuzu fields
-        return None
+        # @@ STEP: Cache by identity of FieldInfo (stable per model class)
+        cache_key = id(field_info)
+        cached = self._field_metadata_cache.get(cache_key, None)
+        if cached is not None or cache_key in self._field_metadata_cache:
+            return cached
+
+        result: Optional[KuzuFieldMetadata] = None
+        if field_info.json_schema_extra and isinstance(field_info.json_schema_extra, dict):
+            kuzu_meta = field_info.json_schema_extra.get(ModelMetadataConstants.KUZU_FIELD_METADATA)
+            if kuzu_meta:
+                if isinstance(kuzu_meta, KuzuFieldMetadata):
+                    result = kuzu_meta
+                elif isinstance(kuzu_meta, dict):
+                    # Reconstruct ArrayTypeSpecification if present
+                    kt = kuzu_meta.get("kuzu_type")
+                    if isinstance(kt, dict) and "element_type" in kt:
+                        elem = kt["element_type"]
+                        if isinstance(elem, str) and hasattr(KuzuDataType, elem):
+                            elem = getattr(KuzuDataType, elem)
+                        kuzu_meta["kuzu_type"] = ArrayTypeSpecification(element_type=elem)
+                    result = KuzuFieldMetadata(**kuzu_meta)
+
+        # Store even when None to avoid repeated dict lookups and type checks
+        self._field_metadata_cache[cache_key] = result
+        return result
 
 
 # Singleton
@@ -1710,29 +1739,42 @@ class KuzuBaseModel(BaseModel):
 
     @classmethod
     def get_all_kuzu_metadata(cls) -> Dict[str, KuzuFieldMetadata]:
+        cached = cls.__dict__.get("__kuzu_cached_all_meta__")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
         res: Dict[str, KuzuFieldMetadata] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta:
                 res[field_name] = meta
+        # cache on class for subsequent lookups
+        setattr(cls, "__kuzu_cached_all_meta__", res)
         return res
 
     @classmethod
     def get_primary_key_fields(cls) -> List[str]:
+        cached = cls.__dict__.get("__kuzu_cached_pk_fields__")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
         pks: List[str] = []
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.primary_key:
                 pks.append(field_name)
+        setattr(cls, "__kuzu_cached_pk_fields__", pks)
         return pks
 
     @classmethod
     def get_foreign_key_fields(cls) -> Dict[str, ForeignKeyReference]:
+        cached = cls.__dict__.get("__kuzu_cached_fk_fields__")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
         fks: Dict[str, ForeignKeyReference] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.foreign_key:
                 fks[field_name] = meta.foreign_key
+        setattr(cls, "__kuzu_cached_fk_fields__", fks)
         return fks
 
     @classmethod
@@ -1743,11 +1785,15 @@ class KuzuBaseModel(BaseModel):
         Returns:
             List of field names that are auto-increment (SERIAL) fields
         """
+        cached = cls.__dict__.get("__kuzu_cached_ai_fields__")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
         auto_inc_fields: List[str] = []
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.auto_increment:
                 auto_inc_fields.append(field_name)
+        setattr(cls, "__kuzu_cached_ai_fields__", auto_inc_fields)
         return auto_inc_fields
 
     @classmethod
@@ -1758,11 +1804,15 @@ class KuzuBaseModel(BaseModel):
         Returns:
             Dictionary mapping field names to their KuzuFieldMetadata for auto-increment fields
         """
+        cached = cls.__dict__.get("__kuzu_cached_ai_meta__")
+        if cached is not None:
+            return cached  # type: ignore[return-value]
         auto_inc_meta: Dict[str, KuzuFieldMetadata] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.auto_increment:
                 auto_inc_meta[field_name] = meta
+        setattr(cls, "__kuzu_cached_ai_meta__", auto_inc_meta)
         return auto_inc_meta
 
     @classmethod
@@ -1773,10 +1823,15 @@ class KuzuBaseModel(BaseModel):
         Returns:
             True if there's a primary key field with auto_increment=True
         """
+        cached = cls.__dict__.get("__kuzu_cached_has_ai_pk__")
+        if cached is not None:
+            return bool(cached)
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.primary_key and meta.auto_increment:
+                setattr(cls, "__kuzu_cached_has_ai_pk__", True)
                 return True
+        setattr(cls, "__kuzu_cached_has_ai_pk__", False)
         return False
 
     def get_auto_increment_fields_needing_generation(self) -> List[str]:
@@ -3238,6 +3293,11 @@ def clear_registry():
     _kuzu_registry.nodes.clear()
     _kuzu_registry.relationships.clear()
     _kuzu_registry.models.clear()
+
+    # @@ STEP 3.1: Clear hot path caches that may hold onto FieldInfo identities
+    # || IMPORTANT: C-extension allocators can reuse memory addresses, causing id(FieldInfo)
+    # || collisions across tests/classes. We must clear the cache to avoid cross-talk.
+    _kuzu_registry._field_metadata_cache.clear()
 
     # @@ STEP 4: No forced garbage collection - let Python handle cleanup naturally
     # || S.S.3: Forced gc.collect() on complex objects with circular refs causes segfaults
