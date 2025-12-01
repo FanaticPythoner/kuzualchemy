@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType
 )
-from .kuzu_orm import RelationshipPair
 from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants, QueryReturnAliasConstants
 
 logger = logging.getLogger(__name__)
@@ -121,6 +120,8 @@ class QueryState:
     parameter_prefix: str = ""
     return_alias: Optional[str] = None  # Override return alias for traversals
     return_model_class: Optional[Type[Any]] = None  # Override model class for traversals
+    # Limit relationship pairs to a subset of indices for memory-safe streaming
+    pairs_subset: Optional[List[int]] = None
     
     def copy(self, **kwargs) -> QueryState:
         """Create a copy with updated fields."""
@@ -225,12 +226,12 @@ class CypherQueryBuilder:
                 # Final RETURN with same items (aliases are now available)
                 final_return_items = []
                 if self.state.group_by:
-                    for field in self.state.group_by:
+                    for fld in self.state.group_by:
                         # Use the field name as alias (Kuzu requires aliases in WITH)
-                        final_return_items.append(field)
+                        final_return_items.append(fld)
 
-                for alias, (func, field) in self.state.aggregations.items():
-                    _ = func, field  # Mark as intentionally unused - only alias is needed in RETURN
+                for alias, (func, fld) in self.state.aggregations.items():
+                    _ = func, fld  # Mark as intentionally unused - only alias is needed in RETURN
                     final_return_items.append(alias)
 
                 clauses.append(f"{CypherConstants.RETURN} {', '.join(final_return_items)}")
@@ -252,15 +253,15 @@ class CypherQueryBuilder:
         
         if self.state.order_by:
             order_items = []
-            for field, direction in self.state.order_by:
-                if "." in field:
-                    order_items.append(f"{field} {direction.value}")
+            for fld, direction in self.state.order_by:
+                if "." in fld:
+                    order_items.append(f"{fld} {direction.value}")
                 else:
                     # @@ STEP: When we have aggregations, ORDER BY should reference aliases, not table fields
-                    if self.state.aggregations and field in self.state.aggregations:
-                        order_items.append(f"{field} {direction.value}")
+                    if self.state.aggregations and fld in self.state.aggregations:
+                        order_items.append(f"{fld} {direction.value}")
                     else:
-                        order_items.append(f"{self.state.alias}.{field} {direction.value}")
+                        order_items.append(f"{self.state.alias}.{fld} {direction.value}")
             clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
         
         # @@ STEP: Kuzu requires SKIP instead of OFFSET, and SKIP must come before LIMIT
@@ -271,6 +272,12 @@ class CypherQueryBuilder:
             clauses.append(f"{CypherConstants.LIMIT} {self.state.limit_value}")
         
         query = "\n".join(clauses)
+        # @@ STEP: Prune parameters that are not referenced in the Cypher text
+        if self.parameters:
+            import re as _re
+            used = set(_re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", query))
+            if used:
+                self.parameters = {k: v for k, v in self.parameters.items() if k in used}
         if self.state.union_queries:
             union_parts = [query]
             for union_query, use_all in self.state.union_queries:
@@ -296,6 +303,18 @@ class CypherQueryBuilder:
         
         # @@ STEP 1: Get relationship pairs from the model class
         rel_pairs = rel_class.__kuzu_relationship_pairs__
+        # Apply optional subset selection for memory-safe streaming
+        pairs = rel_pairs
+        subset = getattr(self.state, 'pairs_subset', None)
+        if subset:
+            # Validate indices strictly; fail fast on invalid input
+            if any((not isinstance(i, int)) or i < 0 or i >= len(rel_pairs) for i in subset):
+                raise ValueError(
+                    ValidationMessageConstants.INVALID_RELATIONSHIP_PAIR_INDEX
+                    if hasattr(ValidationMessageConstants, 'INVALID_RELATIONSHIP_PAIR_INDEX')
+                    else f"Invalid relationship pair indices: {subset}"
+                )
+            pairs = [rel_pairs[i] for i in subset]
         
         if not rel_pairs:
             raise ValueError(f"Relationship {rel_name} has no relationship pairs defined")
@@ -307,13 +326,13 @@ class CypherQueryBuilder:
         direction = rel_class.__dict__.get('__kuzu_direction__')
         
         endpoint_aliases: List[Tuple[str, str]] = []
-        for idx, pair in enumerate(rel_pairs):
+        for idx, pair in enumerate(pairs):
             # || S.S.5: Get node names from the pair
             from_name = pair.get_from_name()
             to_name = pair.get_to_name()
 
             # || S.S.6: Create unique aliases for each pair to avoid conflicts
-            if len(rel_pairs) > 1:
+            if len(pairs) > 1:
                 from_alias = f"from_node_{idx}"
                 to_alias = f"to_node_{idx}"
             else:
@@ -353,7 +372,7 @@ class CypherQueryBuilder:
             # Ensure relationship alias is registered for QueryField(model=RelClass) resolution in filters
             self.alias_map[rel_alias] = rel_alias
             self.alias_map[self.state.model_class.__name__] = rel_alias
-            union_query = self._build_multi_pair_union_query(match_patterns, endpoint_aliases, rel_alias, rel_pairs)
+            union_query = self._build_multi_pair_union_query(match_patterns, endpoint_aliases, rel_alias, pairs)
             # Don't clear parameters - they're needed for WHERE clauses in UNION queries
             # Return the UNION query with parameters intact
             return union_query, self.parameters
@@ -372,11 +391,11 @@ class CypherQueryBuilder:
             return_items = self._build_aggregation_return()
             if self.state.group_by:
                 group_items = []
-                for field in self.state.group_by:
-                    if "." in field:
-                        group_items.append(field)
+                for fld in self.state.group_by:
+                    if "." in fld:
+                        group_items.append(fld)
                     else:
-                        group_items.append(f"{self.state.alias}.{field}")
+                        group_items.append(f"{self.state.alias}.{fld}")
                 return_items = group_items + return_items
                 # @@ STEP: Implement proper GROUP BY behavior even though Kuzu uses implicit grouping
                 # || S.S: Validate that all non-aggregated fields are explicitly grouped
@@ -388,14 +407,14 @@ class CypherQueryBuilder:
                 with_items = self._build_aggregation_return()
                 if self.state.group_by:
                     group_items = []
-                    for field in self.state.group_by:
-                        if "." in field:
+                    for fld in self.state.group_by:
+                        if "." in fld:
                             # Already has alias prefix, add AS alias
-                            field_name = field.split(".", 1)[1]
-                            group_items.append(f"{field} AS {field_name}")
+                            field_name = fld.split(".", 1)[1]
+                            group_items.append(f"{fld} AS {field_name}")
                         else:
                             # Add alias prefix and AS alias
-                            group_items.append(f"{self.state.alias}.{field} AS {field}")
+                            group_items.append(f"{self.state.alias}.{fld} AS {fld}")
                     with_items = group_items + with_items
 
                 clauses.append(f"WITH {', '.join(with_items)}")
@@ -411,12 +430,12 @@ class CypherQueryBuilder:
                 # Final RETURN with same items (aliases are now available)
                 final_return_items = []
                 if self.state.group_by:
-                    for field in self.state.group_by:
+                    for fld in self.state.group_by:
                         # Use the field name as alias (Kuzu requires aliases in WITH)
-                        final_return_items.append(field)
+                        final_return_items.append(fld)
 
-                for alias, (func, field) in self.state.aggregations.items():
-                    _ = func, field  # Mark as intentionally unused - only alias is needed in RETURN
+                for alias, (func, fld) in self.state.aggregations.items():
+                    _ = func, fld  # Mark as intentionally unused - only alias is needed in RETURN
                     final_return_items.append(alias)
 
                 return_clause = f"RETURN {', '.join(final_return_items)}"
@@ -426,11 +445,11 @@ class CypherQueryBuilder:
             # Build explicit RETURN including endpoints for relationship queries
             if self.state.select_fields:
                 items = []
-                for field in self.state.select_fields:
-                    if "." in field:
-                        items.append(field)
+                for fld in self.state.select_fields:
+                    if "." in fld:
+                        items.append(fld)
                     else:
-                        items.append(f"{self.state.alias}.{field}")
+                        items.append(f"{self.state.alias}.{fld}")
                 from_alias, to_alias = endpoint_aliases[0]
                 return_clause = f"RETURN {', '.join(items)}, {from_alias} AS {DDLConstants.REL_FROM_NODE_FIELD}, {to_alias} AS {DDLConstants.REL_TO_NODE_FIELD}"
             else:
@@ -440,11 +459,11 @@ class CypherQueryBuilder:
         
         if self.state.order_by:
             order_items = []
-            for field, direction in self.state.order_by:
-                if "." in field:
-                    order_items.append(f"{field} {direction.value}")
+            for fld, direction in self.state.order_by:
+                if "." in fld:
+                    order_items.append(f"{fld} {direction.value}")
                 else:
-                    order_items.append(f"{rel_alias}.{field} {direction.value}")
+                    order_items.append(f"{rel_alias}.{fld} {direction.value}")
             clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
 
         # @@ STEP: Kuzu requires SKIP instead of OFFSET, and SKIP must come before LIMIT
@@ -454,7 +473,14 @@ class CypherQueryBuilder:
         if self.state.limit_value is not None:
             clauses.append(f"{CypherConstants.LIMIT} {self.state.limit_value}")
         
-        return "\n".join(clauses), self.parameters
+        query = "\n".join(clauses)
+        # @@ STEP: Prune parameters that are not referenced in the Cypher text
+        if self.parameters:
+            import re as _re
+            used = set(_re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", query))
+            if used:
+                self.parameters = {k: v for k, v in self.parameters.items() if k in used}
+        return query, self.parameters
     
     def _build_where_clause(self, relationship_alias: Optional[str] = None) -> str:
         """Build WHERE clause from filters."""
@@ -477,15 +503,24 @@ class CypherQueryBuilder:
     def _build_return_clause(self) -> str:
         """Build RETURN clause."""
         if self.state.return_raw:
-            return f"RETURN *"
+            # Return only known aliases instead of RETURN * to avoid exploding result width
+            # Aliases registered: base node alias, join target aliases, and relationship aliases
+            alias_items = []
+            # Ensure deterministic order: source alias first
+            if self.state.alias in self.alias_map:
+                alias_items.append(self.state.alias)
+            for _, v in self.alias_map.items():
+                if v not in alias_items:
+                    alias_items.append(v)
+            return f"RETURN {', '.join(alias_items)}"
 
         if self.state.select_fields:
             items = []
-            for field in self.state.select_fields:
-                if "." in field:
-                    items.append(field)
+            for fld in self.state.select_fields:
+                if "." in fld:
+                    items.append(fld)
                 else:
-                    items.append(f"{self.state.alias}.{field}")
+                    items.append(f"{self.state.alias}.{fld}")
             return f"RETURN {('DISTINCT ' if self.state.distinct else '')}{', '.join(items)}"
         else:
             # @@ STEP: For traversals, return the target node instead of source
@@ -504,12 +539,12 @@ class CypherQueryBuilder:
     def _build_aggregation_return(self) -> List[str]:
         """Build aggregation return items."""
         items = []
-        for alias, (func, field) in self.state.aggregations.items():
+        for alias, (func, fld) in self.state.aggregations.items():
             # @@ STEP: Add alias prefix to field names for aggregations
-            if field != "*":
-                field_with_alias = f"{self.state.alias}.{field}"
+            if fld != "*":
+                field_with_alias = f"{self.state.alias}.{fld}"
             else:
-                field_with_alias = field
+                field_with_alias = fld
             
             if func == AggregateFunction.COUNT_DISTINCT:
                 items.append(f"COUNT(DISTINCT {field_with_alias}) AS {alias}")
@@ -561,9 +596,9 @@ class CypherQueryBuilder:
 
         # Validate that all non-aggregated fields are in GROUP BY
         missing_fields = []
-        for field in non_aggregated_fields:
-            if field not in self.state.group_by:
-                missing_fields.append(field)
+        for fld in non_aggregated_fields:
+            if fld not in self.state.group_by:
+                missing_fields.append(fld)
 
         if missing_fields:
             raise ValueError(
@@ -580,57 +615,25 @@ class CypherQueryBuilder:
         relationships that can exist between multiple node type pairs. Each pattern
         is executed as a separate subquery, and results are combined using UNION ALL.
 
+        The WHERE clause is applied within each subquery to filter correctly before
+        the UNION. The RETURN clause explicitly returns the relationship variable and
+        endpoints to maintain consistent typing across the union.
+
         Args:
             match_patterns: List of MATCH patterns for each relationship pair
+            endpoint_aliases: List of (from_alias, to_alias) tuples for each pair
             rel_alias: Alias for the relationship in the query
             rel_pairs: List of relationship pairs (reserved for future use)
 
         Returns:
             Cypher query string with UNION ALL structure
         """
-        # @@ STEP: rel_pairs parameter reserved for future use in complex relationship handling
-        _ = rel_pairs  # Mark as intentionally unused
+        # rel_pairs reserved for future use in complex relationship handling
+        _ = rel_pairs
 
-        # @@ STEP 1: Build individual subqueries for each relationship pair
-        subqueries = []
-
-        for (pattern, (from_alias, to_alias)) in zip(match_patterns, endpoint_aliases):
-            # || S.S.1: Start building subquery clauses
-            subquery_clauses = [f"MATCH {pattern}"]
-
-            # || S.S.2: Skip WHERE clauses in UNION subqueries to avoid parameter conflicts
-            # || Filtering will be applied at the outer level after UNION
-
-            # || S.S.3: Build explicit return clause for UNION compatibility
-            # || All subqueries must return the same columns for UNION to work
-            # || Use explicit field names to avoid generic column names like col_0, col_1
-            return_items = []
-
-            # || S.S.4: Get field names from the relationship model
-            rel_class = self.state.model_class
-            if hasattr(rel_class, 'model_fields'):
-                for field_name in rel_class.model_fields.keys():
-                    # || S.S.5: Skip internal fields that shouldn't be in results
-                    # || Use constants for relationship field names that should be excluded
-                    excluded_fields = {
-                        DDLConstants.REL_FROM_NODE_FIELD,
-                        DDLConstants.REL_TO_NODE_FIELD
-                    }
-                    if not field_name.startswith('_') and field_name not in excluded_fields:
-                        return_items.append(f"{rel_alias}.{field_name}")
-
-            # || S.S.6: Fallback to .* if no fields found
-            if not return_items:
-                return_items = [f"{rel_alias}.*"]
-
-            subquery_clauses.append(f"RETURN {', '.join(return_items)}, {from_alias} AS {DDLConstants.REL_FROM_NODE_FIELD}, {to_alias} AS {DDLConstants.REL_TO_NODE_FIELD}")
-
-            # || S.S.9: Join clauses into subquery
-            subqueries.append(" ".join(subquery_clauses))
-
-        # @@ STEP 2: Build final UNION query with proper filtering and ordering
-        # || S.S.5: Kuzu doesn't support complex outer query wrapping for UNION
-        # || Apply filters and ordering within each subquery instead
+        # Build subqueries with WHERE applied within each branch for correct filtering
+        # Kuzu doesn't support complex outer query wrapping for UNION, so filters
+        # and ordering must be applied within each subquery
         final_subqueries = []
 
         for (pattern, (from_alias, to_alias)) in zip(match_patterns, endpoint_aliases):

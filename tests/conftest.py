@@ -10,12 +10,13 @@ from __future__ import annotations
 import shutil
 import tempfile
 import uuid
-import gc
 from pathlib import Path
 from typing import Generator, Any, Dict, List
 from unittest.mock import Mock, patch
 
 import pytest
+
+from . import _env  # noqa: F401  # pylint: disable=unused-import
 
 from kuzualchemy import (
     kuzu_node,
@@ -24,7 +25,6 @@ from kuzualchemy import (
     kuzu_field,
     KuzuDataType,
     KuzuSession,
-    SessionFactory,
 )
 from kuzualchemy.constants import KuzuDefaultFunction
 from kuzualchemy.test_utilities import initialize_schema
@@ -50,16 +50,6 @@ def global_registry_cleanup():
     from kuzualchemy import clear_registry
     clear_registry()  # Already includes gc.collect() internally
 
-@pytest.fixture(autouse=True)
-def cleanup_connection_pool():
-    """Automatically clean up connection pool after each test to ensure isolation."""
-    yield
-    # Clean up after each test
-    from src.kuzualchemy.connection_pool import close_all_databases
-    close_all_databases()
-
-
-
 @pytest.fixture(scope="session")
 def test_db_path() -> Generator[Path, None, None]:
     """Create a temporary database path for testing."""
@@ -78,9 +68,6 @@ def kuzu_connection(test_db_path: Path) -> Generator[KuzuSession, None, None]:
         yield conn
     finally:
         conn.close()
-        # Clean up connection pool to prevent test isolation issues
-        from src.kuzualchemy.connection_pool import close_all_databases
-        close_all_databases()
 
 
 
@@ -92,12 +79,6 @@ def kuzu_session(kuzu_connection: KuzuSession) -> Generator[KuzuSession, None, N
         yield session
     finally:
         session.close()
-
-
-@pytest.fixture(scope="function")
-def session_factory(test_db_path: Path) -> SessionFactory:
-    """Create a session factory for testing."""
-    return SessionFactory(test_db_path)
 
 
 # Test model definitions
@@ -163,61 +144,18 @@ def sample_posts() -> List[Dict[str, Any]]:
         {"id": 3, "title": "Third Post", "content": "Yet another post", "author_id": 2},
     ]
 
+# conftest or a helpers module
+import cProfile
+from contextlib import contextmanager
+from pathlib import Path
 
-@pytest.fixture(scope="function")
-def initialized_session(kuzu_session: KuzuSession) -> KuzuSession:
-    """Create a session with initialized schema."""
-    # @@ STEP: Initialize schema using centralized utility
-    initialize_schema(kuzu_session)
-
-    return kuzu_session
-
-
-@pytest.fixture(scope="function")
-def populated_session(
-    initialized_session: KuzuSession,
-    sample_users: List[Dict[str, Any]],
-    sample_posts: List[Dict[str, Any]],
-    test_models: Dict[str, Any]
-) -> KuzuSession:
-    """Create a session with sample data."""
-    TestUser = test_models["TestUser"]
-    TestPost = test_models["TestPost"]
-
-    # Add users
-    for user_data in sample_users:
-        user = TestUser(**user_data)
-        initialized_session.add(user)
-
-    # Add posts
-    for post_data in sample_posts:
-        post = TestPost(**post_data)
-        initialized_session.add(post)
-
-    initialized_session.commit()
-    return initialized_session
-
-
-# Mock fixtures for testing without actual Kuzu installation
-@pytest.fixture(scope="function")
-def mock_kuzu_connection():
-    """Mock Kuzu connection for unit tests."""
-    with patch('src.kuzualchemy.kuzu_session.kuzu') as mock_kuzu:
-        mock_db = Mock()
-        mock_conn = Mock()
-        mock_kuzu.Database.return_value = mock_db
-        mock_kuzu.Connection.return_value = mock_conn
-
-        # Mock execute method
-        mock_conn.execute.return_value = []
-
-        yield mock_conn
-
-
-@pytest.fixture(scope="function")
-def mock_kuzu_session(mock_kuzu_connection):
-    """Mock Kuzu session for unit tests."""
-    with patch('src.kuzualchemy.kuzu_session.KuzuConnection') as mock_conn_class:
-        mock_conn_class.return_value = mock_kuzu_connection
-        session = KuzuSession(db_path=":memory:")
-        yield session
+@contextmanager
+def profile_to(filename: str, folder: str = "profiles"):
+    pr = cProfile.Profile()
+    pr.enable()
+    try:
+        yield
+    finally:
+        pr.disable()
+        Path(folder).mkdir(exist_ok=True)
+        pr.dump_stats(str(Path(folder) / f"{filename}.prof"))

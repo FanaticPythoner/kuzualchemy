@@ -28,7 +28,6 @@ from kuzualchemy import (
     kuzu_field,
     KuzuDataType,
     KuzuSession,
-    SessionFactory,
 )
 from kuzualchemy.test_utilities import initialize_schema
 
@@ -50,18 +49,9 @@ class TestSessionCreationAndInitialization:
             db_path=test_db_path,
             autoflush=False,
             autocommit=True,
-            read_only=True
         )
         assert session.autoflush is False
         assert session.autocommit is True
-        session.close()
-
-    def test_session_factory_creation(self, test_db_path):
-        """Test creating session through SessionFactory."""
-        factory = SessionFactory(test_db_path)
-        session = factory()
-        assert session is not None
-        assert isinstance(session, KuzuSession)
         session.close()
 
     def test_session_initialization_state(self, test_db_path):

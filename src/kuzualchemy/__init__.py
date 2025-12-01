@@ -20,17 +20,11 @@ from importlib import metadata
 
 # Constants
 from .constants import (
-    DatabaseConstants,
     DDLConstants,
     CypherConstants,
     ModelMetadataConstants,
-    SessionConstants,
-    QueryConstants,
     ErrorMessages,
-    LoggingConstants,
-    TypeMappingConstants,
     PerformanceConstants,
-    FileSystemConstants,
     CascadeAction,
 )
 
@@ -311,16 +305,16 @@ from .kuzu_query_expressions import (
 # Session management
 from .kuzu_session import (
     KuzuSession,
-    SessionFactory,
     KuzuConnection,
-    KuzuTransaction,
 )
 
-# Create session_scope alias
-session_scope = SessionFactory.session_scope
-
 # Package metadata - dynamically retrieved from package metadata (PEP 621 compliant)
-__version__ = metadata.version("kuzualchemy")
+try:
+    __version__ = metadata.version("kuzualchemy")
+except Exception as e:
+    print(f"Failed to retrieve version; using 0.0.0+local (it seems we're running from source): {e}")
+    # Fallback when running from source without installed dist-info
+    __version__ = "0.0.0+local"
 __author__ = "FanaticPythoner"  # From pyproject.toml authors
 __email__ = "info@kuzualchemy.com"  # From pyproject.toml authors
 __license__ = "Apache-2.0"  # From pyproject.toml license
@@ -376,10 +370,7 @@ __all__ = [
     "TemporalOperator",
     # Session classes
     "KuzuSession",
-    "SessionFactory",
     "KuzuConnection",
-    "KuzuTransaction",
-    "session_scope",
     # Registry functions
     "get_registered_nodes",
     "get_registered_relationships",
@@ -397,17 +388,11 @@ __all__ = [
     "is_registry_finalized",
     "get_model_creation_order",
     # Constants
-    "DatabaseConstants",
     "DDLConstants",
     "CypherConstants",
     "ModelMetadataConstants",
-    "SessionConstants",
-    "QueryConstants",
     "ErrorMessages",
-    "LoggingConstants",
-    "TypeMappingConstants",
     "PerformanceConstants",
-    "FileSystemConstants",
     # Kuzu functions
     # Text functions
     "concat",

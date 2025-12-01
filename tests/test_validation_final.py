@@ -486,7 +486,7 @@ class TestValidationFinal:
             """Worker function for concurrent operations."""
             # Use read-only session to avoid file locking conflicts
             # The main session is READ_WRITE, concurrent workers use READ_ONLY
-            worker_session = KuzuSession(db_path=str(self.db_path), read_only=True)
+            worker_session = KuzuSession(db_path=str(self.db_path))
             successes = 0
             failures = 0
             

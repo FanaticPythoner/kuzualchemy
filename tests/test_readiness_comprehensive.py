@@ -233,13 +233,6 @@ class TestReadinessComprehensive:
         # Clear registry after each test to prevent memory leaks
         clear_registry()  # Already includes gc.collect() internally
 
-        # Clean up connection pool to prevent test isolation issues
-        try:
-            from src.kuzualchemy.connection_pool import close_all_databases
-            close_all_databases()
-        except ImportError:
-            pass
-
         if Path(self.temp_db).exists():
             shutil.rmtree(self.temp_db, ignore_errors=True)
         
@@ -973,7 +966,7 @@ class TestReadinessComprehensive:
         users_per_second = user_count / total_insert_time
 
         assert avg_batch_time < 15.0, f"Average batch time {avg_batch_time:.2f}s exceeds 15s"
-        assert users_per_second > 500, f"Insert rate {users_per_second:.1f} users/sec below 500/sec minimum"
+        assert users_per_second >= 500, f"Insert rate {users_per_second:.1f} users/sec below 500/sec minimum"
 
         # Phase 2: Large-scale item insertion using BULK INSERT
         item_count = 10000
@@ -996,7 +989,7 @@ class TestReadinessComprehensive:
         item_insert_time = time.time() - start_time
         items_per_second = item_count / item_insert_time
 
-        assert items_per_second > 600, f"Item insert rate {items_per_second:.1f}/sec below 600/sec minimum"
+        assert items_per_second >= 600, f"Item insert rate {items_per_second:.1f}/sec below 600/sec minimum"
 
         # Phase 3: Large-scale relationship creation using BULK INSERT
         relationship_count = 1000
@@ -1022,7 +1015,7 @@ class TestReadinessComprehensive:
         relationship_insert_time = time.time() - start_time
         relationships_per_second = relationship_count / relationship_insert_time
 
-        assert relationships_per_second > 2000, f"Relationship insert rate {relationships_per_second:.1f}/sec below 2000/sec minimum"
+        assert relationships_per_second >= 2000, f"Relationship insert rate {relationships_per_second:.1f}/sec below 2000/sec minimum"
 
         # Phase 4: Complex query performance on large dataset
         query_performance_tests = [
@@ -1190,8 +1183,8 @@ class TestReadinessComprehensive:
             worker_session.close()
 
         # Phase 1: Sequential batch insert test (Kuzu single-writer constraint)
-        num_batches = 5
-        records_per_batch = 100
+        num_batches = 10
+        records_per_batch = 1000
 
         # Create batches of data for sequential processing
         all_batch_data = []
@@ -1221,11 +1214,11 @@ class TestReadinessComprehensive:
 
         # Sequential processing should have 100% success rate
         success_rate = operation_results['insert_success'] / expected_inserts
-        assert success_rate > 0.95, f"Insert success rate {success_rate:.2%} below 95% minimum"
+        assert success_rate >= 0.95, f"Insert success rate {success_rate:.2%} below 95% minimum"
 
         # Phase 2: Concurrent query test (multiple readers allowed)
-        num_query_workers = 5
-        queries_per_worker = 20
+        num_query_workers = 10
+        queries_per_worker = 100
         start_time = time.time()
 
         with ThreadPoolExecutor(max_workers=num_query_workers) as executor:
@@ -1248,7 +1241,7 @@ class TestReadinessComprehensive:
 
         # Queries should have very high success rate
         query_success_rate = operation_results['query_success'] / expected_queries
-        assert query_success_rate > 0.98, f"Query success rate {query_success_rate:.2%} below 98% minimum"
+        assert query_success_rate >= 0.98, f"Query success rate {query_success_rate:.2%} below 98% minimum"
 
         # Phase 3: Validate data consistency after concurrent operations
         final_session = KuzuSession(db_path=str(self.db_path))
@@ -1288,8 +1281,8 @@ class TestReadinessComprehensive:
         print(f"Total insert errors: {operation_results['insert_errors']}, Total query errors: {operation_results['query_errors']}")
         print(f"Actual user count: {actual_user_count}, Expected user count: {operation_results['insert_success']}")
         
-        assert insert_rate > 1000, f"Concurrent insert rate {insert_rate:.1f}/sec below 1000/sec minimum"
-        assert query_rate > 1000, f"Concurrent query rate {query_rate:.1f}/sec below 1000/sec minimum"
+        assert insert_rate >= 1000, f"Concurrent insert rate {insert_rate:.1f}/sec below 1000/sec minimum"
+        assert query_rate >= 1000, f"Concurrent query rate {query_rate:.1f}/sec below 1000/sec minimum"
 
         final_session.close()
 

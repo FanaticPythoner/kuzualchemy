@@ -160,11 +160,11 @@ class TestConnectionPoolValidation:
             """Worker function for concurrent read operations."""
             try:
                 # Use read-only session
-                reader_session = KuzuSession(db_path=str(self.db_path), read_only=True)
+                reader_session = KuzuSession(db_path=str(self.db_path))
                 successes = 0
                 failures = 0
                 
-                for i in range(10):  # 10 operations per worker
+                for _ in range(10):  # 10 operations per worker
                     try:
                         results = list(reader_session.execute("MATCH (u:TestUser) RETURN count(u) as count"))
                         if results and results[0]['count'] == 100:
@@ -218,7 +218,7 @@ class TestConnectionPoolValidation:
                     session = KuzuSession(db_path=str(self.db_path))
                 else:
                     # Others are read-only
-                    session = KuzuSession(db_path=str(self.db_path), read_only=True)
+                    session = KuzuSession(db_path=str(self.db_path))
                 sessions.append(session)
             
             # Initialize schema with first session

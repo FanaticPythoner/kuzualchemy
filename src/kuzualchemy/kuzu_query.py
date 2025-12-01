@@ -75,7 +75,6 @@ class Query(Generic[ModelType]):
         # @@ STEP: Use the correct model class and alias for field resolution
         # || S.S: After traversal, use return_model_class and return_alias for subsequent filters
         target_model = self._state.return_model_class or self._state.model_class
-        target_alias = self._state.return_alias or self._state.alias
 
         for field_name, value in kwargs.items():
             # Create field using model-based resolution; the builder will map model -> alias
@@ -125,6 +124,26 @@ class Query(Generic[ModelType]):
 
         return self._copy_with_state(select_fields=field_names)
 
+    def pairs_subset(self, indices: List[int]) -> Query:
+        """Restrict relationship queries to a subset of pair indices for memory safety."""
+        if indices is None:
+            return self
+        # Strict validation: list of non-negative ints
+        if not isinstance(indices, list) or any(not isinstance(i, int) for i in indices):
+            raise ValueError("pairs_subset expects a list of integers")
+        if any(i < 0 for i in indices):
+            raise ValueError("pairs_subset indices must be non-negative")
+        return self._copy_with_state(pairs_subset=list(indices))
+
+    def return_raw(self) -> Query:
+        """Return all bound aliases and columns as raw dictionaries (RETURN *).
+
+        This is useful for advanced patterns where multiple aliases (e.g., node pairs)
+        are needed from a single query. Mapping to model instances can then be done
+        by downstream code if desired.
+        """
+        return self._copy_with_state(return_raw=True)
+
     def join(
         self,
         target_model_or_rel: Type[Any],
@@ -133,7 +152,11 @@ class Query(Generic[ModelType]):
         target_alias: Optional[str] = None,
         rel_alias: Optional[str] = None,
         conditions: Optional[List[FilterExpression]] = None,
-        **kwargs
+        direction: Optional[Any] = None,
+        pattern: Optional[str] = None,
+        properties: Dict[str, Any] = {},
+        min_hops: int = 1,
+        max_hops: int = 1
     ) -> Query:
         """Join with another node through a relationship.
 
@@ -206,7 +229,11 @@ class Query(Generic[ModelType]):
             target_alias=target_alias,
             rel_alias=rel_alias,
             conditions=conditions,
-            **kwargs
+            direction=direction,
+            pattern=pattern,
+            properties=properties,
+            min_hops=min_hops,
+            max_hops=max_hops
         )
 
         new_joins = list(self._state.joins)
@@ -418,27 +445,43 @@ class Query(Generic[ModelType]):
         if not self._session:
             raise RuntimeError("No session attached to query")
 
+        # Adaptive paging that halves page_size on buffer exhaustion to avoid OOM
+        def is_buffer_exhaustion_error(err: BaseException) -> bool:
+            m = str(err).lower()
+            return (
+                "buffer manager exception" in m
+                or "no more frame groups" in m
+                or "buffer pool is full" in m
+                or "unable to allocate memory" in m
+                or "out of memory" in m
+            )
+
+        ps = int(page_size)
+        pf = 1 if prefetch_pages and prefetch_pages > 0 else 0
+
         def fetch_page(offset: int) -> List[Union[ModelType, Dict[str, Any]]]:
-            q = self.offset(offset).limit(page_size)
-            raw = q._execute()
-            return q._map_results(raw)
+            nonlocal ps, pf
+            while True:
+                q = self.offset(offset).limit(ps)
+                raw = q._execute()
+                return q._map_results(raw)
 
         # Fetch first page synchronously
         offset = 0
         page = fetch_page(offset)
-        offset += page_size
+        offset += ps
 
-        if prefetch_pages > 0:
+        if pf > 0:
             with ThreadPoolExecutor(max_workers=1) as executor:
-                next_future = executor.submit(fetch_page, offset) if len(page) == page_size else None
+                next_future = executor.submit(fetch_page, offset) if len(page) == ps else None
                 while True:
                     for item in page:
                         yield item
-                    if len(page) < page_size:
+                    if len(page) < ps:
                         break
                     next_page = next_future.result() if next_future is not None else fetch_page(offset)
-                    offset += page_size
-                    if len(next_page) == page_size:
+                    offset += ps
+                    if len(next_page) == ps and pf > 0:
                         next_future = executor.submit(fetch_page, offset)
                     else:
                         next_future = None
@@ -447,10 +490,10 @@ class Query(Generic[ModelType]):
             while True:
                 for item in page:
                     yield item
-                if len(page) < page_size:
+                if len(page) < ps:
                     break
                 page = fetch_page(offset)
-                offset += page_size
+                offset += ps
 
     def all(self, as_iterator: bool = False, page_size: Optional[int] = None, prefetch_pages: int = 1) -> Union[List[ModelType], List[Dict[str, Any]], Iterator[Union[ModelType, Dict[str, Any]]]]:
         """Execute query and return all results or an iterator over results with paging.
@@ -638,10 +681,12 @@ class Query(Generic[ModelType]):
                 if type(node_dict) is not dict:
                     logger.error("Endpoint data is not a dict: %r", type(node_dict))
                     raise TypeError("Endpoint data must be a dict")
-                if '_label' not in node_dict:
+                label = node_dict.get('_label')
+                if label is None and '_LABEL' in node_dict:
+                    label = node_dict.get('_LABEL')
+                if label is None:
                     logger.error("Endpoint dict missing _label; keys: %r", list(node_dict.keys()))
                     raise KeyError("Endpoint node missing _label")
-                label = node_dict['_label']
                 # 2) Resolve class by label strictly among declared candidates
                 node_cls: Optional[Type[Any]] = None
                 for cls in candidates:
@@ -707,6 +752,18 @@ class Query(Generic[ModelType]):
                     )
                     raise KeyError("Relationship query results missing required endpoint aliases")
 
+                # Normalize endpoint maps to ensure lowercase '_label' exists when only uppercase is present
+                if isinstance(from_data, dict) and ('_label' not in from_data) and ('_LABEL' in from_data):
+                    try:
+                        from_data['_label'] = from_data['_LABEL']
+                    except Exception:
+                        pass
+                if isinstance(to_data, dict) and ('_label' not in to_data) and ('_LABEL' in to_data):
+                    try:
+                        to_data['_label'] = to_data['_LABEL']
+                    except Exception:
+                        pass
+
                 # Validate endpoint presence and structure (strict)
                 if type(from_data) is not dict or type(to_data) is not dict:
                     logger.error(
@@ -714,7 +771,9 @@ class Query(Generic[ModelType]):
                         type(from_data), type(to_data)
                     )
                     raise TypeError("Endpoint nodes must be dictionaries with Kuzu metadata")
-                if ('_label' not in from_data) or ('_label' not in to_data):
+                from_label_present = (('_label' in from_data) or ('_LABEL' in from_data))
+                to_label_present = (('_label' in to_data) or ('_LABEL' in to_data))
+                if not from_label_present or not to_label_present:
                     logger.error(
                         "Endpoint node missing _label: from_keys=%r to_keys=%r",
                         list(from_data.keys()), list(to_data.keys())
@@ -843,13 +902,10 @@ class Query(Generic[ModelType]):
             if hasattr(model_class, 'model_fields') and field_name in model_class.model_fields:
                 field_info = model_class.model_fields[field_name]
                 meta = _kuzu_registry.get_field_metadata(field_info)
-                # || S.1.2: Convert UUID objects to strings for UUID fields
-                if meta and meta.kuzu_type == KuzuDataType.UUID and hasattr(value, '__class__'):
-                    # Check if it's a UUID object (avoid importing uuid if not needed)
-                    if value.__class__.__name__ == 'UUID':
-                        converted_data[field_name] = str(value)
-                    else:
-                        converted_data[field_name] = value
+                # || S.1.2: Preserve UUID objects for UUID fields; ATP already returns
+                # normalized uuid.UUID instances, and Pydantic can consume them directly.
+                if meta and meta.kuzu_type == KuzuDataType.UUID:
+                    converted_data[field_name] = value
                 else:
                     converted_data[field_name] = value
             else:

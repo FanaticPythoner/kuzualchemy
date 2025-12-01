@@ -15,86 +15,9 @@ used throughout the KuzuAlchemy codebase. No magic values are allowed elsewhere.
 from __future__ import annotations
 
 from enum import Enum, StrEnum
-import os
-from pathlib import Path
 from typing import Final, Any
-import shutil
 
 from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
-
-# ============================================================================
-# DATABASE CONSTANTS
-# ============================================================================
-
-class DatabaseConstants:
-    """Database-related constants."""
-
-    DEFAULT_DB_NAME: Final[str] = "kuzu.db"
-    MEMORY_DB_PATH: Final[str] = ":memory:"
-    # Let Kuzu choose an optimal buffer pool size (~80% of system memory) when 0 is passed.
-    DEFAULT_BUFFER_POOL_SIZE: Final[int] = 0
-
-    # Minimum max DB size Kuzu accepts (8 MiB)
-    MIN_MAX_DB_SIZE_BYTES: Final[int] = 8 * 1024 * 1024
-    # Fraction of free disk space to allow the DB to grow to by default
-    MAX_DB_SIZE_FRACTION_OF_FREE_DISK: Final[float] = 0.90
-    # Absolute cap to avoid pathological mmap requests on constrained environments
-    MAX_DB_SIZE_ABSOLUTE_CAP_BYTES: Final[int] = 1 << 39  # 512 GiB
-
-    DEFAULT_MAX_THREADS: Final[int] = os.cpu_count()
-    DEFAULT_CHECKPOINT_THRESHOLD: Final[int] = 1000000
-
-    @staticmethod
-    def resolve_max_db_size_for_path(db_path: str | Path) -> int:
-        """
-        Compute a safe, high default for Kuzu's ``max_db_size`` based on the host system.
-
-        Strategy
-        --------
-        - Base on the filesystem containing ``db_path``: use ~90% of free space.
-        - Clamp to an absolute cap (512 GiB) to avoid oversized mmap reservations
-          that can fail on some CI/container environments despite 64-bit address space.
-        - Round DOWN to the nearest power of two (Kuzu requires power-of-two size).
-        - Enforce Kuzu's minimum (8 MiB).
-
-        Parameters
-        ----------
-        db_path:
-            Target database file path (may not exist yet). Its parent directory
-            is used to measure available free space.
-
-        Returns
-        -------
-        int
-            Computed ``max_db_size`` in bytes.
-        """
-        # @@ STEP: Resolve the mount point and measure free space
-        path_obj = Path(db_path).resolve()
-        target_dir = path_obj.parent if path_obj.suffix else path_obj
-        # Walk up to the nearest existing parent (handles non-existent temp paths)
-        while not target_dir.exists():
-            if target_dir.parent == target_dir:
-                # Root reached; fallback to root filesystem
-                break
-            target_dir = target_dir.parent
-        usage = shutil.disk_usage(target_dir)
-        free_bytes = usage.free
-
-        # @@ STEP: Compute candidate based on free space fraction and cap
-        candidate = int(free_bytes * DatabaseConstants.MAX_DB_SIZE_FRACTION_OF_FREE_DISK)
-        capped = min(candidate, DatabaseConstants.MAX_DB_SIZE_ABSOLUTE_CAP_BYTES)
-        at_least_min = max(capped, DatabaseConstants.MIN_MAX_DB_SIZE_BYTES)
-
-        # @@ STEP: Round down to nearest power of two
-        # Ensure >0 before bit_length; MIN ensures this.
-        rounded = 1 << (at_least_min.bit_length() - 1)
-
-        # @@ STEP: Guard against rounding below MIN
-        # When at_least_min is already a power of two, it stays the same
-        if rounded < DatabaseConstants.MIN_MAX_DB_SIZE_BYTES:
-            rounded = DatabaseConstants.MIN_MAX_DB_SIZE_BYTES
-
-        return rounded
 
 
 # ============================================================================
@@ -362,70 +285,6 @@ class NodeBaseConstants:
 
 
 # ============================================================================
-# SESSION CONSTANTS
-# ============================================================================
-
-class SessionConstants:
-    """Session management constants."""
-
-    # @@ STEP 1: Define session states
-    STATE_NEW: Final[str] = "new"
-    STATE_DIRTY: Final[str] = "dirty"
-    STATE_DELETED: Final[str] = "deleted"
-    STATE_DETACHED: Final[str] = "detached"
-    STATE_TRANSIENT: Final[str] = "transient"
-    STATE_PERSISTENT: Final[str] = "persistent"
-
-    # @@ STEP 2: Define transaction states
-    TRANSACTION_ACTIVE: Final[str] = "active"
-    TRANSACTION_COMMITTED: Final[str] = "committed"
-    TRANSACTION_ROLLED_BACK: Final[str] = "rolled_back"
-    TRANSACTION_FAILED: Final[str] = "failed"
-
-    # @@ STEP 3: Define flush modes
-    FLUSH_AUTO: Final[str] = "auto"
-    FLUSH_COMMIT: Final[str] = "commit"
-    FLUSH_MANUAL: Final[str] = "manual"
-    FLUSH_ALWAYS: Final[str] = "always"
-
-    # @@ STEP 4: Define batch sizes
-    DEFAULT_BATCH_SIZE: Final[int] = 1000
-    MAX_BATCH_SIZE: Final[int] = 10000
-    MIN_BATCH_SIZE: Final[int] = 1
-
-
-# ============================================================================
-# QUERY CONSTANTS
-# ============================================================================
-
-class QueryConstants:
-    """Query building constants."""
-
-    # @@ STEP 1: Define query states
-    QUERY_STATE_INIT: Final[str] = "initialized"
-    QUERY_STATE_BUILT: Final[str] = "built"
-    QUERY_STATE_EXECUTED: Final[str] = "executed"
-    QUERY_STATE_FAILED: Final[str] = "failed"
-
-    # @@ STEP 2: Define default aliases
-    DEFAULT_NODE_ALIAS: Final[str] = "n"
-    DEFAULT_REL_ALIAS: Final[str] = "r"
-    DEFAULT_PATH_ALIAS: Final[str] = "p"
-    ALIAS_PREFIX: Final[str] = "n"
-    ALIAS_SEPARATOR: Final[str] = "_"
-
-    # @@ STEP 3: Define query limits
-    DEFAULT_LIMIT: Final[int] = 1000
-    MAX_LIMIT: Final[int] = 100000
-    DEFAULT_OFFSET: Final[int] = 0
-
-    # @@ STEP 4: Define query modes
-    MODE_READ: Final[str] = "read"
-    MODE_WRITE: Final[str] = "write"
-    MODE_READ_WRITE: Final[str] = "read_write"
-
-
-# ============================================================================
 # ERROR MESSAGE CONSTANTS
 # ============================================================================
 
@@ -487,88 +346,6 @@ class ErrorMessages:
     NOT_IMPLEMENTED: Final[str] = "Feature not implemented: {feature}"
     INTERNAL_ERROR: Final[str] = "Internal error: {error}"
 
-
-# ============================================================================
-# LOGGING CONSTANTS
-# ============================================================================
-
-class LoggingConstants:
-    """Logging constants."""
-
-    # @@ STEP 1: Define log levels
-    LOG_DEBUG: Final[str] = "DEBUG"
-    LOG_INFO: Final[str] = "INFO"
-    LOG_WARNING: Final[str] = "WARNING"
-    LOG_ERROR: Final[str] = "ERROR"
-    LOG_CRITICAL: Final[str] = "CRITICAL"
-
-    # @@ STEP 2: Define log formats
-    LOG_FORMAT: Final[str] = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    LOG_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
-
-    # @@ STEP 3: Define logger names
-    LOGGER_ORM: Final[str] = "kuzualchemy.orm"
-    LOGGER_QUERY: Final[str] = "kuzualchemy.query"
-    LOGGER_SESSION: Final[str] = "kuzualchemy.session"
-    LOGGER_DDL: Final[str] = "kuzualchemy.ddl"
-
-    # @@ STEP 4: Define log message templates
-    CONNECTION_REUSE_ERROR_MSG: Final[str] = (
-        "Connection reuse failed for query: {query}. Error: {error}. "
-        "Falling back to normal execution."
-    )
-
-
-# ============================================================================
-# TYPE MAPPING CONSTANTS
-# ============================================================================
-
-class TypeMappingConstants:
-    """Type mapping constants between Python and Kuzu."""
-
-    # @@ STEP 1: Define Python to Kuzu type mappings
-    PYTHON_TO_KUZU: Final[dict[str, str]] = {
-        "int": "INT64",
-        "float": "DOUBLE",
-        "str": "STRING",
-        "bool": "BOOL",
-        "bytes": "BLOB",
-        "datetime": "TIMESTAMP",
-        "date": "DATE",
-        "time": "INTERVAL",
-        "uuid": "UUID",
-        "list": "LIST",
-        "dict": "STRUCT",
-        "set": "SET",
-    }
-
-    # @@ STEP 2: Define Kuzu to Python type mappings
-    KUZU_TO_PYTHON: Final[dict[str, str]] = {
-        "INT8": "int",
-        "INT16": "int",
-        "INT32": "int",
-        "INT64": "int",
-        "INT128": "int",
-        "UINT8": "int",
-        "UINT16": "int",
-        "UINT32": "int",
-        "UINT64": "int",
-        "FLOAT": "float",
-        "DOUBLE": "float",
-        "STRING": "str",
-        "BOOL": "bool",
-        "BLOB": "bytes",
-        "TIMESTAMP": "datetime",
-        "DATE": "date",
-        "INTERVAL": "timedelta",
-        "UUID": "uuid",
-        "LIST": "list",
-        "STRUCT": "dict",
-        "SET": "set",
-        "MAP": "dict",
-    }
-
-
 # ============================================================================
 # PERFORMANCE CONSTANTS
 # ============================================================================
@@ -581,7 +358,7 @@ class PerformanceConstants:
     CACHE_TTL: Final[int] = 3600  # 1 hour in seconds
     CACHE_MAX_AGE: Final[int] = 86400  # 24 hours in seconds
 
-    # @@ STEP 2: Define pool settings
+    # @@ STEP 2: Define pool settings (fixed constants; no env)
     CONNECTION_POOL_SIZE: Final[int] = 10
     CONNECTION_POOL_MAX_OVERFLOW: Final[int] = 20
     CONNECTION_POOL_TIMEOUT: Final[int] = 30
@@ -596,77 +373,11 @@ class PerformanceConstants:
     BATCH_UPDATE_SIZE: Final[int] = 500
     BATCH_DELETE_SIZE: Final[int] = 500
 
-    # @@ STEP 5: Define session optimization settings
+    # @@ STEP 5: Define session optimization settings (fixed constants; no env)
     CONNECTION_REUSE_THRESHOLD: Final[int] = 5  # Reuse connection for N operations
     AUTOFLUSH_BATCH_SIZE: Final[int] = 100  # Batch size before forcing flush
     IDENTITY_MAP_INITIAL_SIZE: Final[int] = 256  # Initial identity map size
     METADATA_CACHE_SIZE: Final[int] = 500  # Cache size for model metadata
-
-
-# ============================================================================
-# FILE SYSTEM CONSTANTS
-# ============================================================================
-
-class FileSystemConstants:
-    """File system constants."""
-
-    # @@ STEP 1: Define file extensions
-    DB_FILE_EXTENSION: Final[str] = ".db"
-    BACKUP_FILE_EXTENSION: Final[str] = ".bak"
-    LOG_FILE_EXTENSION: Final[str] = ".log"
-    SCHEMA_FILE_EXTENSION: Final[str] = ".ddl"
-
-    # @@ STEP 2: Define directory names
-    DB_DIR: Final[str] = "data"
-    BACKUP_DIR: Final[str] = "backups"
-    LOG_DIR: Final[str] = "logs"
-    TEMP_DIR: Final[str] = "tmp"
-
-    # @@ STEP 3: Define file permissions
-    DEFAULT_FILE_MODE: Final[int] = 0o644
-    DEFAULT_DIR_MODE: Final[int] = 0o755
-    SECURE_FILE_MODE: Final[int] = 0o600
-    SECURE_DIR_MODE: Final[int] = 0o700
-
-
-# ============================================================================
-# PACKAGE METADATA CONSTANTS
-# ============================================================================
-# || S.S. Package metadata is now managed via pyproject.toml for PEP 621 compliance
-# || S.S. All package constants (version, author, email, license, etc.) are retrieved
-# || S.S. dynamically from package metadata in __init__.py using importlib.metadata
-
-
-# ============================================================================
-# ENUM CACHE CONSTANTS
-# ============================================================================
-
-class EnumCacheConstants:
-    """Constants for enum caching system."""
-
-    # @@ STEP 1: Define cache keys
-    NAMES_KEY: Final[str] = "names"
-    VALUES_KEY: Final[str] = "values"
-
-    # @@ STEP 2: Define cache behavior
-    CACHE_ENABLED: Final[bool] = True
-    MAX_CACHE_SIZE: Final[int] = 1000
-
-
-# ============================================================================
-# FUNCTION TYPE CONSTANTS
-# ============================================================================
-
-class FunctionTypeConstants:
-    """Constants for function type system."""
-
-    # @@ STEP 1: Define error messages
-    NEXTVAL_REQUIRES_SEQUENCE: Final[str] = "NEXTVAL requires a sequence name argument"
-
-    # @@ STEP 2: Define function categories
-    TIME_FUNCTION_CATEGORY: Final[str] = "time"
-    UUID_FUNCTION_CATEGORY: Final[str] = "uuid"
-    SEQUENCE_FUNCTION_CATEGORY: Final[str] = "sequence"
 
 
 # ============================================================================
@@ -766,6 +477,7 @@ class KuzuDataType(StrEnum):
 
     # @@ STEP 6: Define temporal types
     DATE: Final[str] = "DATE"
+    TIME: Final[str] = "TIME"
     TIMESTAMP: Final[str] = "TIMESTAMP"
     TIMESTAMP_NS: Final[str] = "TIMESTAMP_NS"
     TIMESTAMP_MS: Final[str] = "TIMESTAMP_MS"
@@ -830,14 +542,7 @@ class ArrayTypeConstants:
 
 class QueryFieldConstants:
     """Constants for query field operations."""
-
-    # @@ STEP 1: Define field access patterns
     PRIVATE_FIELD_PREFIX: Final[str] = "_"
-    COLUMN_PREFIX: Final[str] = "col_"
-
-    # @@ STEP 2: Define order directions
-    ASC_SUFFIX: Final[str] = " ASC"
-    DESC_SUFFIX: Final[str] = " DESC"
 
 
 # ============================================================================
@@ -1023,22 +728,14 @@ class RelationshipNodeTypeQueryErrorConstants:
 # ============================================================================
 
 __all__ = [
-    "DatabaseConstants",
     "KuzuDefaultFunction",
     "DDLConstants",
     "DDLMessageConstants",
     "CypherConstants",
     "ModelMetadataConstants",
     "NodeBaseConstants",
-    "SessionConstants",
-    "QueryConstants",
     "ErrorMessages",
-    "LoggingConstants",
-    "TypeMappingConstants",
     "PerformanceConstants",
-    "FileSystemConstants",
-    "EnumCacheConstants",
-    "FunctionTypeConstants",
     "DefaultValueConstants",
     "RelationshipDirection",
     "KuzuDataType",

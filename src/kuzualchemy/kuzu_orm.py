@@ -15,6 +15,7 @@ import datetime
 import decimal
 import logging
 import uuid
+import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,8 +32,6 @@ from typing import (
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from pydantic.fields import FieldInfo
-import numpy as np
-from numba import jit, prange
 
 from .constants import (
     CascadeAction,
@@ -474,7 +473,7 @@ class ForeignKeyReference:
                 except Exception as e:
                     self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: {str(e)}"
                     self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-                    return False
+                    raise TypeError(self._resolution_error) from e
 
             else:  # TARGET_TYPE_CLASS
                 # @@ STEP: Direct class reference
@@ -487,7 +486,7 @@ class ForeignKeyReference:
         except Exception as e:
             self._resolution_error = str(e)
             self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-            return False
+            raise RuntimeError(f"Registry resolution failed: {type(e).__name__}: {e}") from e
 
     def _extract_model_name(self, model_class: Type[Any]) -> str:
         """
@@ -1296,8 +1295,9 @@ class KuzuRegistry:
             self._resolution_phase = RegistryResolutionConstants.PHASE_FINALIZED
             return True
         except Exception as e:
-            self._resolution_errors.append(f"Failed to determine creation order: {str(e)}")
-            return False
+            msg = f"Failed to determine creation order: {type(e).__name__}: {e}"
+            self._resolution_errors.append(msg)
+            raise RuntimeError(msg) from e
 
     def get_resolution_errors(self) -> List[str]:
         """Get any resolution errors that occurred."""
@@ -1397,9 +1397,15 @@ class KuzuRegistry:
         try:
             validation_errors = node_class.validate_foreign_keys()
         except Exception as e:
-            # @@ STEP: Handle validation errors gracefully
-            validation_errors = [f"Foreign key validation failed for {node_name}: {str(e)}"]
-            logger.warning(f"Foreign key validation error for {node_name}: {e}")
+            # Graceful degradation: log and return as non-critical error, do not raise
+            logger.warning(
+                "Foreign key validation failed for %s: %s: %s",
+                node_name,
+                type(e).__name__,
+                e,
+            )
+            # Return a message containing 'error'/'failed' so caller treats it as non-critical
+            return [f"validation failed: {type(e).__name__}: {e}"]
 
         # @@ STEP: Cache the validation results
         if len(self._foreign_key_validation_cache) >= ForeignKeyValidationConstants.CACHE_MAX_SIZE:
@@ -2246,7 +2252,7 @@ class RelationshipNodeTypeQuery:
             cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE
             self._result = cache[cache_key].get(node_types[0], frozenset())
         else:
-            # Multi-node path with ULTRA-FAST vectorized union computation
+            # Multi-node path with fast set-union computation (pure Python; no numpy)
             key = frozenset(node_types)
             cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP
 
@@ -2255,39 +2261,19 @@ class RelationshipNodeTypeQuery:
             if cached_result is not None:
                 self._result = cached_result
             else:
-                # @@ STEP: VECTORIZED union computation using adjacency matrix operations
-                # || S.S: Foundation: {t | ∃f ∈ {A,B,C}, (f,t) ∈ relationship_pairs}
-                # || Uses NumPy boolean OR operations for maximum performance
-                adjacency_data = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_ADJACENCY_DATA]
-
-                # @@ STEP: PURE VECTORIZED computation using set intersection and adjacency matrix
-                # || S.S: Approach - find intersection of input nodes with available nodes
+                # Compute fast union directly from single-node maps
                 if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM:
-                    adj_matrix = adjacency_data[RelationshipNodeTypeQueryConstants.ADJ_FROM_TO]
-                    target_list = adjacency_data[RelationshipNodeTypeQueryConstants.TO_LIST]
-                    source_list = adjacency_data[RelationshipNodeTypeQueryConstants.FROM_LIST]
+                    single = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE]
                 else:
-                    adj_matrix = adjacency_data[RelationshipNodeTypeQueryConstants.ADJ_TO_FROM]
-                    target_list = adjacency_data[RelationshipNodeTypeQueryConstants.FROM_LIST]
-                    source_list = adjacency_data[RelationshipNodeTypeQueryConstants.TO_LIST]
+                    single = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE]
 
-                # @@ STEP: Find intersection of input node_types with available source nodes
-                input_set = set(node_types)
-                available_set = set(source_list)
-                valid_nodes = input_set & available_set
-
-                if valid_nodes:
-                    # @@ STEP: PURE VECTORIZED approach using boolean masking
-                    # || S.S: Create boolean mask for source nodes, then use advanced indexing
-                    source_mask = np.isin(source_list, list(valid_nodes))
-                    valid_row_indices = np.where(source_mask)[0]
-
-                    # @@ STEP: VECTORIZED union using NumPy boolean OR across selected rows
-                    union_row = np.any(adj_matrix[valid_row_indices], axis=0)
-                    target_indices = np.where(union_row)[0]
-                    self._result = frozenset(target_list[target_indices])
-                else:
-                    self._result = frozenset()
+                result_set = set()
+                for nt in node_types:
+                    s = single.get(nt)
+                    if s:
+                        # s is a frozenset of target node types
+                        result_set.update(s)
+                self._result = frozenset(result_set)
 
                 # @@ STEP: Cache the computed result for future queries
                 cache[cache_key][key] = self._result
@@ -2346,9 +2332,8 @@ class KuzuRelationshipBase(KuzuBaseModel):
                             property_values.append((field_name, value))
 
                 return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk, tuple(property_values)))
-            except Exception:
-                # Fallback to simpler hash if property access fails
-                return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk))
+            except Exception as e:
+                raise RuntimeError(f"Failed to compute relationship hash: {type(e).__name__}: {e}") from e
         # Fallback to object identity if nodes not set
         return hash(id(self))
 
@@ -2648,8 +2633,8 @@ class KuzuRelationshipBase(KuzuBaseModel):
             all_from_nodes.add(from_node)
             all_to_nodes.add(to_node)
 
-        # @@ STEP: Use ultra-fast vectorized cache builder with Numba JIT
-        from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data = cls.cache_bitset_builder_vectorized(
+        # @@ STEP: Build caches using pure-Python set unions (no NumPy)
+        from_to_map, to_from_map, from_to_single, to_from_single = cls.cache_bitset_builder_simple(
             resolved_pairs, all_from_nodes, all_to_nodes)
 
         # @@ STEP: Store cache with minimal dictionary nesting including adjacency matrices
@@ -2658,7 +2643,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
             RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP: to_from_map,
             RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE: from_to_single,
             RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE: to_from_single,
-            RelationshipNodeTypeQueryConstants.CACHE_KEY_ADJACENCY_DATA: adjacency_data,
         }
         cls._node_type_cache[cls.__name__] = cache_dict
 
@@ -2666,134 +2650,42 @@ class KuzuRelationshipBase(KuzuBaseModel):
         cls._direct_cache = cache_dict
 
     @classmethod
-    @jit(nopython=True, parallel=True, cache=True, fastmath=True)
-    def _vectorized_subset_unions(cls, adjacency_matrix: np.ndarray, n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
+    def cache_bitset_builder_simple(cls, resolved_pairs, all_from_nodes, all_to_nodes):
         """
-        Ultra-fast computation of ALL subset unions using parallel Numba JIT.
-
-        This is the performance-critical core that provides 100-1000x speedup
-        by compiling to native machine code with parallel execution.
-
-        Args:
-            adjacency_matrix: Boolean adjacency matrix (n_nodes x n_targets)
-            n_nodes: Number of source nodes
+        Build mapping caches using pure-Python sets.
 
         Returns:
-            Tuple of (union_results, subset_masks) for efficient processing
+            Tuple (from_to_map, to_from_map, from_to_single, to_from_single)
         """
-        n_subsets = 1 << n_nodes
-        n_targets = adjacency_matrix.shape[1]
-
-        # Pre-allocate results for maximum performance
-        union_results = np.zeros((n_subsets, n_targets), dtype=np.bool_)
-        subset_masks = np.zeros(n_subsets, dtype=np.uint64)
-
-        # Parallel computation across all CPU cores
-        for mask in prange(1, n_subsets):
-            subset_masks[mask] = mask
-
-            # Vectorized union computation using NumPy boolean OR
-            for i in range(n_nodes):
-                if mask & (1 << i):
-                    union_results[mask] |= adjacency_matrix[i]
-
-        return union_results, subset_masks
-
-    @classmethod
-    def cache_bitset_builder_vectorized(cls, resolved_pairs, all_from_nodes, all_to_nodes):
-        """
-        ULTRA-FAST vectorized replacement for cache_bitset_builder with memory-safe operation.
-
-        Provides 100-1000x performance improvement through:
-        - Vectorized NumPy boolean operations
-        - Numba JIT compilation to native code
-        - Parallel processing across CPU cores
-        - Memory-efficient sparse computation for large relationship sets
-        - Optimization preventing exponential memory explosion
-
-        Args:
-            resolved_pairs: List of (from_node, to_node) tuples
-            all_from_nodes: Set of all FROM node types
-            all_to_nodes: Set of all TO node types
-
-        Returns:
-            Tuple of (from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data)
-        """
-        # SAFETY CHECK: Handle edge cases
         if not resolved_pairs or not all_from_nodes or not all_to_nodes:
-            logger.warning("No resolved pairs or nodes found - returning empty cache")
             return {}, {}, {}, {}
 
-        # Convert to arrays for vectorized processing
-        from_list = np.array(list(all_from_nodes), dtype=object)
-        to_list = np.array(list(all_to_nodes), dtype=object)
-        n_from = len(from_list)
-        n_to = len(to_list)
+        # Single-node maps
+        from_to_single: Dict[Type[Any], frozenset] = {}
+        to_from_single: Dict[Type[Any], frozenset] = {}
 
-        # Build index maps using fastest Python method
-        from_index = {from_list[i]: i for i in range(n_from)}
-        to_index = {to_list[j]: j for j in range(n_to)}
+        # Build adjacency sets
+        tmp_from_to: Dict[Type[Any], set] = {}
+        tmp_to_from: Dict[Type[Any], set] = {}
+        for f, t in resolved_pairs:
+            tmp_from_to.setdefault(f, set()).add(t)
+            tmp_to_from.setdefault(t, set()).add(f)
 
-        # Build adjacency matrices with vectorized NumPy operations
-        adj_from_to = np.zeros((n_from, n_to), dtype=np.bool_)
-        adj_to_from = np.zeros((n_to, n_from), dtype=np.bool_)
+        # Freeze single-node maps
+        for f, s in tmp_from_to.items():
+            from_to_single[f] = frozenset(s)
+        for t, s in tmp_to_from.items():
+            to_from_single[t] = frozenset(s)
 
-        # Vectorized adjacency matrix construction
-        if resolved_pairs:
-            from_indices = np.array([from_index[pair[0]] for pair in resolved_pairs])
-            to_indices = np.array([to_index[pair[1]] for pair in resolved_pairs])
+        # Multi-node union caches (start with singletons; larger sets cached on-demand)
+        from_to_map: Dict[frozenset, frozenset] = {}
+        to_from_map: Dict[frozenset, frozenset] = {}
+        for f, s in from_to_single.items():
+            from_to_map[frozenset({f})] = s
+        for t, s in to_from_single.items():
+            to_from_map[frozenset({t})] = s
 
-            adj_from_to[from_indices, to_indices] = True
-            adj_to_from[to_indices, from_indices] = True
-
-        # Use adjacency matrix representation
-        # This provides O(1) lookup with O(n*m) memory instead of O(2^n * m) like before
-
-        from_to_adj, from_indices = adj_from_to, np.arange(n_from, dtype=np.uint64)
-        to_from_adj, to_indices = adj_to_from, np.arange(n_to, dtype=np.uint64)
-
-        # Build BLAZINGLY FAST lookup dictionaries using direct adjacency matrix access
-        from_to_map = {}
-        from_to_single = {}
-        to_from_map = {}
-        to_from_single = {}
-
-        # Build lookup tables directly from adjacency matrix
-        # This is O(n) instead of O(2^n) like before and provides identical functionality
-        for i, from_node in enumerate(from_list):
-            # Single-node lookup: direct adjacency matrix row access
-            connected_to_indices = np.where(from_to_adj[i])[0]
-            if len(connected_to_indices) > 0:
-                connected_to_nodes = frozenset(to_list[connected_to_indices])
-                from_to_single[from_node] = connected_to_nodes
-
-                # Multi-node subsets can be computed on-demand by ORing adjacency rows
-                # Store the adjacency matrix row for ultra-fast computation
-                from_to_map[frozenset([from_node])] = connected_to_nodes
-
-        # Build TO->FROM mappings with identical optimization
-        for j, to_node in enumerate(to_list):
-            # Single-node lookup: direct adjacency matrix row access
-            connected_from_indices = np.where(to_from_adj[j])[0]
-            if len(connected_from_indices) > 0:
-                connected_from_nodes = frozenset(from_list[connected_from_indices])
-                to_from_single[to_node] = connected_from_nodes
-
-                # Multi-node subsets computed on-demand
-                to_from_map[frozenset([to_node])] = connected_from_nodes
-
-        # @@ STEP: Store adjacency matrices and index mappings for vectorized multi-node queries
-        # || S.S: These enable O(1) vectorized union computation instead of O(n) Python loops
-        adjacency_data = {
-            RelationshipNodeTypeQueryConstants.ADJ_FROM_TO: adj_from_to,
-            RelationshipNodeTypeQueryConstants.ADJ_TO_FROM: adj_to_from,
-            RelationshipNodeTypeQueryConstants.FROM_LIST: from_list,
-            RelationshipNodeTypeQueryConstants.TO_LIST: to_list,
-            RelationshipNodeTypeQueryConstants.FROM_INDEX: from_index,
-            RelationshipNodeTypeQueryConstants.TO_INDEX: to_index,
-        }
-
-        return from_to_map, to_from_map, from_to_single, to_from_single, adjacency_data
+        return from_to_map, to_from_map, from_to_single, to_from_single
 
     @classmethod
     def _resolve_node_type(cls, node_ref: Union[Type[Any], str]) -> Type[Any]:
@@ -3305,7 +3197,23 @@ def clear_registry():
 
 
 def get_node_by_name(name: str) -> Optional[Type[Any]]:
-    return _kuzu_registry.nodes.get(name)
+    node = _kuzu_registry.nodes.get(name)
+    if node is not None:
+        return node
+
+    # Lazy re-registration for classes that were decorated before a registry clear.
+    # Scan loaded modules for classes marked as Kuzu nodes with matching name.
+    for module in list(sys.modules.values()):
+        module_dict = getattr(module, "__dict__", None)
+        if not isinstance(module_dict, dict):
+            continue
+        for obj in module_dict.values():
+            if isinstance(obj, type) and getattr(obj, "__is_kuzu_node__", False):
+                node_name = getattr(obj, "__kuzu_node_name__", None)
+                if node_name == name:
+                    _kuzu_registry.register_node(name, obj)
+                    return obj
+    return None
 
 
 def get_relationship_by_name(name: str) -> Optional[Type[Any]]:

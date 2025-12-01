@@ -37,168 +37,47 @@ from kuzualchemy.test_utilities import initialize_schema
 class TestConnectionReuseExceptionHandling:
     """tests for connection reuse exception handling."""
     
-    def test_connection_error_during_reuse_logs_and_falls_back(self, test_db_path):
-        """Test that ConnectionError during reuse is logged and falls back gracefully."""
+    def test_connection_error_propagates_under_atp(self, test_db_path):
+        """ConnectionError in underlying execution should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
-        
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 1
-        
-        # Mock the reused connection to raise ConnectionError
-        session._reused_connection.execute.side_effect = ConnectionError("Connection lost")
-        
-        # Mock the main connection to succeed
-        session._conn.execute = Mock(return_value="success")
-        
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            result = session._execute_with_connection_reuse("RETURN 1")
-            
-            # Verify fallback succeeded
-            assert result == "success"
-            
-            # Verify connection reuse state was reset to main connection for future reuse
-            assert session._reused_connection is session._conn
-            assert session._connection_operation_count == 1
-            
-            # Verify warning was logged
-            mock_logger.warning.assert_called_once()
-            warning_call = mock_logger.warning.call_args[0][0]
-            assert "Connection reuse failed" in warning_call
-            assert "Connection lost" in warning_call
+        session._conn.execute = Mock(side_effect=ConnectionError("Connection lost"))
+        with pytest.raises(ConnectionError, match="Connection lost"):
+            session._execute_with_connection_reuse("RETURN 1")
     
-    def test_os_error_during_reuse_logs_and_falls_back(self, test_db_path):
-        """Test that OSError during reuse is logged and falls back gracefully."""
+    def test_os_error_propagates_under_atp(self, test_db_path):
+        """OSError in underlying execution should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
-        
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 2
-        
-        # Mock the reused connection to raise OSError
-        session._reused_connection.execute.side_effect = OSError("File descriptor error")
-        
-        # Mock the main connection to succeed
-        session._conn.execute = Mock(return_value="fallback_success")
-        
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            result = session._execute_with_connection_reuse("MATCH (n) RETURN n")
-            
-            # Verify fallback succeeded
-            assert result == "fallback_success"
-            
-            # Verify connection reuse state was reset to main connection for future reuse
-            assert session._reused_connection is session._conn
-            assert session._connection_operation_count == 1
-            
-            # Verify warning was logged
-            mock_logger.warning.assert_called_once()
+        session._conn.execute = Mock(side_effect=OSError("File descriptor error"))
+        with pytest.raises(OSError, match="File descriptor error"):
+            session._execute_with_connection_reuse("MATCH (n) RETURN n")
     
-    def test_runtime_error_during_reuse_logs_and_falls_back(self, test_db_path):
-        """Test that RuntimeError during reuse is logged and falls back gracefully."""
+    def test_runtime_error_propagates_under_atp(self, test_db_path):
+        """RuntimeError in underlying execution should propagate under ATP (write path)."""
         session = KuzuSession(db_path=test_db_path)
-        
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 3
-        
-        # Mock the reused connection to raise RuntimeError
-        session._reused_connection.execute.side_effect = RuntimeError("Database runtime error")
-        
-        # Mock the main connection to succeed
-        session._conn.execute = Mock(return_value="runtime_fallback")
-        
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            result = session._execute_with_connection_reuse("CREATE (n:Test)")
-            
-            # Verify fallback succeeded
-            assert result == "runtime_fallback"
-            
-            # Verify connection reuse state was reset to main connection for future reuse
-            assert session._reused_connection is session._conn
-            assert session._connection_operation_count == 1
-            
-            # Verify warning was logged
-            mock_logger.warning.assert_called_once()
+        session._conn._atp.run_cypher = Mock(side_effect=RuntimeError("Database runtime error"))
+        with pytest.raises(RuntimeError, match="Database runtime error"):
+            session._execute_with_connection_reuse("CREATE (n:Test)")
     
-    def test_value_error_during_reuse_logs_and_falls_back(self, test_db_path):
-        """Test that ValueError during reuse is treated as connection error and falls back."""
+    def test_value_error_propagates_under_atp(self, test_db_path):
+        """ValueError in underlying execution should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
-
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 1
-
-        # Mock the reused connection to raise ValueError (treated as connection error)
-        session._reused_connection.execute.side_effect = ValueError("Connection validation error")
-
-        # Mock the main connection to succeed
-        session._conn.execute = Mock(return_value="value_error_fallback")
-
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            result = session._execute_with_connection_reuse("RETURN 1")
-
-            # Verify fallback succeeded
-            assert result == "value_error_fallback"
-
-            # Verify connection reuse state was reset to main connection for future reuse
-            assert session._reused_connection is session._conn
-            assert session._connection_operation_count == 1
-
-            # Verify warning was logged
-            mock_logger.warning.assert_called_once()
-            warning_call = mock_logger.warning.call_args[0][0]
-            assert "Connection reuse failed" in warning_call
-            assert "Connection validation error" in warning_call
+        session._conn.execute = Mock(side_effect=ValueError("Connection validation error"))
+        with pytest.raises(ValueError, match="Connection validation error"):
+            session._execute_with_connection_reuse("RETURN 1")
     
-    def test_unexpected_exception_during_reuse_logs_and_reraises(self, test_db_path):
-        """Test that truly unexpected exceptions during reuse are logged and re-raised."""
+    def test_unexpected_exception_propagates_under_atp(self, test_db_path):
+        """Unexpected exceptions should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
+        session._conn.execute = Mock(side_effect=TypeError("Unexpected type error"))
+        with pytest.raises(TypeError, match="Unexpected type error"):
+            session._execute_with_connection_reuse("RETURN 1")
 
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 1
-
-        # Mock the reused connection to raise an unexpected exception (not a connection error)
-        unexpected_error = TypeError("Unexpected type error")
-        session._reused_connection.execute.side_effect = unexpected_error
-
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            with pytest.raises(TypeError, match="Unexpected type error"):
-                session._execute_with_connection_reuse("RETURN 1")
-
-            # Verify connection reuse state was reset before re-raising
-            assert session._reused_connection is None
-            assert session._connection_operation_count == 0
-
-            # Verify error was logged
-            mock_logger.error.assert_called_once()
-            error_call = mock_logger.error.call_args[0][0]
-            assert "Unexpected error during connection reuse" in error_call
-            assert "Unexpected type error" in error_call
-
-    def test_memory_error_during_reuse_logs_and_reraises(self, test_db_path):
-        """Test that MemoryError during reuse is logged and re-raised."""
+    def test_memory_error_propagates_under_atp(self, test_db_path):
+        """MemoryError should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
-        
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 4
-        
-        # Mock the reused connection to raise MemoryError
-        memory_error = MemoryError("Out of memory")
-        session._reused_connection.execute.side_effect = memory_error
-        
-        with patch('kuzualchemy.kuzu_session.logger') as mock_logger:
-            with pytest.raises(MemoryError, match="Out of memory"):
-                session._execute_with_connection_reuse("MATCH (n) RETURN n LIMIT 1000000")
-            
-            # Verify connection reuse state was reset before re-raising
-            assert session._reused_connection is None
-            assert session._connection_operation_count == 0
-            
-            # Verify error was logged
-            mock_logger.error.assert_called_once()
+        session._conn.execute = Mock(side_effect=MemoryError("Out of memory"))
+        with pytest.raises(MemoryError, match="Out of memory"):
+            session._execute_with_connection_reuse("MATCH (n) RETURN n LIMIT 1000000")
 
 
 # @@ STEP: UUID Type Safety Enforcement Tests
@@ -492,56 +371,42 @@ class TestConcurrentUUIDHandling:
                 assert not validation_passed, f"Thread {thread_id}: Expected invalid UUID to fail validation"
                 assert error is not None, f"Thread {thread_id}: Expected error message for invalid UUID"
 
-    def test_concurrent_connection_reuse_exception_handling(self, test_db_path):
-        """Test connection reuse exception handling under concurrent access."""
+    def test_concurrent_exception_handling_under_atp(self, test_db_path):
+        """Test exception handling under concurrent access with ATP-managed execution."""
         session = KuzuSession(db_path=test_db_path)
 
-        # Set up connection reuse state
-        session._reused_connection = Mock()
-        session._connection_operation_count = 1
-
-        # Create a lock to synchronize exception raising
+        # Create a lock to synchronize exception raising across threads
         exception_lock = threading.Lock()
         exception_count = 0
 
-        def execute_with_exception():
+        def execute_side_effect(*_args, **_kwargs):
             nonlocal exception_count
             with exception_lock:
                 exception_count += 1
                 if exception_count <= 3:
                     raise ConnectionError(f"Connection error {exception_count}")
-                else:
-                    return f"success_{exception_count}"
+                return f"success_{exception_count}"
 
-        session._reused_connection.execute.side_effect = execute_with_exception
-        session._conn.execute = Mock(return_value="fallback_success")
+        session._conn.execute = Mock(side_effect=execute_side_effect)
 
         results = []
 
         def execute_query_in_thread(query: str, thread_id: int):
-            """Execute query in a separate thread."""
             try:
-                with patch('kuzualchemy.kuzu_session.logger'):
-                    result = session._execute_with_connection_reuse(query)
+                result = session._execute_with_connection_reuse(query)
                 return (thread_id, result, None)
             except Exception as e:
                 return (thread_id, None, str(e))
 
-        # Run queries concurrently
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = []
             for i in range(5):
-                future = executor.submit(execute_query_in_thread, f"SELECT {i}", i)
-                futures.append(future)
+                futures.append(executor.submit(execute_query_in_thread, f"SELECT {i}", i))
+            for f in futures:
+                results.append(f.result())
 
-            for future in futures:
-                thread_id, result, error = future.result()
-                results.append((thread_id, result, error))
-
-        # Verify that some operations succeeded (either through reuse or fallback)
-        successful_operations = [r for r in results if r[1] is not None]
-        assert len(successful_operations) > 0, "At least some operations should have succeeded"
-
-        # Verify that connection reuse state was properly managed
-        # (This is harder to test precisely due to concurrency, but we can check final state)
-        assert session._connection_operation_count >= 0  # Should be non-negative
+        # Verify that some operations succeeded and some failed due to simulated errors
+        successes = [r for r in results if r[1] is not None]
+        failures = [r for r in results if r[2] is not None]
+        assert len(successes) > 0
+        assert len(failures) > 0

@@ -293,6 +293,15 @@ class FieldFilterExpression(FilterExpression):
         if self.operator == ComparisonOperator.CONTAINS and isinstance(self.value, str):
             return {}
 
+        # @@ STEP: Do not bind QueryField as a parameter; it is inlined in to_cypher
+        from .kuzu_query_fields import QueryField as _QF
+        if isinstance(self.value, _QF):
+            return {}
+
+        # @@ STEP: If RHS is an expression, collect its parameters only
+        if isinstance(self.value, (ArithmeticExpression, TemporalExpression, FunctionExpression, PatternExpression)):
+            return self.value.get_parameters()
+
         value = self.value
         if not self.case_sensitive and type(value) is str:
             value = value.lower()
@@ -568,6 +577,55 @@ class ArithmeticExpression(FilterExpression):
     def __rsub__(self, other: Any) -> 'ArithmeticExpression':
         """Right subtraction operator (-)."""
         return ArithmeticExpression(other, ArithmeticOperator.SUB, self)
+
+    # ============================================================================
+    # COMPARISON OPERATORS FOR FUNCTION EXPRESSIONS
+    # ============================================================================
+
+    def _cmp(self, op: ComparisonOperator, other: Any) -> 'FunctionFilterExpression':
+        return FunctionFilterExpression(self, op, other)
+
+    def __eq__(self, other: Any) -> 'FunctionFilterExpression':  # type: ignore[override]
+        return self._cmp(ComparisonOperator.EQ, other)
+
+    def __ne__(self, other: Any) -> 'FunctionFilterExpression':  # type: ignore[override]
+        return self._cmp(ComparisonOperator.NEQ, other)
+
+    def __lt__(self, other: Any) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.LT, other)
+
+    def __le__(self, other: Any) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.LTE, other)
+
+    def __gt__(self, other: Any) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.GT, other)
+
+    def __ge__(self, other: Any) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.GTE, other)
+
+    def like(self, pattern: str) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.LIKE, pattern)
+
+    def not_like(self, pattern: str) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.NOT_LIKE, pattern)
+
+    def regex(self, pattern: str) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.REGEX_MATCH, pattern)
+
+    def not_regex(self, pattern: str) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.NOT_REGEX_MATCH, pattern)
+
+    def in_(self, values: list[Any]) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.IN, values)
+
+    def not_in(self, values: list[Any]) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.NOT_IN, values)
+
+    def is_null(self) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.IS_NULL, None)
+
+    def is_not_null(self) -> 'FunctionFilterExpression':
+        return self._cmp(ComparisonOperator.IS_NOT_NULL, None)
 
     def __mul__(self, other: Any) -> 'ArithmeticExpression':
         """Multiplication operator (*)."""
@@ -955,8 +1013,32 @@ class FunctionFilterExpression(FilterExpression):
         self.parameter_name = parameter_name or f"func_filter_{abs(hash((str(function_expr), operator, str(value))))}"
 
     def to_cypher(self, alias_map: Dict[str, str], param_prefix: str = "", relationship_alias: Optional[str] = None, post_with: bool = False) -> str:
-        """Convert to Cypher WHERE clause fragment."""
+        """Convert to Cypher WHERE clause fragment.
+
+        Supports QueryField/FunctionExpression on the RHS without parameterization.
+        """
         function_cypher = self.function_expr.to_cypher(alias_map, param_prefix, relationship_alias, post_with)
+
+        # Resolve RHS when it's a field or function expression
+        rhs_expr: Optional[str] = None
+        from .kuzu_query_fields import QueryField as _QF
+        if isinstance(self.value, _QF):
+            parts = self.value.field_path.split(".", 1)
+            if len(parts) == 2:
+                alias, field = parts
+                mapped = alias_map[alias] if alias in alias_map else (next(iter(alias_map.values())) if alias_map else alias)
+                rhs_expr = f"{mapped}.{field}"
+            else:
+                if post_with:
+                    rhs_expr = self.value.field_path
+                elif relationship_alias:
+                    rhs_expr = f"{relationship_alias}.{self.value.field_path}"
+                else:
+                    default_alias = next(iter(alias_map.values())) if alias_map else "n"
+                    rhs_expr = f"{default_alias}.{self.value.field_path}"
+        elif isinstance(self.value, (FunctionExpression, ArithmeticExpression, TemporalExpression, PatternExpression)):
+            rhs_expr = self.value.to_cypher(alias_map, param_prefix, relationship_alias, post_with)
+
         param_name = f"{param_prefix}{self.parameter_name}"
 
         if self.operator == ComparisonOperator.IS_NULL:
@@ -977,7 +1059,14 @@ class FunctionFilterExpression(FilterExpression):
                 ComparisonOperator.GTE: ">=",
                 ComparisonOperator.LIKE: "LIKE",
                 ComparisonOperator.NOT_LIKE: "NOT LIKE",
+                ComparisonOperator.REGEX: "=~",
+                ComparisonOperator.NOT_REGEX: "!~",
+                ComparisonOperator.REGEX_MATCH: "=~",
+                ComparisonOperator.NOT_REGEX_MATCH: "!~",
             }.get(self.operator, "=")
+
+            if rhs_expr is not None:
+                return f"{function_cypher} {operator_str} {rhs_expr}"
 
             if isinstance(self.value, (int, float, bool)):
                 value_str = str(self.value).lower() if isinstance(self.value, bool) else str(self.value)
@@ -987,11 +1076,21 @@ class FunctionFilterExpression(FilterExpression):
 
     def get_parameters(self) -> Dict[str, Any]:
         """Get query parameters."""
+        # Start with parameters from LHS function
         params = self.function_expr.get_parameters()
-        if not isinstance(self.value, (int, float, bool)) and self.operator not in (
-            ComparisonOperator.IS_NULL, ComparisonOperator.IS_NOT_NULL
-        ):
-            params[self.parameter_name] = self.value
+
+        # Add parameters from RHS function if present
+        from .kuzu_query_fields import QueryField as _QF
+        if isinstance(self.value, (FunctionExpression, ArithmeticExpression, TemporalExpression, PatternExpression)):
+            params.update(self.value.get_parameters())
+        elif isinstance(self.value, _QF):
+            # Field references are inlined, no parameter
+            pass
+        else:
+            if not isinstance(self.value, (int, float, bool)) and self.operator not in (
+                ComparisonOperator.IS_NULL, ComparisonOperator.IS_NOT_NULL
+            ):
+                params[self.parameter_name] = self.value
         return params
 
     def get_field_references(self) -> Set[str]:

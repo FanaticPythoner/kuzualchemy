@@ -77,8 +77,7 @@ class TestPerformanceOptimizations:
         # Test exactly at threshold
         threshold = PerformanceConstants.CONNECTION_REUSE_THRESHOLD
         
-        # Reset connection reuse state to start fresh
-        self.session._reset_connection_reuse()
+        # No internal connection reuse state to reset under ATP-managed connections
 
         # Execute exactly threshold number of operations
         for i in range(threshold):
@@ -88,16 +87,13 @@ class TestPerformanceOptimizations:
             assert len(result) == 1
             assert result[0]["count"] == 0
 
-        # Connection should be at threshold at this point
-        assert self.session._connection_operation_count == threshold
-        
-        # One more operation should reach threshold and reset connection reuse
+        # One more operation should continue to work identically under ATP
         result = self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
         # Justification: After reaching threshold, connection should reset to 1
         # but query result should still be the same
         assert len(result) == 1
         assert result[0]["count"] == 0
-        assert self.session._connection_operation_count == 1  # Reset after reaching threshold
+        # No internal counters exist; only the results matter
 
     def test_identity_map_key_generation_edge_cases(self):
         """Test identity map key generation with edge case values."""
@@ -135,7 +131,7 @@ class TestPerformanceOptimizations:
         # Execute query with no pending operations
         result = self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
         
-        # Justification: flush should not be called since _has_pending_operations() returns False
+        # Justification: flush should not be called when there are no pending operations
         assert flush_call_count == 0
         assert len(result) == 1
         assert result[0]["count"] == 0
@@ -195,24 +191,10 @@ class TestPerformanceOptimizations:
 
     def test_connection_reuse_with_stale_connection(self):
         """Test connection reuse recovery when connection becomes stale."""
-        # Set up connection reuse
-        self.session._connection_operation_count = 1
-        self.session._reused_connection = Mock()
-        
-        # Mock reused connection to fail
-        self.session._reused_connection.execute.side_effect = RuntimeError("Connection stale")
-        
-        # Mock the main connection to succeed
-        original_execute = self.session._conn.execute
-        
-        # Execute query - should fall back to main connection
-        result = self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
-        
-        # Justification: Should fall back to main connection and set up reuse again
-        assert self.session._reused_connection is not None  # Set to main connection for reuse
-        assert self.session._connection_operation_count == 1  # Reset and set to 1
-        assert len(result) == 1
-        assert result[0]["count"] == 0
+        # Under ATP, no reuse/fallback: patch the underlying connection to raise and ensure propagation
+        self.session._conn.execute = Mock(side_effect=RuntimeError("Connection stale"))
+        with pytest.raises(RuntimeError, match="Connection stale"):
+            self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
 
     def test_identity_map_optimization_with_merge_operations(self):
         """Test identity map optimization during merge operations."""
@@ -397,18 +379,8 @@ class TestPerformanceOptimizations:
 
     def test_exception_propagation_in_optimized_paths(self):
         """Test that exceptions are properly propagated in optimized code paths."""
-        # Test exception in connection reuse path
-        self.session._reused_connection = Mock()
-        self.session._connection_operation_count = 1
-
-        # Make reused connection raise a non-recoverable exception
-        self.session._reused_connection.execute.side_effect = ValueError("Critical error")
-
-        # Mock main connection to also fail
-        original_execute = self.session._conn.execute
+        # Under ATP, there is no reuse/fallback; the underlying error should propagate
         self.session._conn.execute = Mock(side_effect=RuntimeError("Main connection failed"))
-
-        # Should propagate the main connection error after fallback
         with pytest.raises(RuntimeError, match="Main connection failed"):
             self.session.execute("MATCH (n:ATNode) RETURN count(n)")
 
@@ -472,35 +444,34 @@ class TestPerformanceOptimizations:
             assert self.session._identity_map[identity_key] == node
 
     def test_autoflush_batch_size_usage(self):
-        """Test that AUTOFLUSH_BATCH_SIZE constant is actually used in autoflush logic."""
+        """Test that AUTOFLUSH_BATCH_SIZE constant is wired into session config and pending counts are tracked."""
         # @@ STEP: Verify the constant is accessible and used
         from kuzualchemy.constants import PerformanceConstants
 
         assert PerformanceConstants.AUTOFLUSH_BATCH_SIZE == 100
         assert self.session._autoflush_batch_size == 100
 
-        # @@ STEP: Test batch size logic in _has_pending_operations
-        # || Create operations below batch threshold
+        # @@ STEP: Create operations below the batch threshold (legacy) and verify pending counts directly
         nodes = []
         for i in range(50):  # Below batch size
             node = self.ATNode(id=i, name=f"User {i}", value=20 + i)
             self.session.add(node)
             nodes.append(node)
 
-        # @@ STEP: Verify pending operations count is tracked
-        has_pending = self.session._has_pending_operations()
-        assert self.session._pending_operations_count == 50
-        assert has_pending  # Should be True because autoflush is enabled
+        # @@ STEP: Verify pending operations count is tracked without calling removed helper
+        pending_count = len(self.session._new) + len(self.session._dirty) + len(self.session._deleted)
+        assert pending_count == 50
+        assert pending_count > 0  # Any pending operations will trigger autoflush on execute()
 
-        # @@ STEP: Test at batch threshold
+        # @@ STEP: Add more to reach the legacy batch threshold and verify counts again
         for i in range(50, 100):  # Reach batch size
             node = self.ATNode(id=i, name=f"User {i}", value=20 + i)
             self.session.add(node)
             nodes.append(node)
 
-        has_pending = self.session._has_pending_operations()
-        assert self.session._pending_operations_count == 100
-        assert has_pending  # Should be True due to batch threshold
+        pending_count = len(self.session._new) + len(self.session._dirty) + len(self.session._deleted)
+        assert pending_count == 100
+        assert pending_count > 0
 
     def test_metadata_cache_size_usage(self):
         """Test that METADATA_CACHE_SIZE constant is actually used in metadata caching."""

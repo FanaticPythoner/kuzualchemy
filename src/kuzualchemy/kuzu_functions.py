@@ -7,7 +7,7 @@ Standalone Kuzu functions that don't operate on QueryField objects.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any
 
 from .kuzu_query_expressions import CaseExpression, CastExpression, FunctionExpression
 
