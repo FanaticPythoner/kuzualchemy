@@ -83,13 +83,26 @@ fi
 
 # ---------------- 3b) Install atp_pipeline wheel --------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ATP_WHL="$SCRIPT_DIR/atp_pipeline-1.0.0-cp312-cp312-manylinux_2_34_x86_64.whl"
-if [[ -f "$ATP_WHL" ]]; then
-  log "Installing atp_pipeline from local wheel"
-  "$VENV_PY" -m pip install "$ATP_WHL"
+ATP_WHL=""
+ATP_WHL_TS=0
+shopt -s nullglob
+for f in "$SCRIPT_DIR"/atp_pipeline-*.whl; do
+  [[ -f "$f" ]] || continue
+  ts="$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f")"
+  if (( ts > ATP_WHL_TS )); then
+    ATP_WHL_TS="$ts"
+    ATP_WHL="$f"
+  fi
+done
+shopt -u nullglob
+if [[ -n "$ATP_WHL" && -f "$ATP_WHL" ]]; then
+  log "Installing atp_pipeline from local wheel: $(basename "$ATP_WHL")"
+  "$VENV_PY" -m pip install --force-reinstall --no-deps "$ATP_WHL"
 else
-  log "⚠ atp_pipeline wheel not found at $ATP_WHL"
+  log "⚠ atp_pipeline wheel not found under $SCRIPT_DIR (expected atp_pipeline-*.whl)"
 fi
+
+"$VENV_PY" -m pip install -e ".[dev,test]"
 
 # ---------------- 4) Final Verification ----------------
 log "Verifying installation..."
@@ -104,11 +117,10 @@ else
   "$VENV_PY" -c "import sys; print('Python OK'); sys.exit(0)" 2>&1 || true
 fi
 
-# Test kuzualchemy_[RUSTPACKAGENAME] import (TODO: ADAPT THIS FOR THE NEW PIPELINE PACKAGES)
-if "$VENV_PY" -c "import kuzualchemy_[RUSTPACKAGENAME]; print('kuzualchemy_[RUSTPACKAGENAME] version:', kuzualchemy_[RUSTPACKAGENAME].__version__ if hasattr(kuzualchemy_[RUSTPACKAGENAME], '__version__') else 'unknown')" 2>/dev/null; then
-  log "✓ kuzualchemy_[RUSTPACKAGENAME] is importable"
+if "$VENV_PY" -c "import atp_pipeline, kuzualchemy; print('atp_pipeline:', atp_pipeline.__file__); print('kuzualchemy:', kuzualchemy.__file__)" >/dev/null; then
+  log "✓ atp_pipeline and kuzualchemy are importable"
 else
-  log "⚠ kuzualchemy_[RUSTPACKAGENAME] import failed"
+  die "Import check failed for atp_pipeline and/or kuzualchemy"
 fi
 
 echo

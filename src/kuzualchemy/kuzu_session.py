@@ -585,6 +585,12 @@ class KuzuSession:
         # Get PK fields once for nodes
         pk_fields = getattr(model_class, 'get_primary_key_fields', lambda: [])() if not is_rel else []
 
+        # Relationship bulk insert optimization: when the relationship is defined for exactly one
+        # (from_label,to_label) pair, precompute routing once and avoid per-row routing fields.
+        fixed_rel_routing: Optional[Dict[str, str]] = None
+        if is_rel:
+            fixed_rel_routing = self._try_get_fixed_relationship_routing(model_class)
+
         n = len(instances)
         start = 0
         cur_batch = max(1, int(batch_size))
@@ -620,15 +626,30 @@ class KuzuSession:
                     self._update_identity_map(model_class, inst_ref, pk_fields)
             else:
                 # === RELATIONSHIP BULK INSERT ===
-                rows_r = self._build_rel_rows(model_class, inst_ref, has_auto_increment)
+                if fixed_rel_routing is not None:
+                    rows_r = self._build_rel_rows_fixed(inst_ref, has_auto_increment)
+                else:
+                    rows_r = self._build_rel_rows(model_class, inst_ref, has_auto_increment)
+
+                src_label = '*'
+                dst_label = '*'
+                src_pk_field = '*'
+                dst_pk_field = '*'
+                if fixed_rel_routing is not None:
+                    src_label = fixed_rel_routing['from_label']
+                    dst_label = fixed_rel_routing['to_label']
+                    src_pk_field = fixed_rel_routing['from_pk_field']
+                    dst_pk_field = fixed_rel_routing['to_pk_field']
 
                 ret_rows_r: Optional[List[Dict[str, Any]]] = None
                 try:
                     ret_rows_r = self._conn._atp.create_edges(
                         rel_name=table_name,
-                        src_label='*', dst_label='*',
+                        src_label=src_label,
+                        dst_label=dst_label,
                         rows=rows_r,
-                        src_pk_field='*', dst_pk_field='*',
+                        src_pk_field=src_pk_field,
+                        dst_pk_field=dst_pk_field,
                     )
                 except Exception as e:
                     self._raise_bulk_error("Bulk relationship insert", table_name, e)
@@ -669,29 +690,141 @@ class KuzuSession:
         exclude_fields = {
             DDLConstants.REL_FROM_NODE_FIELD, DDLConstants.REL_TO_NODE_FIELD,
             DDLConstants.REL_FROM_NODE_PK_FIELD, DDLConstants.REL_TO_NODE_PK_FIELD,
-            'from_node_pk', 'to_node_pk',  # accessor names
+            'from_node_pk', 'to_node_pk',
         }
+
+        # Cache PK-field resolution per label for this call to avoid repeated registry scans
+        pk_field_cache: Dict[str, str] = {}
+
+        # Fast path: if there is exactly one relationship pair, labels are fixed even when instances
+        # are constructed with raw PKs (ints/str). This avoids repeated pair inspection.
+        fixed_labels: Optional[Dict[str, str]] = None
+        if pairs and len(pairs) == 1:
+            rp0 = pairs[0]
+            if hasattr(rp0, 'get_from_name') and hasattr(rp0, 'get_to_name'):
+                try:
+                    fixed_labels = {
+                        'from_label': rp0.get_from_name(),
+                        'to_label': rp0.get_to_name(),
+                    }
+                except Exception:
+                    fixed_labels = None
 
         rows: List[Dict[str, Any]] = []
         for j, inst in enumerate(instances):
-            fpv, tpv = getattr(inst, "from_node_pk", None), getattr(inst, "to_node_pk", None)
+            d0 = getattr(inst, '__dict__', {})
+            fpv = d0.get(DDLConstants.REL_FROM_NODE_PK_FIELD)
+            tpv = d0.get(DDLConstants.REL_TO_NODE_PK_FIELD)
+            if fpv is None:
+                fpv = getattr(inst, "from_node_pk", None)
+            if tpv is None:
+                tpv = getattr(inst, "to_node_pk", None)
             if fpv is None or tpv is None:
                 raise ValueError("Relationship bulk insert requires both from_node_pk and to_node_pk")
 
-            # Get from/to nodes from __dict__ for label resolution
-            d = inst.__dict__
-            from_label = self._resolve_node_label(d.get('from_node'), pairs, 'from')
-            to_label = self._resolve_node_label(d.get('to_node'), pairs, 'to')
+            if fixed_labels is not None:
+                from_label = fixed_labels['from_label']
+                to_label = fixed_labels['to_label']
+            else:
+                d_inst = getattr(inst, '__dict__', {})
+                from_label = self._resolve_node_label(d_inst.get('from_node'), pairs, 'from')
+                to_label = self._resolve_node_label(d_inst.get('to_node'), pairs, 'to')
 
-            # Build routing keys + properties from model_dump (serializable only)
-            props = inst.model_dump(exclude_unset=True)
+            from_pk_field = pk_field_cache.get(from_label)
+            if from_pk_field is None:
+                from_pk_field = self._resolve_pk_field_for_relationship_label(model_class, from_label)
+                pk_field_cache[from_label] = from_pk_field
+            to_pk_field = pk_field_cache.get(to_label)
+            if to_pk_field is None:
+                to_pk_field = self._resolve_pk_field_for_relationship_label(model_class, to_label)
+                pk_field_cache[to_label] = to_pk_field
+
+            # Build row from __dict__ to avoid the overhead of model_dump for large batches
             row: Dict[str, Any] = {
                 'from_label': from_label, 'to_label': to_label,
-                'from_pk_field': self._resolve_pk_field_for_relationship_label(model_class, from_label),
-                'to_pk_field': self._resolve_pk_field_for_relationship_label(model_class, to_label),
+                'from_pk_field': from_pk_field,
+                'to_pk_field': to_pk_field,
                 'from_pk': fpv, 'to_pk': tpv,
-                **{k: v for k, v in props.items() if k not in exclude_fields},
             }
+            props = inst.model_dump(exclude_unset=True)
+            for k, v in props.items():
+                if k in exclude_fields:
+                    continue
+                if v is None:
+                    continue
+                row[k] = v
+            if has_auto_increment:
+                row["__atp_row_idx"] = j
+            rows.append(row)
+        return rows
+
+    def _try_get_fixed_relationship_routing(self, rel_cls: Type[Any]) -> Optional[Dict[str, str]]:
+        """Return fixed routing info for single-pair relationships, else None."""
+        cached = self._get_cached_metadata(rel_cls, 'fixed_rel_routing')
+        if cached is not None:
+            return cast(Optional[Dict[str, str]], cached)
+
+        from .kuzu_orm import KuzuRelationshipBase as _RelBase
+        if not issubclass(rel_cls, _RelBase):
+            self._set_cached_metadata(rel_cls, 'fixed_rel_routing', None)
+            return None
+
+        pairs = getattr(rel_cls, '__kuzu_relationship_pairs__', [])
+        if not pairs or len(pairs) != 1:
+            self._set_cached_metadata(rel_cls, 'fixed_rel_routing', None)
+            return None
+
+        rp0 = pairs[0]
+        if not (hasattr(rp0, 'get_from_name') and hasattr(rp0, 'get_to_name')):
+            self._set_cached_metadata(rel_cls, 'fixed_rel_routing', None)
+            return None
+
+        try:
+            from_label = rp0.get_from_name()
+            to_label = rp0.get_to_name()
+        except Exception:
+            self._set_cached_metadata(rel_cls, 'fixed_rel_routing', None)
+            return None
+
+        if not isinstance(from_label, str) or not isinstance(to_label, str):
+            self._set_cached_metadata(rel_cls, 'fixed_rel_routing', None)
+            return None
+
+        routing = {
+            'from_label': from_label,
+            'to_label': to_label,
+            'from_pk_field': self._resolve_pk_field_for_relationship_label(rel_cls, from_label),
+            'to_pk_field': self._resolve_pk_field_for_relationship_label(rel_cls, to_label),
+        }
+        self._set_cached_metadata(rel_cls, 'fixed_rel_routing', routing)
+        return routing
+
+    def _build_rel_rows_fixed(self, instances: List[Any], has_auto_increment: bool) -> List[Dict[str, Any]]:
+        """Build relationship rows when routing is fixed via context (no per-row routing keys)."""
+        exclude_fields = {
+            DDLConstants.REL_FROM_NODE_FIELD, DDLConstants.REL_TO_NODE_FIELD,
+            DDLConstants.REL_FROM_NODE_PK_FIELD, DDLConstants.REL_TO_NODE_PK_FIELD,
+            'from_node_pk', 'to_node_pk',
+        }
+        rows: List[Dict[str, Any]] = []
+        for j, inst in enumerate(instances):
+            d0 = getattr(inst, '__dict__', {})
+            fpv = d0.get(DDLConstants.REL_FROM_NODE_PK_FIELD)
+            tpv = d0.get(DDLConstants.REL_TO_NODE_PK_FIELD)
+            if fpv is None:
+                fpv = getattr(inst, "from_node_pk", None)
+            if tpv is None:
+                tpv = getattr(inst, "to_node_pk", None)
+            if fpv is None or tpv is None:
+                raise ValueError("Relationship bulk insert requires both from_node_pk and to_node_pk")
+            row: Dict[str, Any] = {'from_pk': fpv, 'to_pk': tpv}
+            props = inst.model_dump(exclude_unset=True)
+            for k, v in props.items():
+                if k in exclude_fields:
+                    continue
+                if v is None:
+                    continue
+                row[k] = v
             if has_auto_increment:
                 row["__atp_row_idx"] = j
             rows.append(row)
