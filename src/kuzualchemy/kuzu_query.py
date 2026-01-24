@@ -8,18 +8,26 @@ Main Query class with method chaining for Kuzu ORM.
 from __future__ import annotations
 
 from typing import (
-    TYPE_CHECKING, Any, Dict, List, Optional, Type, Union, TypeVar, Tuple, Iterator, Generic
+    TYPE_CHECKING, Any, Dict, List, Optional, Type, Union, TypeVar, Tuple, Iterator, Generic,
+    get_origin, get_args,
 )
 import logging
+import os
+import threading
+import uuid as uuid_module
 from concurrent.futures import ThreadPoolExecutor
+import time
+
+from pydantic_core import PydanticUndefined
 
 
-from .constants import ValidationMessageConstants, DDLConstants, QueryReturnAliasConstants, KuzuDataType
+from .constants import ValidationMessageConstants, DDLConstants, QueryReturnAliasConstants
 from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType,
 )
 from .kuzu_query_builder import QueryState, JoinClause, CypherQueryBuilder
 from .kuzu_query_fields import QueryField, ModelFieldAccessor
+from .uuid_normalization import _NULL_UUID
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +35,124 @@ if TYPE_CHECKING:
     from .kuzu_session import KuzuSession
 
 ModelType = TypeVar("ModelType")
+
+# =============================================================================
+# MODULE-LEVEL THREAD-SAFE CACHES FOR RELATIONSHIP MAPPING PERFORMANCE
+# =============================================================================
+# These caches persist across _map_results calls to avoid rebuilding lookups
+# on every page/batch of relationship query results. Thread-safe via RLock.
+
+# Cache: relationship_class -> (from_label_to_cls, to_label_to_cls)
+_REL_LABEL_LOOKUP_CACHE: Dict[Type[Any], Tuple[Dict[str, Type[Any]], Dict[str, Type[Any]]]] = {}
+_REL_LABEL_LOOKUP_LOCK = threading.RLock()
+
+# Cache: node_class -> metadata dict with pk_fields, valid_fields, uuid_fields, etc.
+_NODE_CLASS_META_CACHE: Dict[Type[Any], Dict[str, Any]] = {}
+_NODE_CLASS_META_LOCK = threading.RLock()
+
+
+def _get_node_class_meta(node_cls: Type[Any]) -> Dict[str, Any]:
+    """Get or compute node class metadata (pk_fields, uuid_fields, etc.). Thread-safe."""
+    # Fast path: check without lock first
+    cached = _NODE_CLASS_META_CACHE.get(node_cls)
+    if cached is not None:
+        return cached
+
+    # Slow path: acquire lock and compute
+    with _NODE_CLASS_META_LOCK:
+        # Double-check after acquiring lock
+        cached = _NODE_CLASS_META_CACHE.get(node_cls)
+        if cached is not None:
+            return cached
+
+        # Compute once per class
+        pk_getter = getattr(node_cls, "get_primary_key_fields", None)
+        if pk_getter is None:
+            raise ValueError(f"Node class {node_cls.__name__} missing get_primary_key_fields")
+        pk_fields = pk_getter()
+        if type(pk_fields) is not list or len(pk_fields) == 0:
+            raise ValueError(f"Node class {node_cls.__name__} returned invalid primary key fields")
+
+        valid_fields = frozenset(node_cls.model_fields.keys())
+        uuid_fields: set[str] = set()
+        uuid_list_fields: set[str] = set()
+        optional_uuid_fields: set[str] = set()
+        fields_with_defaults: set[str] = set()
+
+        for fname, fi in node_cls.model_fields.items():
+            ann = fi.annotation
+            origin = get_origin(ann)
+
+            # Check scalar UUID
+            if ann is uuid_module.UUID:
+                uuid_fields.add(fname)
+
+            # Check List[UUID]
+            elif origin is list:
+                args = get_args(ann)
+                if len(args) == 1 and args[0] is uuid_module.UUID:
+                    uuid_list_fields.add(fname)
+
+            # Check Optional[UUID]
+            elif origin is Union:
+                args = get_args(ann)
+                if (uuid_module.UUID in args) and (type(None) in args):
+                    optional_uuid_fields.add(fname)
+            # Check for defaults
+            if (fi.default is not PydanticUndefined) or (fi.default_factory is not None):
+                fields_with_defaults.add(fname)
+
+        meta = {
+            'pk_fields': pk_fields,
+            'valid_fields': valid_fields,
+            'uuid_fields': frozenset(uuid_fields),
+            'uuid_list_fields': frozenset(uuid_list_fields),
+            'optional_uuid_fields': frozenset(optional_uuid_fields),
+            'fields_with_defaults': frozenset(fields_with_defaults),
+        }
+        _NODE_CLASS_META_CACHE[node_cls] = meta
+        return meta
+
+
+def _get_rel_label_lookups(
+    rel_cls: Type[Any],
+    from_candidates: List[Type[Any]],
+    to_candidates: List[Type[Any]],
+) -> Tuple[Dict[str, Type[Any]], Dict[str, Type[Any]]]:
+    """Get or compute label->class lookup dicts for a relationship class. Thread-safe."""
+    # Fast path: check without lock first
+    cached = _REL_LABEL_LOOKUP_CACHE.get(rel_cls)
+    if cached is not None:
+        return cached
+
+    # Slow path: acquire lock and compute
+    with _REL_LABEL_LOOKUP_LOCK:
+        # Double-check after acquiring lock
+        cached = _REL_LABEL_LOOKUP_CACHE.get(rel_cls)
+        if cached is not None:
+            return cached
+
+        # Build label -> class lookup dicts
+        from_label_to_cls: Dict[str, Type[Any]] = {}
+        for cls in from_candidates:
+            d = cls.__dict__
+            lbl = d['__kuzu_node_name__'] if '__kuzu_node_name__' in d else cls.__name__
+            from_label_to_cls[lbl] = cls
+
+        to_label_to_cls: Dict[str, Type[Any]] = {}
+        for cls in to_candidates:
+            d = cls.__dict__
+            lbl = d['__kuzu_node_name__'] if '__kuzu_node_name__' in d else cls.__name__
+            to_label_to_cls[lbl] = cls
+
+        # Pre-warm node class metadata for all candidates
+        for cls in from_candidates:
+            _get_node_class_meta(cls)
+        for cls in to_candidates:
+            _get_node_class_meta(cls)
+
+        _REL_LABEL_LOOKUP_CACHE[rel_cls] = (from_label_to_cls, to_label_to_cls)
+        return from_label_to_cls, to_label_to_cls
 
 
 class Query(Generic[ModelType]):
@@ -428,10 +554,23 @@ class Query(Generic[ModelType]):
             raise RuntimeError("No session attached to query")
 
         cypher, params = self.to_cypher()
-        return self._session.execute(cypher, params)
+        # Log the actual Cypher query for tracing
+        model_name = getattr(self._state.model_class, "__name__", str(self._state.model_class))
+        cypher_preview = cypher[:500] + "..." if len(cypher) > 500 else cypher
+        logger.debug(
+            "kuzu.query.execute model=%s cypher_len=%d params_count=%d cypher=%s",
+            model_name,
+            len(cypher),
+            len(params),
+            cypher_preview,
+        )
+        return self._session._execute_for_query_object(cypher, params)
 
     def iter(self, page_size: int = 10, prefetch_pages: int = 1) -> Iterator[Union[ModelType, Dict[str, Any]]]:
         """Return an iterator that yields items across pages lazily.
+
+        Uses parallel page fetching via Rust rayon when ATP_READONLY_POOL_MAX_SIZE > 1
+        and result set is large enough to benefit from parallelization.
 
         Args:
             page_size: Number of items to fetch per page (default: 10).
@@ -445,33 +584,129 @@ class Query(Generic[ModelType]):
         if not self._session:
             raise RuntimeError("No session attached to query")
 
-        # Adaptive paging that halves page_size on buffer exhaustion to avoid OOM
-        def is_buffer_exhaustion_error(err: BaseException) -> bool:
-            m = str(err).lower()
-            return (
-                "buffer manager exception" in m
-                or "no more frame groups" in m
-                or "buffer pool is full" in m
-                or "unable to allocate memory" in m
-                or "out of memory" in m
-            )
-
         ps = int(page_size)
         pf = 1 if prefetch_pages and prefetch_pages > 0 else 0
 
-        def fetch_page(offset: int) -> List[Union[ModelType, Dict[str, Any]]]:
-            nonlocal ps, pf
-            while True:
-                q = self.offset(offset).limit(ps)
-                raw = q._execute()
-                return q._map_results(raw)
+        pairs_subset_meta = getattr(self._state, "pairs_subset", None)
+        
+        model_name = getattr(self._state.model_class, "__name__", str(self._state.model_class))
+        logger.info(
+            "kuzu.query.iter.open rel=%s page_size=%s prefetch_pages=%s pairs_subset=%s",
+            model_name,
+            int(page_size),
+            int(prefetch_pages),
+            pairs_subset_meta,
+        )
 
-        # Fetch first page synchronously
+        # Check if parallel execution is available and beneficial
+        pool_size = int(os.environ["ATP_READONLY_POOL_MAX_SIZE"])
+        parallel_threshold = int(os.environ["ATP_READONLY_POOL_MAX_SIZE"])
+        use_parallel = pool_size > 1 and parallel_threshold > 0
+
+        def fetch_page(offset: int) -> List[Union[ModelType, Dict[str, Any]]]:
+            q = self.offset(offset).limit(ps)
+            t0 = time.perf_counter()
+            raw = q._execute()
+            t1 = time.perf_counter()
+            mapped = q._map_results(raw)
+            t2 = time.perf_counter()
+
+            if getattr(self._session, "_debug_timing", False) or ((t2 - t0) >= 0.25):
+                raw_rows = len(raw) if isinstance(raw, list) else None
+                mapped_rows = len(mapped) if isinstance(mapped, list) else None
+                logger.info(
+                    "kuzu.query.page rel=%s offset=%d page_size=%d raw_rows=%s mapped_rows=%s exec_seconds=%.6f map_seconds=%.6f total_seconds=%.6f pairs_subset=%s",
+                    model_name,
+                    int(offset),
+                    int(ps),
+                    raw_rows,
+                    mapped_rows,
+                    (t1 - t0),
+                    (t2 - t1),
+                    (t2 - t0),
+                    pairs_subset_meta,
+                )
+
+            return mapped
+
+        def fetch_pages_parallel(offsets: List[int]) -> List[List[Union[ModelType, Dict[str, Any]]]]:
+            """Fetch multiple pages in parallel using Rust rayon via ATP pipeline."""
+            if not offsets:
+                return []
+            
+            # Build queries for each offset
+            queries: List[Tuple[str, Dict[str, Any]]] = []
+            for off in offsets:
+                q = self.offset(off).limit(ps)
+                cypher, params = q.to_cypher()
+                queries.append((cypher, params))
+            
+            # Execute in parallel via Rust - no fallback, fail loudly on errors
+            from atp_pipeline import execute_parallel_queries
+            db_path = self._session.get_db_path()
+            t0 = time.perf_counter()
+            raw_results = execute_parallel_queries(db_path, queries)
+            t1 = time.perf_counter()
+            
+            # Map results for each page
+            mapped_pages: List[List[Union[ModelType, Dict[str, Any]]]] = []
+            for i, raw in enumerate(raw_results):
+                q = self.offset(offsets[i]).limit(ps)
+                m0 = time.perf_counter()
+                mapped = q._map_results(raw)
+                m1 = time.perf_counter()
+                if getattr(self._session, "_debug_timing", False) or ((m1 - m0) >= 0.25):
+                    raw_rows = len(raw) if isinstance(raw, list) else None
+                    mapped_rows = len(mapped) if isinstance(mapped, list) else None
+                    logger.info(
+                        "kuzu.query.page.parallel rel=%s offset=%d page_size=%d raw_rows=%s mapped_rows=%s exec_seconds=%.6f map_seconds=%.6f pairs_subset=%s",
+                        model_name,
+                        int(offsets[i]),
+                        int(ps),
+                        raw_rows,
+                        mapped_rows,
+                        (t1 - t0),
+                        (m1 - m0),
+                        pairs_subset_meta,
+                    )
+                mapped_pages.append(mapped)
+            return mapped_pages
+
+        # Fetch first page to determine if more pages exist
         offset = 0
         page = fetch_page(offset)
         offset += ps
 
-        if pf > 0:
+        # If parallel execution is enabled and first page is full, try parallel fetching
+        if use_parallel and len(page) == ps:
+            # Yield first page items
+            for item in page:
+                yield item
+            
+            # Parallel batch fetching
+            batch_size = min(pool_size, parallel_threshold)
+            while True:
+                # Build batch of offsets
+                batch_offsets = [offset + i * ps for i in range(batch_size)]
+                
+                # Fetch batch in parallel
+                batch_pages = fetch_pages_parallel(batch_offsets)
+                
+                # Yield results and track if we got a partial page
+                last_page_full = True
+                for page_idx, page_data in enumerate(batch_pages):
+                    for item in page_data:
+                        yield item
+                    if len(page_data) < ps:
+                        last_page_full = False
+                        break
+                
+                if not last_page_full:
+                    break
+                
+                offset += batch_size * ps
+        elif pf > 0:
+            # Sequential with prefetch (original behavior)
             with ThreadPoolExecutor(max_workers=1) as executor:
                 next_future = executor.submit(fetch_page, offset) if len(page) == ps else None
                 while True:
@@ -487,6 +722,7 @@ class Query(Generic[ModelType]):
                         next_future = None
                     page = next_page
         else:
+            # Pure sequential (no prefetch)
             while True:
                 for item in page:
                     yield item
@@ -612,17 +848,22 @@ class Query(Generic[ModelType]):
             # Build candidate classes and prepare mapping
             mapped: List[Any] = []
 
+            t_map_start = time.perf_counter()
+            endpoint_cache: Dict[Tuple[str, Tuple[Any, ...]], Any] = {}
+            cache_hits = 0
+            cache_misses = 0
+
             # Build candidate classes from relationship pairs (handles multi-pair and legacy)
             has_pairs_attr = '__kuzu_relationship_pairs__' in d_model
             rel_pairs = d_model['__kuzu_relationship_pairs__'] if has_pairs_attr else []
             legacy_from = d_model['__kuzu_from_node__'] if '__kuzu_from_node__' in d_model else None
             legacy_to = d_model['__kuzu_to_node__'] if '__kuzu_to_node__' in d_model else None
-            logger.debug(
+            logger.info(
                 "RelClass=%s has_pairs_attr=%s pairs_len=%s legacy_from=%s legacy_to=%s",
                 result_model_class.__name__, has_pairs_attr, len(rel_pairs),
                 type(legacy_from).__name__ if legacy_from is not None else None,
                 type(legacy_to).__name__ if legacy_to is not None else None,
-            )
+            ) # TODO: REVERT TO debug()
             if (not rel_pairs) and (legacy_from is None or legacy_to is None):
                 logger.error(
                     "Relationship class %s lacks pairs and legacy endpoints",
@@ -639,12 +880,8 @@ class Query(Generic[ModelType]):
                     return None
 
                 # If it's a subclass of KuzuRelationshipBase, it's a relationship, not a node
-                try:
-                    if issubclass(x, KuzuRelationshipBase):
-                        return None  # It's a relationship, not a node
-                except TypeError:
-                    # issubclass can raise TypeError if x is not a class
-                    return None
+                if issubclass(x, KuzuRelationshipBase):
+                    return None  # It's a relationship, not a node
 
                 # If it's not a relationship, it's a node class
                 return x
@@ -672,68 +909,110 @@ class Query(Generic[ModelType]):
                 if ct is not None:
                     to_candidates.append(ct)
 
-            # Helper to build a validated node instance from endpoint data (strict)
-            def _build_node_instance(
+            # === USE MODULE-LEVEL CACHED LOOKUPS FOR O(1) ACCESS ===
+            # Get cached label->class lookup dicts (built once per relationship class)
+            from_label_to_cls, to_label_to_cls = _get_rel_label_lookups(
+                result_model_class, from_candidates, to_candidates
+            )
+
+            # Optimized node instance builder using module-level cached metadata
+            def _build_node_instance_fast(
                 node_dict: Dict[str, Any],
-                candidates: List[Type[Any]]
+                label_to_cls: Dict[str, Type[Any]]
             ) -> Any:
-                # 1) Strictly require dict with _label and a candidate class match
-                if type(node_dict) is not dict:
-                    logger.error("Endpoint data is not a dict: %r", type(node_dict))
-                    raise TypeError("Endpoint data must be a dict")
-                label = node_dict.get('_label')
-                if label is None and '_LABEL' in node_dict:
-                    label = node_dict.get('_LABEL')
+                nonlocal cache_hits, cache_misses
+                # 1) Get label (fast path)
+                label = node_dict.get('_label') or node_dict.get('_LABEL')
                 if label is None:
-                    logger.error("Endpoint dict missing _label; keys: %r", list(node_dict.keys()))
                     raise KeyError("Endpoint node missing _label")
-                # 2) Resolve class by label strictly among declared candidates
-                node_cls: Optional[Type[Any]] = None
-                for cls in candidates:
-                    d = cls.__dict__
-                    cand_name = (
-                        d['__kuzu_node_name__'] if ('__kuzu_node_name__' in d)
-                        else cls.__name__
-                    )
-                    if cand_name == label:
-                        node_cls = cls
-                        break
+
+                # 2) O(1) class lookup
+                node_cls = label_to_cls.get(label)
                 if node_cls is None:
-                    cand_labels = [
-                        (c.__dict__['__kuzu_node_name__']
-                         if ('__kuzu_node_name__' in c.__dict__)
-                         else c.__name__)
-                        for c in candidates
-                    ]
-                    logger.error(
-                        "No candidate class found for label %r among %r",
-                        label, cand_labels
-                    )
                     raise KeyError(f"No candidate node class for label: {label}")
 
-                # 3) Filter properties to only include fields that belong to this node class
-                # Kuzu returns ALL possible fields from ALL node types, with None for non-matching
-                # We must exclude None values for fields that don't belong to this specific class
-                valid_fields = set(node_cls.model_fields.keys())
-                clean_props = {}
+                # 3) Get pre-computed metadata from module-level cache
+                meta = _get_node_class_meta(node_cls)
+                pk_fields = meta['pk_fields']
+                valid_fields = meta['valid_fields']
+                uuid_fields = meta['uuid_fields']
+                uuid_list_fields = meta['uuid_list_fields']
+                optional_uuid_fields = meta.get('optional_uuid_fields', frozenset())
+                fields_with_defaults = meta['fields_with_defaults']
+
+                def _assert_uuid(value: Any, field_name: str) -> None:
+                    if isinstance(value, uuid_module.UUID):
+                        return
+                    raise TypeError(
+                        f"UUID field {field_name} in {node_cls.__name__} expected uuid.UUID, "
+                        f"got {value!r} ({type(value).__name__})"
+                    )
+
+                def _assert_uuid_seq(seq_value: Any, field_name: str) -> None:
+                    if not isinstance(seq_value, (list, tuple)):
+                        raise TypeError(
+                            f"UUID[] field {field_name} in {node_cls.__name__} expected list/tuple of uuid.UUID, "
+                            f"got {seq_value!r} ({type(seq_value).__name__})"
+                        )
+                    for item in seq_value:
+                        _assert_uuid(item, field_name)
+
+                # 4) Build cache key from PK values with strict UUID validation
+                pk_values: List[Any] = []
+                for pk in pk_fields:
+                    v_pk = node_dict.get(pk)
+                    if v_pk is None:
+                        raise ValueError(f"Endpoint node primary key field {pk} is None")
+                    if pk in uuid_list_fields:
+                        if isinstance(v_pk, list):
+                            _assert_uuid_seq(v_pk, pk)
+                            v_pk = tuple(v_pk)
+                        elif isinstance(v_pk, tuple):
+                            _assert_uuid_seq(v_pk, pk)
+                        else:
+                            _assert_uuid_seq(v_pk, pk)
+                    elif pk in uuid_fields:
+                        _assert_uuid(v_pk, pk)
+                    pk_values.append(v_pk)
+
+                cache_key = (label, tuple(pk_values))
+                cached = endpoint_cache.get(cache_key)
+                if cached is not None:
+                    cache_hits += 1
+                    return cached
+                cache_misses += 1
+
+                # 5) Build clean props dict with strict UUID type checks (no coercion)
+                clean_props: Dict[str, Any] = {}
                 for k, v in node_dict.items():
-                    if not str(k).startswith('_'):
-                        if k in valid_fields:
-                            # Include field if it belongs to this node class and has non-None value
-                            # OR if it's None but field doesn't have default (making None valid)
-                            fi = node_cls.model_fields[k]
-                            has_default = (
-                                (fi.default is not None) or
-                                (fi.default_factory is not None)
-                            )
+                    if k.startswith('_'):
+                        continue
+                    if k not in valid_fields:
+                        continue
+                    # Skip None for fields with defaults
+                    if v is None and k in fields_with_defaults:
+                        continue
 
-                            if v is not None or not has_default:
-                                clean_props[k] = v
-                            # Skip None values for fields with defaults - let Pydantic use default
-                        # Exclude fields that don't belong to this node class (even if non-None)
-                        # This prevents cross-contamination between different node types in results
+                    if (k in optional_uuid_fields) and (v == _NULL_UUID):
+                        v = None
 
-                return node_cls(**clean_props)
+                    if k in uuid_fields:
+                        if v is None and k in optional_uuid_fields:
+                            clean_props[k] = None
+                            continue
+                        _assert_uuid(v, k)
+                    elif k in uuid_list_fields:
+                        if v is None and k in optional_uuid_fields:
+                            clean_props[k] = None
+                            continue
+                        _assert_uuid_seq(v, k)
+
+                    clean_props[k] = v
+
+                # 6) Use model_construct for fast instantiation (skip validation - data from DB is valid)
+                inst = node_cls.model_construct(**clean_props)
+                endpoint_cache[cache_key] = inst
+                return inst
 
             for row in raw_results:
                 # Extract endpoints by standardized keys (strict, two forms)
@@ -754,15 +1033,9 @@ class Query(Generic[ModelType]):
 
                 # Normalize endpoint maps to ensure lowercase '_label' exists when only uppercase is present
                 if isinstance(from_data, dict) and ('_label' not in from_data) and ('_LABEL' in from_data):
-                    try:
-                        from_data['_label'] = from_data['_LABEL']
-                    except Exception:
-                        pass
+                    from_data['_label'] = from_data['_LABEL']
                 if isinstance(to_data, dict) and ('_label' not in to_data) and ('_LABEL' in to_data):
-                    try:
-                        to_data['_label'] = to_data['_LABEL']
-                    except Exception:
-                        pass
+                    to_data['_label'] = to_data['_LABEL']
 
                 # Validate endpoint presence and structure (strict)
                 if type(from_data) is not dict or type(to_data) is not dict:
@@ -780,8 +1053,8 @@ class Query(Generic[ModelType]):
                     )
                     raise KeyError("Endpoint nodes missing _label")
 
-                from_node = _build_node_instance(from_data, from_candidates)
-                to_node = _build_node_instance(to_data, to_candidates)
+                from_node = _build_node_instance_fast(from_data, from_label_to_cls)
+                to_node = _build_node_instance_fast(to_data, to_label_to_cls)
                 # from_node and to_node must be constructed; any failure would have raised earlier
 
                 # Collect relationship properties: prefer nested alias dict when returned
@@ -812,9 +1085,21 @@ class Query(Generic[ModelType]):
                 if DDLConstants.REL_TO_NODE_FIELD in rel_props:
                     rel_props.pop(DDLConstants.REL_TO_NODE_FIELD)
 
-                # Construct validated relationship instance (no model_construct bypass)
-                instance = result_model_class(from_node=from_node, to_node=to_node, **rel_props)
+                # Construct relationship instance using model_construct for speed (data from DB is valid)
+                instance = result_model_class.model_construct(from_node=from_node, to_node=to_node, **rel_props)
                 mapped.append(instance)
+
+            t_map_end = time.perf_counter()
+            if getattr(self._session, "_debug_timing", False) or ((t_map_end - t_map_start) >= 0.25):
+                logger.info(
+                    "kuzu.query.map_results rel=%s rows=%d endpoints_unique=%d cache_hits=%d cache_misses=%d seconds=%.6f",
+                    result_model_class.__name__,
+                    len(raw_results),
+                    len(endpoint_cache),
+                    int(cache_hits),
+                    int(cache_misses),
+                    (t_map_end - t_map_start),
+                )
 
             return mapped
 
@@ -847,9 +1132,6 @@ class Query(Generic[ModelType]):
                     # Filter out Kuzu internal fields
                     cleaned_data = {k: v for k, v in node_data.items()
                                    if not k.startswith('_')}
-
-                    cleaned_data = self._convert_uuid_objects_to_strings(cleaned_data, result_model_class)
-
                     instance = result_model_class(**cleaned_data)
                     mapped.append(instance)
                 elif len(row) == 1 and type(list(row.values())[0]) is dict:
@@ -858,9 +1140,6 @@ class Query(Generic[ModelType]):
                     # Filter out Kuzu internal fields
                     cleaned_data = {k: v for k, v in node_data.items()
                                    if not k.startswith('_')}
-
-                    cleaned_data = self._convert_uuid_objects_to_strings(cleaned_data, result_model_class)
-
                     instance = result_model_class(**cleaned_data)
                     mapped.append(instance)
                 else:
@@ -882,36 +1161,6 @@ class Query(Generic[ModelType]):
                         mapped.append(row)
 
         return mapped
-
-    def _convert_uuid_objects_to_strings(self, data: Dict[str, Any], model_class: Type[Any]) -> Dict[str, Any]:
-        """
-        Convert UUID objects to strings for UUID fields in the model.
-
-        Args:
-            data: Dictionary of field names to values
-            model_class: The model class to check field types against
-
-        Returns:
-            Dictionary with UUID objects converted to strings for UUID fields
-        """
-        # @@ STEP 1: Get field metadata to identify UUID fields
-        from .kuzu_orm import _kuzu_registry
-        converted_data = {}
-        for field_name, value in data.items():
-            # || S.1.1: Get field metadata
-            if hasattr(model_class, 'model_fields') and field_name in model_class.model_fields:
-                field_info = model_class.model_fields[field_name]
-                meta = _kuzu_registry.get_field_metadata(field_info)
-                # || S.1.2: Preserve UUID objects for UUID fields; ATP already returns
-                # normalized uuid.UUID instances, and Pydantic can consume them directly.
-                if meta and meta.kuzu_type == KuzuDataType.UUID:
-                    converted_data[field_name] = value
-                else:
-                    converted_data[field_name] = value
-            else:
-                converted_data[field_name] = value
-        return converted_data
-
 
     def __iter__(self) -> Iterator[Union[ModelType, Dict[str, Any]]]:
         """Iterate over query results."""

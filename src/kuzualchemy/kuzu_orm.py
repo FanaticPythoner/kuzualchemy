@@ -1361,7 +1361,7 @@ class KuzuRegistry:
         # @@ STEP: Reset the registry state hash
         self._registry_state_hash = None
 
-        logger.debug("Foreign key validation cache invalidated due to registry state change")
+        logger.info("Foreign key validation cache invalidated due to registry state change") # TODO: REVERT TO debug()
 
     def _validate_foreign_keys_for_node(self, node_name: str, node_class: Type[Any]) -> List[str]:
         """
@@ -2167,7 +2167,7 @@ class KuzuNodeBase(KuzuBaseModel):
             node_name = self.get_node_name()
         except ValueError:
             # @@ STEP: Skip validation if node is not properly decorated
-            logger.debug(f"Skipping foreign key validation for {self.__class__.__name__} - not properly decorated")
+            logger.info(f"Skipping foreign key validation for {self.__class__.__name__} - not properly decorated") # TODO: REVERT TO debug()
             return self
 
         # @@ STEP: Perform cached foreign key validation using registry
@@ -2204,9 +2204,8 @@ class KuzuNodeBase(KuzuBaseModel):
 
 # Define NodeReference AFTER KuzuNodeBase to resolve forward reference properly
 # Formulation: NodeReference = Union[KuzuNodeBase, PrimaryKeyTypes]
-# Where PrimaryKeyTypes = {int, float, str, bytes, datetime, UUID, Decimal}
-# Now using direct class reference instead of string literal for proper validation
-NodeReference = Union[KuzuNodeBase, int, float, str, bytes, datetime.datetime, uuid.UUID, decimal.Decimal]
+# Where PrimaryKeyTypes = {UUID, int, float, bytes, datetime, Decimal}
+NodeReference = Union[KuzuNodeBase, uuid.UUID, int, float, bytes, datetime.datetime, decimal.Decimal]
 
 
 class RelationshipNodeTypeQuery:
@@ -3035,7 +3034,14 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
         comment_payload = "\n  ".join(comment_lines)
         comment_block = f"/*\n  {comment_payload}\n*/\n"
 
-    ddl = f"{comment_block}{DDLConstants.CREATE_REL_TABLE} {rel_name}(" + ", ".join(items) + ");"
+    # Format DDL with line breaks to avoid parser issues with large relationship definitions
+    if len(items) > 10:
+        # Multi-line format for readability and parser compatibility
+        items_formatted = ",\n  ".join(items)
+        ddl = f"{comment_block}{DDLConstants.CREATE_REL_TABLE} {rel_name}(\n  {items_formatted}\n);"
+    else:
+        # Single-line format for small relationships
+        ddl = f"{comment_block}{DDLConstants.CREATE_REL_TABLE} {rel_name}(" + ", ".join(items) + ");"
 
     # Compound indexes after CREATE
     for ci in cls.__dict__.get("__kuzu_compound_indexes__", []) or []:

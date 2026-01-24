@@ -11,7 +11,7 @@ error handling with precision.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast, Callable
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast, Callable, get_origin, get_args
 from contextlib import contextmanager
 from pathlib import Path
 from collections import defaultdict, OrderedDict
@@ -19,7 +19,8 @@ import logging
 import uuid
 # enum.Enum - Rust py_to_value handles Enum.value unwrapping
 import os
-from datetime import datetime, date
+import time
+# datetime/date imports removed - ATP returns properly typed Python objects
 
 from .kuzu_query import Query
 from .constants import (
@@ -155,6 +156,9 @@ class KuzuSession:
         self._metadata_cache: OrderedDict[str, Any] = OrderedDict()
         self._metadata_cache_size = PerformanceConstants.METADATA_CACHE_SIZE
 
+    def get_db_path(self) -> str:
+        """Return the database path as a string for ATP parallel query execution."""
+        return str(self._conn.db_path)
 
     def query(
         self,
@@ -207,6 +211,24 @@ class KuzuSession:
             self.flush()
 
         result = self._execute_with_connection_reuse(query, parameters)
+        return result
+
+    def _execute_for_query_object(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        if self.autoflush and not self._flushing and (self._new or self._dirty or self._deleted):
+            self.flush()
+
+        t0 = time.perf_counter()
+        result = self._conn.execute(query, parameters)
+        dt = time.perf_counter() - t0
+
+        if self._debug_timing or dt >= 0.25:
+            rows = len(result) if isinstance(result, list) else None
+            logger.info(
+                "kuzu.session.exec_raw_for_query rows=%s seconds=%.6f",
+                rows,
+                dt,
+            )
+
         return result
 
     def iterate(
@@ -290,77 +312,112 @@ class KuzuSession:
         result = self._conn.execute(query, bound_params)
         if not isinstance(result, list):
             return result
-        return [self._normalize_result_row(row) for row in result]
+        # All types (UUID, Date, DateTime, etc.) come correctly typed from ATP
+        return result
 
-    def _normalize_result_row(self, row: Any) -> Any:
-        """Normalize a single result row using Kuzu ORM metadata.
+    def bulk_update_nodes(self, model_class: Type[Any], rows: List[Dict[str, Any]]) -> None:
+        if not isinstance(rows, list):
+            raise ValueError("rows must be a list of dictionaries")
+        if not rows:
+            return
+        if not isinstance(model_class, type) or not hasattr(model_class, "__kuzu_node_name__"):
+            raise ValueError("model_class must be a registered Kuzu node model")
 
-        This converts node/relationship property maps back to typed Python
-        objects (e.g. uuid.UUID, datetime/date) based on the registered
-        model definitions, while leaving scalar aggregation values unchanged.
-        """
-        from .kuzu_orm import get_node_by_name, get_relationship_by_name, _kuzu_registry
+        pk_fields = self._get_pk_fields_cached(model_class)
+        if not pk_fields:
+            raise ValueError(f"No primary key found in node {model_class.__name__}")
 
-        if not isinstance(row, dict):
-            return row
+        label = model_class.__kuzu_node_name__
 
-        def _maybe_normalize_value(val: Any) -> Any:
-            if isinstance(val, dict) and "_label" in val and isinstance(val.get("_label"), str):
-                return self._normalize_labeled_map(val, get_node_by_name, get_relationship_by_name, _kuzu_registry)
-            if isinstance(val, list):
-                return [
-                    self._normalize_labeled_map(v, get_node_by_name, get_relationship_by_name, _kuzu_registry)
-                    if isinstance(v, dict) and "_label" in v and isinstance(v.get("_label"), str)
-                    else v
-                    for v in val
-                ]
-            return val
+        def _normalize_uuid_value(field: str, v: Any, *, optional: bool) -> Any:
+            if v is None:
+                if optional:
+                    return None
+                raise TypeError(f"Field {label}.{field} is not optional and cannot be None")
+            if isinstance(v, uuid.UUID):
+                return v
+            raise TypeError(f"Field {label}.{field} expects uuid.UUID{'|None' if optional else ''}, got {type(v)}")
 
-        out: Dict[str, Any] = {}
-        for k, v in row.items():
-            out[k] = _maybe_normalize_value(v)
-        return out
+        def _normalize_row_types(r: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(r, dict):
+                raise ValueError("each row must be a dict")
+            out: Dict[str, Any] = dict(r)
+            for fname, fi in model_class.model_fields.items():
+                if fname not in out:
+                    continue
+                ann = fi.annotation
+                origin = get_origin(ann)
+                if ann is uuid.UUID:
+                    out[fname] = _normalize_uuid_value(fname, out[fname], optional=False)
+                elif origin is Union:
+                    args = get_args(ann)
+                    if uuid.UUID in args and type(None) in args:
+                        out[fname] = _normalize_uuid_value(fname, out[fname], optional=True)
+            return out
 
-    def _normalize_labeled_map(self, value: Dict[str, Any], get_node_by_name, get_relationship_by_name, registry) -> Dict[str, Any]:
-        """Normalize a node/relationship property map using registry metadata."""
-        label = value.get("_label")
-        if not isinstance(label, str):
-            return value
+        # Validate PK presence and determine SET fields deterministically
+        set_fields: List[str] = []
+        rows = [_normalize_row_types(r) for r in rows]
 
-        model_cls = get_node_by_name(label)
-        if model_cls is None:
-            model_cls = get_relationship_by_name(label)
-        if model_cls is None:
-            return value
+        for r in rows:
+            if not isinstance(r, dict):
+                raise ValueError("each row must be a dict")
+            for pk in pk_fields:
+                if pk not in r:
+                    raise ValueError(f"row missing primary key field '{pk}' for {label}")
+            for k in r.keys():
+                if k in pk_fields:
+                    continue
+                if k not in set_fields:
+                    set_fields.append(k)
 
-        meta_map = getattr(model_cls, "model_fields", None)
-        if not isinstance(meta_map, dict):
-            return value
+        if not set_fields:
+            return
 
-        from .constants import KuzuDataType
+        where_expr = " AND ".join([f"n.{pk} = row.{pk}" for pk in pk_fields])
 
-        out = dict(value)
-        for field_name, field_info in meta_map.items():
-            if field_name not in out:
-                continue
-            meta = registry.get_field_metadata(field_info)
-            if meta is None:
-                continue
-            cur = out[field_name]
-            try:
-                if meta.kuzu_type == KuzuDataType.UUID and isinstance(cur, str):
-                    out[field_name] = uuid.UUID(cur)
-                elif meta.kuzu_type == KuzuDataType.TIMESTAMP and isinstance(cur, str):
-                    # ISO-like timestamp string -> datetime
-                    out[field_name] = datetime.fromisoformat(cur)
-                elif meta.kuzu_type == KuzuDataType.DATE and isinstance(cur, str):
-                    out[field_name] = date.fromisoformat(cur)
-            except (ValueError, TypeError) as exc:
-                raise RuntimeError(
-                    f"Failed to normalize field '{field_name}' for label '{label}' "
-                    f"with value {cur!r} as {getattr(meta, 'kuzu_type', None)}"
-                ) from exc
-        return out
+        # Kuzu does not accept NULL parameters without an explicit type.
+        # Perform per-field updates and split NULL vs non-NULL assignments.
+        for field in set_fields:
+            non_null_rows: List[Dict[str, Any]] = []
+            null_rows: List[Dict[str, Any]] = []
+            for r in rows:
+                v = r.get(field)
+                if v is None:
+                    null_rows.append({pk: r[pk] for pk in pk_fields})
+                else:
+                    rr: Dict[str, Any] = {pk: r[pk] for pk in pk_fields}
+                    rr[field] = v
+                    non_null_rows.append(rr)
+
+            if non_null_rows:
+                cypher_set = f"UNWIND $rows AS row MATCH (n:{label}) WHERE {where_expr} SET n.{field} = row.{field}"
+                _ = self._conn._atp.run_cypher(cypher_set, {"rows": non_null_rows}, expect_rows=False)
+
+            if null_rows:
+                cypher_null = f"UNWIND $rows AS row MATCH (n:{label}) WHERE {where_expr} SET n.{field} = NULL"
+                _ = self._conn._atp.run_cypher(cypher_null, {"rows": null_rows}, expect_rows=False)
+
+    def bulk_delete_nodes(self, model_class: Type[Any], pks: List[Any]) -> None:
+        if not isinstance(pks, list):
+            raise ValueError("pks must be a list")
+        if not pks:
+            return
+        if not isinstance(model_class, type) or not hasattr(model_class, "__kuzu_node_name__"):
+            raise ValueError("model_class must be a registered Kuzu node model")
+
+        pk_fields = self._get_pk_fields_cached(model_class)
+        if not pk_fields or len(pk_fields) != 1:
+            raise ValueError(f"bulk_delete_nodes currently supports single-field primary keys only for {model_class.__name__}")
+        pk_field = pk_fields[0]
+        label = model_class.__kuzu_node_name__
+
+        rows = [{pk_field: v} for v in pks]
+        cypher = f"UNWIND $rows AS row MATCH (n:{label}) WHERE n.{pk_field} = row.{pk_field} DELETE n"
+        _ = self._conn._atp.run_cypher(cypher, {"rows": rows}, expect_rows=False)
+
+    # REMOVED: _normalize_result_row and _normalize_labeled_map
+    # All types (UUID, Date, DateTime, etc.) now come correctly typed from ATP's Rust layer
 
     def _raise_bulk_error(self, kind: str, name: str, exc: Exception) -> None:
         """Raise a structured RuntimeError for bulk operations without swallowing details."""
@@ -726,9 +783,8 @@ class KuzuSession:
                 from_label = fixed_labels['from_label']
                 to_label = fixed_labels['to_label']
             else:
-                d_inst = getattr(inst, '__dict__', {})
-                from_label = self._resolve_node_label(d_inst.get('from_node'), pairs, 'from')
-                to_label = self._resolve_node_label(d_inst.get('to_node'), pairs, 'to')
+                from_label = self._resolve_node_label(d0.get('from_node'), pairs, 'from')
+                to_label = self._resolve_node_label(d0.get('to_node'), pairs, 'to')
 
             from_pk_field = pk_field_cache.get(from_label)
             if from_pk_field is None:
@@ -746,13 +802,23 @@ class KuzuSession:
                 'to_pk_field': to_pk_field,
                 'from_pk': fpv, 'to_pk': tpv,
             }
-            props = inst.model_dump(exclude_unset=True)
-            for k, v in props.items():
-                if k in exclude_fields:
-                    continue
-                if v is None:
-                    continue
-                row[k] = v
+            fields_set = getattr(inst, '__pydantic_fields_set__', None)
+            if isinstance(fields_set, set):
+                for k in fields_set:
+                    if k in exclude_fields:
+                        continue
+                    v = d0.get(k)
+                    if v is None:
+                        continue
+                    row[k] = v
+            else:
+                props = inst.model_dump(exclude_unset=True)
+                for k, v in props.items():
+                    if k in exclude_fields:
+                        continue
+                    if v is None:
+                        continue
+                    row[k] = v
             if has_auto_increment:
                 row["__atp_row_idx"] = j
             rows.append(row)
@@ -818,13 +884,23 @@ class KuzuSession:
             if fpv is None or tpv is None:
                 raise ValueError("Relationship bulk insert requires both from_node_pk and to_node_pk")
             row: Dict[str, Any] = {'from_pk': fpv, 'to_pk': tpv}
-            props = inst.model_dump(exclude_unset=True)
-            for k, v in props.items():
-                if k in exclude_fields:
-                    continue
-                if v is None:
-                    continue
-                row[k] = v
+            fields_set = getattr(inst, '__pydantic_fields_set__', None)
+            if isinstance(fields_set, set):
+                for k in fields_set:
+                    if k in exclude_fields:
+                        continue
+                    v = d0.get(k)
+                    if v is None:
+                        continue
+                    row[k] = v
+            else:
+                props = inst.model_dump(exclude_unset=True)
+                for k, v in props.items():
+                    if k in exclude_fields:
+                        continue
+                    if v is None:
+                        continue
+                    row[k] = v
             if has_auto_increment:
                 row["__atp_row_idx"] = j
             rows.append(row)

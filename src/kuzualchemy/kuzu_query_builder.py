@@ -321,70 +321,106 @@ class CypherQueryBuilder:
         
         # @@ STEP 2: Build MATCH patterns for all relationship pairs
         # || S.S.4: For multi-pair relationships, we need to generate multiple MATCH patterns
-        match_patterns = []
         rel_alias = self.state.alias
         direction = rel_class.__dict__.get('__kuzu_direction__')
-        
+
+        where_already_applied = False
+
         endpoint_aliases: List[Tuple[str, str]] = []
-        for idx, pair in enumerate(pairs):
-            # || S.S.5: Get node names from the pair
-            from_name = pair.get_from_name()
-            to_name = pair.get_to_name()
-
-            # || S.S.6: Create unique aliases for each pair to avoid conflicts
-            if len(pairs) > 1:
-                from_alias = f"from_node_{idx}"
-                to_alias = f"to_node_{idx}"
-            else:
-                from_alias = "from_node"
-                to_alias = "to_node"
-
+        # Optimization: when ALL pairs (or nearly all) are requested, skip LABEL() predicates entirely.
+        # This avoids generating massive WHERE clauses with N OR conditions that cause Kuzu to hang.
+        # Threshold: if requesting >= 90% of pairs, treat as "all pairs" since predicate overhead is worse.
+        pairs_ratio = len(pairs) / len(rel_pairs) if rel_pairs else 1.0
+        all_pairs_requested = (subset is None) or (pairs_ratio >= 0.90)
+        
+        if len(pairs) > 1:
+            # Multi-pair relationships must enforce a *global* SKIP/LIMIT cap.
+            # Using UNION ALL with per-branch SKIP/LIMIT multiplies the effective page size.
+            # Instead, MATCH a single unlabeled endpoint pair and constrain endpoints by LABEL().
+            from_alias = "from_node"
+            to_alias = "to_node"
             endpoint_aliases.append((from_alias, to_alias))
-
-            # || S.S.7: Register aliases in the map
             self.alias_map[from_alias] = from_alias
             self.alias_map[to_alias] = to_alias
 
-            # @@ STEP 3: Build pattern based on direction
             if direction:
                 if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
-                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
                 elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
-                    pattern = f"({from_alias}:{from_name})<-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                    pattern = f"({from_alias})<-[{rel_alias}:{rel_name}]-({to_alias})"
                 elif direction == RelationshipDirection.BOTH:
-                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]-({to_alias})"
                 else:
-                    # Default to forward direction for unknown directions
-                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
             else:
-                # || S.S.8: Default to forward direction if not specified
-                pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
+            clauses.append(f"MATCH {pattern}")
 
-            match_patterns.append(pattern)
-
-        # @@ STEP 4: Add MATCH clause(s) to the query
-        # || S.S.9: For multi-pair relationships, we need to handle all patterns properly
-        if len(match_patterns) == 1:
-            clauses.append(f"MATCH {match_patterns[0]}")
-        else:
-            # || S.S.10: For multi-pair relationships, we use UNION ALL to match any valid pattern
-            # || This creates a query that handles all relationship pair combinations
-            # Ensure relationship alias is registered for QueryField(model=RelClass) resolution in filters
             self.alias_map[rel_alias] = rel_alias
             self.alias_map[self.state.model_class.__name__] = rel_alias
-            union_query = self._build_multi_pair_union_query(match_patterns, endpoint_aliases, rel_alias, pairs)
-            # Don't clear parameters - they're needed for WHERE clauses in UNION queries
-            # Return the UNION query with parameters intact
-            return union_query, self.parameters
+
+            where_clause = self._build_where_clause(relationship_alias=rel_alias)
+            # Only add LABEL() predicates when a subset is explicitly requested
+            if all_pairs_requested:
+                # No need for pair filtering - we want all relationships
+                if where_clause:
+                    clauses.append(where_clause)
+                    where_already_applied = True
+            else:
+                # Decide positive vs negative predicate strategy:
+                # Use negative (NOT) when requested >= half of total to minimize OR conditions
+                use_negative = len(pairs) >= len(rel_pairs) // 2
+                pair_clause = self._build_relationship_pair_label_predicate(
+                    from_alias, to_alias, pairs, rel_pairs, use_negative=use_negative
+                )
+                if pair_clause:  # Could be empty if negative mode and all pairs requested
+                    if where_clause:
+                        base = where_clause[len("WHERE "):]
+                        clauses.append(f"WHERE ({base}) AND ({pair_clause})")
+                    else:
+                        clauses.append(f"WHERE {pair_clause}")
+                    where_already_applied = True
+                elif where_clause:
+                    clauses.append(where_clause)
+                    where_already_applied = True
+        else:
+            match_patterns = []
+            for pair in pairs:
+                from_name = pair.get_from_name()
+                to_name = pair.get_to_name()
+
+                from_alias = "from_node"
+                to_alias = "to_node"
+                endpoint_aliases.append((from_alias, to_alias))
+
+                self.alias_map[from_alias] = from_alias
+                self.alias_map[to_alias] = to_alias
+
+                if direction:
+                    if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
+                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                    elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
+                        pattern = f"({from_alias}:{from_name})<-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                    elif direction == RelationshipDirection.BOTH:
+                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                    else:
+                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                else:
+                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+
+                match_patterns.append(pattern)
+
+            clauses.append(f"MATCH {match_patterns[0]}")
 
         self.alias_map[rel_alias] = rel_alias
         # Map relationship class name to alias for QueryField/filters referencing the class name
         rel_cls_name = self.state.model_class.__name__
         self.alias_map[rel_cls_name] = rel_alias
 
-        where_clause = self._build_where_clause(relationship_alias=rel_alias)
-        if where_clause:
-            clauses.append(where_clause)
+        if not where_already_applied:
+            where_clause = self._build_where_clause(relationship_alias=rel_alias)
+            if where_clause:
+                clauses.append(where_clause)
         
         # @@ STEP: Check for aggregations in relationship queries
         if self.state.aggregations or self.state.group_by:
@@ -481,6 +517,52 @@ class CypherQueryBuilder:
             if used:
                 self.parameters = {k: v for k, v in self.parameters.items() if k in used}
         return query, self.parameters
+
+    def _build_relationship_pair_label_predicate(
+        self,
+        from_var: str,
+        to_var: str,
+        requested_pairs: List[Any],
+        all_pairs: List[Any],
+        use_negative: bool = False,
+    ) -> str:
+        """Build a LABEL() predicate for multi-pair relationships.
+        
+        When use_negative=False (positive mode):
+            Build (LABEL(from)=X AND LABEL(to)=Y) OR ... for requested pairs.
+        When use_negative=True (negative mode):
+            Build NOT((LABEL(from)=X AND LABEL(to)=Y) OR ...) for excluded pairs.
+            This is more efficient when requested_pairs > half of all_pairs.
+        """
+        if use_negative:
+            # Build exclusion predicate for pairs NOT in requested_pairs
+            requested_set = set((p.get_from_name(), p.get_to_name()) for p in requested_pairs)
+            excluded_pairs = [p for p in all_pairs if (p.get_from_name(), p.get_to_name()) not in requested_set]
+            if not excluded_pairs:
+                # All pairs requested, no filtering needed
+                return ""
+            parts: List[str] = []
+            for i, pair in enumerate(excluded_pairs):
+                from_label = pair.get_from_name()
+                to_label = pair.get_to_name()
+                p_from = f"{self.state.parameter_prefix}__excl_from_{i}"
+                p_to = f"{self.state.parameter_prefix}__excl_to_{i}"
+                self.parameters[p_from] = from_label
+                self.parameters[p_to] = to_label
+                parts.append(f"(label({from_var}) = ${p_from} AND label({to_var}) = ${p_to})")
+            return "NOT(" + " OR ".join(parts) + ")"
+        else:
+            # Positive mode: include only requested pairs
+            parts: List[str] = []
+            for i, pair in enumerate(requested_pairs):
+                from_label = pair.get_from_name()
+                to_label = pair.get_to_name()
+                p_from = f"{self.state.parameter_prefix}__pairs_from_{i}"
+                p_to = f"{self.state.parameter_prefix}__pairs_to_{i}"
+                self.parameters[p_from] = from_label
+                self.parameters[p_to] = to_label
+                parts.append(f"(label({from_var}) = ${p_from} AND label({to_var}) = ${p_to})")
+            return "(" + " OR ".join(parts) + ")"
     
     def _build_where_clause(self, relationship_alias: Optional[str] = None) -> str:
         """Build WHERE clause from filters."""

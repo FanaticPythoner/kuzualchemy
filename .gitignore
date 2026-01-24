@@ -223,3 +223,4 @@ atp_flame.svg
 *.prom
 atomic-transactional-pipeline-(atp)-revamp.md
 atp_pipeline-1.0.0-cp312-cp312-manylinux_2_34_x86_64.whl
+atp_pipeline-1.0.6-cp312-cp312-manylinux_2_35_x86_64.whl

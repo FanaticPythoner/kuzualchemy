@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import threading
+import atexit
 
 from atp_pipeline import (
     ATPHandler,
@@ -15,52 +16,87 @@ from atp_pipeline import (
 
 
 _HANDLER_LOCK = threading.RLock()
-_HANDLERS: Dict[str, Tuple[ATPHandler, int]] = {}
+_HANDLERS: Dict[str, ATPHandler] = {}
+_KUZU_INITIALIZED: set[str] = set()  # Track initialized db_paths to avoid repeated calls
+
+
+def _shutdown_all_handlers() -> None:
+    # Best-effort shutdown at interpreter exit.
+    with _HANDLER_LOCK:
+        for handler in list(_HANDLERS.values()):
+            try:
+                handler.flush(None)
+            except Exception:
+                pass
+            try:
+                handler.shutdown(None)
+            except Exception:
+                pass
+        _HANDLERS.clear()
+
+
+atexit.register(_shutdown_all_handlers)
 
 
 def _acquire_handler(db_path: str) -> ATPHandler:
+    # ':memory:' is treated as ephemeral per-instance. It should not be cached across sessions,
+    # otherwise separate in-memory graphs would alias and tests would interfere.
+    if db_path == ":memory:":
+        cfg: Dict[str, Any] = {"db_path": db_path}
+        handler: ATPHandler = ATPHandler(DatabaseType.KUZU, cfg)
+        _ = handler.get_capability_report()
+        return handler
+
     key = str(Path(db_path).resolve())
     with _HANDLER_LOCK:
         if key in _HANDLERS:
-            handler, refc = _HANDLERS[key]
-            _HANDLERS[key] = (handler, refc + 1)
-            return handler
-        # Create new handler and store with refcount 1
+            return _HANDLERS[key]
+
+        # Create new handler and store for process lifetime
         cfg: Dict[str, Any] = {"db_path": key}
         handler: ATPHandler = ATPHandler(DatabaseType.KUZU, cfg)
         # Force capability negotiation early for explicit failure
         _ = handler.get_capability_report()
-        _HANDLERS[key] = (handler, 1)
+        _HANDLERS[key] = handler
         return handler
 
 
 def _release_handler(db_path: str, timeout: Optional[float]) -> None:
+    # ':memory:' is ephemeral and is handled by the instance.
+    if db_path == ":memory:":
+        return
+
+    # For file-backed DBs, handler is intentionally retained until process exit.
     key = str(Path(db_path).resolve())
     with _HANDLER_LOCK:
-        entry = _HANDLERS.get(key)
-        if not entry:
+        handler = _HANDLERS.get(key)
+        if handler is None:
             return
-        handler, refc = entry
-        if refc > 1:
-            _HANDLERS[key] = (handler, refc - 1)
-            return
-        # Last reference: flush and shutdown, then remove
-        try:
-            handler.flush(timeout)
-        finally:
-            handler.shutdown(timeout)
-        _HANDLERS.pop(key, None)
+        handler.flush(timeout)
 
 
 class ATPIntegration:
     """Integration with ATP pipeline for Kuzu database operations."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._db_path = str(Path(db_path).resolve())
-        # Acquire or create a shared handler per db_path
-        self._handler: ATPHandler = _acquire_handler(self._db_path)
+        raw = str(db_path)
+        if raw == ":memory:":
+            self._db_path = ":memory:"
+            self._ephemeral_handler: Optional[ATPHandler] = _acquire_handler(":memory:")
+            self._handler = self._ephemeral_handler
+        else:
+            self._db_path = str(Path(db_path).resolve())
+            self._ephemeral_handler = None
+            # Acquire or create a shared handler per db_path
+            self._handler = _acquire_handler(self._db_path)
 
     def run_cypher(self, query: str, params: Optional[Dict[str, Any]], expect_rows: bool) -> List[Dict[str, Any]]:
+        # FAST PATH: For read-only queries expecting rows, bypass ATP pipeline entirely
+        # and use the readonly connection pool directly for ~10x faster execution.
+        if expect_rows and self._is_readonly_query(query):
+            return self._run_cypher_fast(query, params)
+        
+        # SLOW PATH: Full ATP pipeline for write queries or non-row-returning queries
         returns = ReturnSpec(modes=ReturnMode.POST_CYPHER if expect_rows else ReturnMode.NONE)
         spec = OperationSpec(
             kind=OpKind.RUN_CYPHER,
@@ -83,6 +119,71 @@ class ATPIntegration:
                     return first  # type: ignore[return-value]
                 return []
         return []
+
+    def _is_readonly_query(self, query: str) -> bool:
+        """Check if a query is read-only (no write clauses).
+        
+        Read-only queries can use the fast path (readonly connection pool)
+        instead of the full ATP transactional pipeline.
+        """
+        q = query.upper()
+        # Write clause keywords that indicate a non-readonly query
+        write_keywords = (
+            'CREATE', 'DELETE', 'DETACH', 'SET', 'REMOVE', 'MERGE',
+            'DROP', 'ALTER', 'COPY', 'CALL', 'BEGIN', 'COMMIT', 'ROLLBACK'
+        )
+        for kw in write_keywords:
+            # Check for keyword as whole word (not substring)
+            if f' {kw} ' in f' {q} ' or q.startswith(f'{kw} ') or f' {kw}(' in f' {q} ':
+                return False
+        return True
+
+    def _run_cypher_fast(self, query: str, params: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Execute a read-only query using the readonly connection pool directly.
+        
+        This bypasses the full ATP transactional pipeline for ~10x faster execution
+        on read queries. Uses execute_parallel_queries with a single query.
+        """
+        from atp_pipeline import execute_parallel_queries, ensure_kuzu_initialized
+        
+        try:
+            # Ensure database is initialized only once per db_path
+            if self._db_path not in _KUZU_INITIALIZED:
+                ensure_kuzu_initialized(self._db_path)
+                _KUZU_INITIALIZED.add(self._db_path)
+            results = execute_parallel_queries(self._db_path, [(query, params or {})])
+            if results and len(results) > 0:
+                return results[0]
+            return []
+        except Exception as e:
+            raise RuntimeError(f"Query error: {e}") from e
+
+    def run_cypher_parallel(self, queries: List[tuple[str, Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+        """Execute multiple Cypher queries in parallel using the readonly connection pool.
+        
+        This leverages the Rust-side parallel execution with rayon and the readonly
+        connection pool for GIL-independent parallel query execution.
+        
+        Args:
+            queries: List of (query_string, params_dict) tuples to execute in parallel
+            
+        Returns:
+            List of result lists (one per query, in same order as input)
+        """
+        if not queries:
+            return []
+        
+        # Import here to avoid circular imports
+        from atp_pipeline import execute_parallel_queries
+        
+        # Convert to format expected by Rust: list of (query, params) tuples
+        query_tuples = [(q, p or {}) for q, p in queries]
+        
+        try:
+            results = execute_parallel_queries(self._db_path, query_tuples)
+            return results
+        except Exception as e:
+            raise RuntimeError(f"Parallel query error: {e}") from e
 
     def create_node(self, label: str, props: Optional[Dict[str, Any]] = None, pk: Optional[Dict[str, Any]] = None, return_object: bool = False) -> Optional[Dict[str, Any]]:
         returns = None
@@ -245,6 +346,13 @@ class ATPIntegration:
         self._handler.flush(timeout)
 
     def release(self, timeout: Optional[float] = None) -> None:
+        if self._ephemeral_handler is not None:
+            try:
+                self._ephemeral_handler.flush(timeout)
+            finally:
+                self._ephemeral_handler.shutdown(timeout)
+            self._ephemeral_handler = None
+            return
         _release_handler(self._db_path, timeout)
 
     def shutdown(self, timeout: Optional[float] = None) -> None:

@@ -6,8 +6,10 @@ from __future__ import annotations
 from typing import Any, Union, get_origin, get_args, Type, Dict
 from enum import Enum
 from pydantic import model_validator
+import uuid
 
 from .kuzu_orm import KuzuBaseModel
+from .uuid_normalization import normalize_uuid_fields_for_model
 
 # Module-level cache for enum lookups: {EnumClass: (names_dict, values_dict)}
 _ENUM_CACHE: Dict[Type[Enum], tuple[Dict[str, Enum], Dict[Any, Enum]]] = {}
@@ -87,6 +89,18 @@ class BaseModel(KuzuBaseModel):
             raise ValueError(f"Invalid enum value: {elem}")
 
         return convert_element
+
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_uuid_fields(cls: Type['BaseModel'], values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+
+        # Only normalize keys present in values (avoid populating defaults here).
+        present = {k: v for (k, v) in values.items() if k in cls.model_fields}
+        norm = normalize_uuid_fields_for_model(model_class=cls, data=present)
+        values.update(norm)
+        return values
 
     @model_validator(mode='before')
     @classmethod
