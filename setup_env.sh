@@ -5,12 +5,11 @@ set -Eeuo pipefail
 # Installs Python, Rust, and builds the rust extensions
 
 # Usage:
-#   ./setup_env.sh [VENV] [PY_REQ] [TOOLS_DIR] [PY_SPEC]
+#   ./setup_env.sh [VENV] [TOOLS_DIR] [PY_SPEC]
 # Defaults:
 VENV="${1:-.venv}"
-PY_REQ="${2:-requirements.txt}"
-TOOLS_DIR="${3:-.tools}"
-PY_SPEC="${4:-3.12}"
+TOOLS_DIR="${2:-.tools}"
+PY_SPEC="${3:-3.12}"
 
 log(){ printf '[kuzualchemy] %s\n' "$*"; }
 die(){ printf '[kuzualchemy] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -73,35 +72,9 @@ if [[ ! -f "$VENV_PY" ]]; then
 fi
 
 # ---------------- 3) Install Python deps STRICTLY into the venv -------------
-if [[ -f "$PY_REQ" ]]; then
-  log "Installing Python requirements from $PY_REQ (venv pip)"
-  "$VENV_PY" -m pip install --upgrade pip setuptools wheel
-  "$VENV_PY" -m pip install -r "$PY_REQ"
-else
-  log "No $PY_REQ found; skipping Python deps"
-fi
-
-# ---------------- 3b) Install atp_pipeline wheel --------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ATP_WHL=""
-ATP_WHL_TS=0
-shopt -s nullglob
-for f in "$SCRIPT_DIR"/atp_pipeline-*.whl; do
-  [[ -f "$f" ]] || continue
-  ts="$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f")"
-  if (( ts > ATP_WHL_TS )); then
-    ATP_WHL_TS="$ts"
-    ATP_WHL="$f"
-  fi
-done
-shopt -u nullglob
-if [[ -n "$ATP_WHL" && -f "$ATP_WHL" ]]; then
-  log "Installing atp_pipeline from local wheel: $(basename "$ATP_WHL")"
-  "$VENV_PY" -m pip install --force-reinstall --no-deps "$ATP_WHL"
-else
-  log "⚠ atp_pipeline wheel not found under $SCRIPT_DIR (expected atp_pipeline-*.whl)"
-fi
-
+# Dependencies and wheels are now handled by pyproject.toml
+log "Installing project and dependencies from pyproject.toml"
+"$VENV_PY" -m pip install --upgrade pip setuptools wheel
 "$VENV_PY" -m pip install -e ".[dev,test]"
 
 # ---------------- 4) Final Verification ----------------

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 import threading
 import atexit
+import logging
+import time
+import re
 
 from atp_pipeline import (
     ATPHandler,
@@ -16,23 +19,47 @@ from atp_pipeline import (
 
 
 _HANDLER_LOCK = threading.RLock()
-_HANDLERS: Dict[str, ATPHandler] = {}
+_HANDLERS: Dict[str, Union[ATPHandler, None]] = {}
+_HANDLER_REFCOUNTS: Dict[str, int] = {}
 _KUZU_INITIALIZED: set[str] = set()  # Track initialized db_paths to avoid repeated calls
+logger = logging.getLogger(__name__)
 
 
 def _shutdown_all_handlers() -> None:
     # Best-effort shutdown at interpreter exit.
+    handlers: list[tuple[str, ATPHandler]] = []
     with _HANDLER_LOCK:
-        for handler in list(_HANDLERS.values()):
-            try:
-                handler.flush(None)
-            except Exception:
-                pass
-            try:
-                handler.shutdown(None)
-            except Exception:
-                pass
+        if _HANDLERS:
+            handlers = list(_HANDLERS.items())
         _HANDLERS.clear()
+        _HANDLER_REFCOUNTS.clear()
+        _KUZU_INITIALIZED.clear()
+
+    for key, handler in handlers:
+        flush_err: Exception | None = None
+        shutdown_err: Exception | None = None
+        t0 = time.perf_counter()
+        try:
+            handler.flush(None)
+        except Exception as exc:  # pylint: disable=broad-except
+            flush_err = exc
+            logger.error("kuzualchemy.atp.handler.shutdown_all.flush_failed db_path=%s error=%s", key, exc)
+        t1 = time.perf_counter()
+        try:
+            handler.shutdown(None)
+        except Exception as exc:  # pylint: disable=broad-except
+            shutdown_err = exc
+            logger.error("kuzualchemy.atp.handler.shutdown_all.shutdown_failed db_path=%s error=%s", key, exc)
+        t2 = time.perf_counter()
+        logger.info(
+            "kuzualchemy.atp.handler.shutdown_all.done db_path=%s flush_seconds=%.6f shutdown_seconds=%.6f total_seconds=%.6f",
+            key,
+            t1 - t0,
+            t2 - t1,
+            t2 - t0,
+        )
+        if flush_err or shutdown_err:
+            continue
 
 
 atexit.register(_shutdown_all_handlers)
@@ -45,12 +72,20 @@ def _acquire_handler(db_path: str) -> ATPHandler:
         cfg: Dict[str, Any] = {"db_path": db_path}
         handler: ATPHandler = ATPHandler(DatabaseType.KUZU, cfg)
         _ = handler.get_capability_report()
+        logger.info("kuzualchemy.atp.handler.acquire.ephemeral db_path=%s", db_path)
         return handler
 
     key = str(Path(db_path).resolve())
     with _HANDLER_LOCK:
-        if key in _HANDLERS:
-            return _HANDLERS[key]
+        handler = _HANDLERS.get(key)
+        if handler is not None:
+            _HANDLER_REFCOUNTS[key] = _HANDLER_REFCOUNTS.get(key, 0) + 1
+            logger.info(
+                "kuzualchemy.atp.handler.acquire.reuse db_path=%s refcount=%d",
+                key,
+                _HANDLER_REFCOUNTS[key],
+            )
+            return handler
 
         # Create new handler and store for process lifetime
         cfg: Dict[str, Any] = {"db_path": key}
@@ -58,6 +93,8 @@ def _acquire_handler(db_path: str) -> ATPHandler:
         # Force capability negotiation early for explicit failure
         _ = handler.get_capability_report()
         _HANDLERS[key] = handler
+        _HANDLER_REFCOUNTS[key] = _HANDLER_REFCOUNTS.get(key, 0) + 1
+        logger.info("kuzualchemy.atp.handler.acquire.create db_path=%s refcount=%d", key, _HANDLER_REFCOUNTS[key])
         return handler
 
 
@@ -66,13 +103,74 @@ def _release_handler(db_path: str, timeout: Optional[float]) -> None:
     if db_path == ":memory:":
         return
 
-    # For file-backed DBs, handler is intentionally retained until process exit.
+    # For file-backed DBs, release when no sessions remain (refcount reaches zero).
     key = str(Path(db_path).resolve())
+    handler: ATPHandler | None = None
+    do_flush = False
+    do_shutdown = False
+    new_refcount: int | None = None
     with _HANDLER_LOCK:
         handler = _HANDLERS.get(key)
         if handler is None:
             return
+        refcount = _HANDLER_REFCOUNTS.get(key, 0)
+        if refcount <= 1:
+            _HANDLERS.pop(key, None)
+            _HANDLER_REFCOUNTS.pop(key, None)
+            _KUZU_INITIALIZED.discard(key)
+            do_flush = True
+            do_shutdown = True
+            new_refcount = 0
+        else:
+            _HANDLER_REFCOUNTS[key] = refcount - 1
+            do_flush = True
+            new_refcount = _HANDLER_REFCOUNTS[key]
+
+    logger.info(
+        "kuzualchemy.atp.handler.release db_path=%s refcount=%s shutdown=%s",
+        key,
+        new_refcount,
+        do_shutdown,
+    )
+
+    if handler is None or not do_flush:
+        return
+
+    flush_err: Exception | None = None
+    shutdown_err: Exception | None = None
+    t0 = time.perf_counter()
+    try:
         handler.flush(timeout)
+    except Exception as exc:  # pylint: disable=broad-except
+        flush_err = exc
+        logger.error("kuzualchemy.atp.handler.release.flush_failed db_path=%s error=%s", key, exc)
+    t1 = time.perf_counter()
+
+    if do_shutdown:
+        try:
+            handler.shutdown(timeout)
+        except Exception as exc:  # pylint: disable=broad-except
+            shutdown_err = exc
+            logger.error("kuzualchemy.atp.handler.release.shutdown_failed db_path=%s error=%s", key, exc)
+        t2 = time.perf_counter()
+        logger.info(
+            "kuzualchemy.atp.handler.release.done db_path=%s flush_seconds=%.6f shutdown_seconds=%.6f total_seconds=%.6f",
+            key,
+            t1 - t0,
+            t2 - t1,
+            t2 - t0,
+        )
+    else:
+        logger.info(
+            "kuzualchemy.atp.handler.release.flushed db_path=%s flush_seconds=%.6f",
+            key,
+            t1 - t0,
+        )
+
+    if flush_err is not None:
+        raise flush_err
+    if shutdown_err is not None:
+        raise shutdown_err
 
 
 class ATPIntegration:
@@ -126,7 +224,7 @@ class ATPIntegration:
         Read-only queries can use the fast path (readonly connection pool)
         instead of the full ATP transactional pipeline.
         """
-        q = query.upper()
+        q = re.sub(r"\s+", " ", query.strip()).upper()
         # Write clause keywords that indicate a non-readonly query
         write_keywords = (
             'CREATE', 'DELETE', 'DETACH', 'SET', 'REMOVE', 'MERGE',
