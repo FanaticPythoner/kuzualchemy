@@ -33,7 +33,7 @@ classifiers = [
 requires-python = ">=3.8"
 dependencies = [
     "pydantic>=2.0.0",
-    "atp_pipeline @ file://./atp_pipeline-1.0.7-cp312-cp312-manylinux_2_34_x86_64.whl"
+    "atp-pipeline"
 ]
 
 [project.optional-dependencies]

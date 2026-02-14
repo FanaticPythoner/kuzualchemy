@@ -69,6 +69,35 @@ cd kuzualchemy
 pip install -e ".[dev,test]"
 ```
 
+### Internal distribution workflow (CodeGraph)
+
+Use this workflow for internal builds/releases with CGPM + devpi.
+
+```bash
+# From /home/n00ne/Documents/GitHub/cgpm
+./.venv/bin/cgpm -c config/packages.toml pull kuzualchemy
+./.venv/bin/cgpm -c config/packages.toml build kuzualchemy --python ./.venv/bin/python
+./.venv/bin/cgpm -c config/packages.toml publish kuzualchemy --python ./.venv/bin/python
+```
+
+Internal consumer install:
+
+```bash
+python -m pip install --extra-index-url http://localhost:3141/codegraph/prod/+simple/ kuzualchemy
+```
+
+Internal dependency declaration policy (`pyproject.toml`):
+
+```toml
+[project]
+dependencies = [
+    "pydantic>=2.0.0",
+    "atp-pipeline",
+]
+```
+
+`atp-pipeline` is an internal package and is intentionally unpinned (bare name only).
+
 ## Quick Start
 
 ### Basic Setup
