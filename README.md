@@ -71,19 +71,27 @@ pip install -e ".[dev,test]"
 
 ### Internal distribution workflow (CodeGraph)
 
-Use this workflow for internal builds/releases with CGPM + devpi.
+Publication is managed centrally by [CGPM](https://github.com/FanaticPythoner/cgpm).
+A single `publish` command pulls latest, bumps the version, builds the wheel,
+commits + pushes the version change, and uploads to devpi:
 
 ```bash
-# From /home/n00ne/Documents/GitHub/cgpm
-./.venv/bin/cgpm -c config/packages.toml pull kuzualchemy
-./.venv/bin/cgpm -c config/packages.toml build kuzualchemy --python ./.venv/bin/python
-./.venv/bin/cgpm -c config/packages.toml publish kuzualchemy --python ./.venv/bin/python
+# From /home/n00ne/Documents/GitHub/cgpm (requires CGPM_DEVPI_PASSWORD + push credentials)
+source .venv/bin/activate
+export CGPM_DEVPI_PASSWORD="your-password"
+cgpm -c config/packages.toml publish kuzualchemy --python .venv/bin/python
 ```
 
 Internal consumer install:
 
 ```bash
-python -m pip install --extra-index-url http://localhost:3141/codegraph/prod/+simple/ kuzualchemy
+pip install --extra-index-url http://localhost:3141/codegraph/prod/+simple/ kuzualchemy
+```
+
+Or, if `pip.conf` is configured (via `cgpm pip-conf --write`):
+
+```bash
+pip install kuzualchemy
 ```
 
 Internal dependency declaration policy (`pyproject.toml`):

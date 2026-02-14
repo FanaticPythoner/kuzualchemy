@@ -263,6 +263,17 @@ class CypherQueryBuilder:
                     else:
                         order_items.append(f"{self.state.alias}.{fld} {direction.value}")
             clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
+        elif (self.state.offset_value is not None or self.state.limit_value is not None):
+            # @@ STEP: Deterministic pagination for node queries.
+            # Without ORDER BY, SKIP/LIMIT across separate query executions can return
+            # duplicate or missing rows because Kuzu's internal scan order is not guaranteed
+            # to be stable across connections. Order by the model's primary key field(s).
+            _pk_getter = getattr(self.state.model_class, 'get_primary_key_fields', None)
+            if _pk_getter is not None:
+                _pk_fields = _pk_getter()
+                if _pk_fields:
+                    _pk_order = ', '.join(f"{self.state.alias}.{pk}" for pk in _pk_fields)
+                    clauses.append(f"{CypherConstants.ORDER_BY} {_pk_order}")
         
         # @@ STEP: Kuzu requires SKIP instead of OFFSET, and SKIP must come before LIMIT
         # || S.1: Add SKIP and LIMIT as separate clauses in correct order for Kuzu
@@ -501,6 +512,29 @@ class CypherQueryBuilder:
                 else:
                     order_items.append(f"{rel_alias}.{fld} {direction.value}")
             clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
+        elif (self.state.offset_value is not None or self.state.limit_value is not None) and endpoint_aliases:
+            # @@ STEP: Deterministic pagination for relationship queries.
+            # Without ORDER BY, SKIP/LIMIT across separate query executions can return
+            # duplicate or missing rows because Kuzu's internal scan order is not guaranteed
+            # to be stable across connections. Order by endpoint primary key fields.
+            _from_alias, _to_alias = endpoint_aliases[0]
+            _from_pk = "id"
+            _to_pk = "id"
+            if pairs:
+                _first_pair = pairs[0]
+                _from_cls = getattr(_first_pair, 'from_node', None)
+                _to_cls = getattr(_first_pair, 'to_node', None)
+                _fpk_getter = getattr(_from_cls, 'get_primary_key_fields', None) if _from_cls else None
+                _tpk_getter = getattr(_to_cls, 'get_primary_key_fields', None) if _to_cls else None
+                if _fpk_getter is not None:
+                    _fpks = _fpk_getter()
+                    if _fpks:
+                        _from_pk = _fpks[0]
+                if _tpk_getter is not None:
+                    _tpks = _tpk_getter()
+                    if _tpks:
+                        _to_pk = _tpks[0]
+            clauses.append(f"{CypherConstants.ORDER_BY} {_from_alias}.{_from_pk}, {_to_alias}.{_to_pk}")
 
         # @@ STEP: Kuzu requires SKIP instead of OFFSET, and SKIP must come before LIMIT
         # || S.1: Add SKIP and LIMIT as separate clauses in correct order for Kuzu
