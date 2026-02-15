@@ -932,12 +932,12 @@ class Query(Generic[ModelType]):
             rel_pairs = d_model['__kuzu_relationship_pairs__'] if has_pairs_attr else []
             legacy_from = d_model['__kuzu_from_node__'] if '__kuzu_from_node__' in d_model else None
             legacy_to = d_model['__kuzu_to_node__'] if '__kuzu_to_node__' in d_model else None
-            logger.info(
+            logger.debug(
                 "RelClass=%s has_pairs_attr=%s pairs_len=%s legacy_from=%s legacy_to=%s",
                 result_model_class.__name__, has_pairs_attr, len(rel_pairs),
                 type(legacy_from).__name__ if legacy_from is not None else None,
                 type(legacy_to).__name__ if legacy_to is not None else None,
-            ) # TODO: REVERT TO debug()
+            )
             if (not rel_pairs) and (legacy_from is None or legacy_to is None):
                 logger.error(
                     "Relationship class %s lacks pairs and legacy endpoints",

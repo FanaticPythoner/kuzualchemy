@@ -1361,7 +1361,7 @@ class KuzuRegistry:
         # @@ STEP: Reset the registry state hash
         self._registry_state_hash = None
 
-        logger.info("Foreign key validation cache invalidated due to registry state change") # TODO: REVERT TO debug()
+        logger.debug("Foreign key validation cache invalidated due to registry state change")
 
     def _validate_foreign_keys_for_node(self, node_name: str, node_class: Type[Any]) -> List[str]:
         """
@@ -2167,7 +2167,7 @@ class KuzuNodeBase(KuzuBaseModel):
             node_name = self.get_node_name()
         except ValueError:
             # @@ STEP: Skip validation if node is not properly decorated
-            logger.info(f"Skipping foreign key validation for {self.__class__.__name__} - not properly decorated") # TODO: REVERT TO debug()
+            logger.debug(f"Skipping foreign key validation for {self.__class__.__name__} - not properly decorated")
             return self
 
         # @@ STEP: Perform cached foreign key validation using registry
