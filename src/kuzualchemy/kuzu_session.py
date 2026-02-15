@@ -265,37 +265,44 @@ class KuzuSession:
         if " skip " in f" {q_lower} " or " limit " in f" {q_lower} ":
             raise ValueError("Raw query already contains SKIP/LIMIT; cannot auto-paginate. Remove them and retry.")
 
-        def fetch_page(offset: int) -> List[Dict[str, Any]]:
-            paged_q = f"{base} SKIP {offset} LIMIT {page_size}"
-            return self.execute(paged_q, parameters)
+        def fetch_page(offset: int) -> tuple[List[Dict[str, Any]], bool]:
+            paged_q = f"{base} SKIP {offset} LIMIT {page_size + 1}"
+            rows = self.execute(paged_q, parameters)
+            has_more = len(rows) > page_size
+            page = rows[:page_size] if has_more else rows
+            return page, has_more
 
         # First page
         offset = 0
-        page = fetch_page(offset)
+        page, has_more = fetch_page(offset)
         if prefetch_pages > 0:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=1) as executor:
-                next_future = executor.submit(fetch_page, offset + page_size) if len(page) == page_size else None
+                next_future = executor.submit(fetch_page, offset + page_size) if has_more else None
                 while True:
                     for row in page:
                         yield row
-                    if len(page) < page_size:
+                    if not has_more:
                         break
-                    next_page = next_future.result() if next_future is not None else fetch_page(offset + page_size)
+                    if next_future is not None:
+                        next_page, next_has_more = next_future.result()
+                    else:
+                        next_page, next_has_more = fetch_page(offset + page_size)
                     offset += page_size
-                    if len(next_page) == page_size:
+                    if next_has_more:
                         next_future = executor.submit(fetch_page, offset + page_size)
                     else:
                         next_future = None
                     page = next_page
+                    has_more = next_has_more
         else:
             while True:
                 for row in page:
                     yield row
-                if len(page) < page_size:
+                if not has_more:
                     break
                 offset += page_size
-                page = fetch_page(offset)
+                page, has_more = fetch_page(offset)
 
 
     def _execute_with_connection_reuse(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Any:

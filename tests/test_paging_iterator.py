@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import List
+import re
 
 import pytest
 import tempfile
@@ -122,6 +122,46 @@ def test_iter_page_size_edge_cases(test_models, sample_users, sample_posts):
         # page_size larger than total
         items_large = list(sess.query(TestUser).order_by("id").iter(page_size=10))
         assert [u.id for u in items_large] == [1, 2, 3]
+    finally:
+        _cleanup_session(sess, db_path)
+
+
+def test_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
+    test_models,
+    sample_users,
+    sample_posts,
+    monkeypatch,
+):
+    sess, db_path = _new_isolated_session()
+    try:
+        _setup_basic_users(sess, test_models, sample_users, sample_posts)
+        TestUser = test_models["TestUser"]
+        # Expand to exact multiple of page_size=2 to exercise terminal-page behavior.
+        sess.add(TestUser(id=4, name="Dora", email="dora@example.com", age=22))
+        sess.commit()
+
+        # Force sequential path for this regression check.
+        monkeypatch.setenv("ATP_READONLY_POOL_MAX_SIZE", "1")
+
+        executed_queries: list[str] = []
+        original_execute = sess._execute_for_query_object
+
+        def _spy_execute(query: str, parameters=None):
+            executed_queries.append(query)
+            return original_execute(query, parameters)
+
+        monkeypatch.setattr(sess, "_execute_for_query_object", _spy_execute)
+
+        items = list(sess.query(TestUser).order_by("id").iter(page_size=2, prefetch_pages=1))
+        assert [u.id for u in items] == [1, 2, 3, 4]
+
+        skip_values = [
+            int(match.group(1))
+            for q in executed_queries
+            for match in [re.search(r"\bSKIP\s+(\d+)\b", q)]
+            if match is not None
+        ]
+        assert skip_values == [0, 2]
     finally:
         _cleanup_session(sess, db_path)
 

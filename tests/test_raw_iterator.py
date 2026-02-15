@@ -6,6 +6,7 @@ from __future__ import annotations
 import tempfile
 import shutil
 import uuid
+import re
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,46 @@ def test_raw_iter_prefetch_equivalence(test_models, sample_users, sample_posts):
         b = [r["id"] for r in sess.iterate(cypher, page_size=2, prefetch_pages=1)]
         c = [r["id"] for r in sess.execute(cypher, as_iterator=True, page_size=2, prefetch_pages=1)]
         assert a == b == c == [1, 2, 3]
+    finally:
+        _cleanup_session(sess, db_path)
+
+
+def test_raw_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
+    test_models,
+    sample_users,
+    sample_posts,
+    monkeypatch,
+):
+    sess, db_path = _new_isolated_session()
+    try:
+        _setup_basic_users(sess, test_models, sample_users, sample_posts)
+        TestUser = test_models["TestUser"]
+        label = TestUser.__kuzu_node_name__
+
+        sess.add(TestUser(id=4, name="Dora", email="dora@example.com", age=22))
+        sess.commit()
+
+        executed_queries: list[str] = []
+        original_execute = sess.execute
+
+        def _spy_execute(query: str, parameters=None, **kwargs):
+            executed_queries.append(query)
+            return original_execute(query, parameters, **kwargs)
+
+        monkeypatch.setattr(sess, "execute", _spy_execute)
+
+        cypher = f"MATCH (n:{label}) RETURN n.id AS id ORDER BY id"
+        ids_iter = [row["id"] for row in sess.iterate(cypher, page_size=2, prefetch_pages=1)]
+
+        assert ids_iter == [1, 2, 3, 4]
+
+        skip_values = [
+            int(match.group(1))
+            for q in executed_queries
+            for match in [re.search(r"\bSKIP\s+(\d+)\b", q)]
+            if match is not None
+        ]
+        assert skip_values == [0, 2]
     finally:
         _cleanup_session(sess, db_path)
 

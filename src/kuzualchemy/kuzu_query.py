@@ -31,6 +31,29 @@ from .uuid_normalization import _NULL_UUID
 
 logger = logging.getLogger(__name__)
 
+_ENV_ATP_READONLY_POOL_MAX_SIZE = "ATP_READONLY_POOL_MAX_SIZE"
+
+
+def _read_required_positive_int_env(var_name: str) -> int:
+    """Read and validate a required positive integer environment variable."""
+    raw = os.getenv(var_name)
+    if raw is None:
+        raise RuntimeError(
+            f"Missing required environment variable '{var_name}'. "
+            "Configure it before calling Query.iter()."
+        )
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Environment variable '{var_name}' must be an integer, got: {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"Environment variable '{var_name}' must be > 0, got: {value}"
+        )
+    return value
+
 if TYPE_CHECKING:
     from .kuzu_session import KuzuSession
 
@@ -599,8 +622,8 @@ class Query(Generic[ModelType]):
         )
 
         # Check if parallel execution is available and beneficial
-        pool_size = int(os.environ["ATP_READONLY_POOL_MAX_SIZE"])
-        parallel_threshold = int(os.environ["ATP_READONLY_POOL_MAX_SIZE"])
+        pool_size = _read_required_positive_int_env(_ENV_ATP_READONLY_POOL_MAX_SIZE)
+        parallel_threshold = pool_size
         use_parallel = pool_size > 1 and parallel_threshold > 0
 
         def fetch_page(offset: int) -> List[Union[ModelType, Dict[str, Any]]]:
@@ -628,6 +651,37 @@ class Query(Generic[ModelType]):
                 )
 
             return mapped
+
+        def fetch_page_with_lookahead(offset: int) -> Tuple[List[Union[ModelType, Dict[str, Any]]], bool]:
+            """Fetch a page with one-row lookahead to avoid terminal out-of-range SKIP queries."""
+            q = self.offset(offset).limit(ps + 1)
+            t0 = time.perf_counter()
+            raw = q._execute()
+            t1 = time.perf_counter()
+            mapped = q._map_results(raw)
+            t2 = time.perf_counter()
+
+            has_more = len(mapped) > ps
+            page_data = mapped[:ps] if has_more else mapped
+
+            if getattr(self._session, "_debug_timing", False) or ((t2 - t0) >= 0.25):
+                raw_rows = len(raw) if isinstance(raw, list) else None
+                mapped_rows = len(page_data) if isinstance(page_data, list) else None
+                logger.info(
+                    "kuzu.query.page.lookahead rel=%s offset=%d page_size=%d raw_rows=%s mapped_rows=%s has_more=%s exec_seconds=%.6f map_seconds=%.6f total_seconds=%.6f pairs_subset=%s",
+                    model_name,
+                    int(offset),
+                    int(ps),
+                    raw_rows,
+                    mapped_rows,
+                    has_more,
+                    (t1 - t0),
+                    (t2 - t1),
+                    (t2 - t0),
+                    pairs_subset_meta,
+                )
+
+            return page_data, has_more
 
         def fetch_pages_parallel(offsets: List[int]) -> List[List[Union[ModelType, Dict[str, Any]]]]:
             """Fetch multiple pages in parallel using Rust rayon via ATP pipeline."""
@@ -672,63 +726,81 @@ class Query(Generic[ModelType]):
                 mapped_pages.append(mapped)
             return mapped_pages
 
-        # Fetch first page to determine if more pages exist
-        offset = 0
-        page = fetch_page(offset)
-        offset += ps
+        # If parallel execution is enabled, preserve existing count-bounded parallel strategy.
+        if use_parallel:
+            offset = 0
+            page = fetch_page(offset)
+            offset += ps
 
-        # If parallel execution is enabled and first page is full, try parallel fetching
-        if use_parallel and len(page) == ps:
+            # If first page is not full, result set fits in one page.
+            if len(page) < ps:
+                for item in page:
+                    yield item
+                return
+
+            total_rows = self.count_results()
+            remaining_rows = max(total_rows - ps, 0)
+
             # Yield first page items
             for item in page:
                 yield item
-            
+
+            if remaining_rows == 0:
+                return
+
             # Parallel batch fetching
             batch_size = min(pool_size, parallel_threshold)
-            while True:
-                # Build batch of offsets
-                batch_offsets = [offset + i * ps for i in range(batch_size)]
-                
+            while remaining_rows > 0:
+                pages_in_batch = min(batch_size, (remaining_rows + ps - 1) // ps)
+                batch_offsets = [offset + i * ps for i in range(pages_in_batch)]
+
                 # Fetch batch in parallel
                 batch_pages = fetch_pages_parallel(batch_offsets)
-                
-                # Yield results and track if we got a partial page
-                last_page_full = True
-                for page_idx, page_data in enumerate(batch_pages):
+
+                # Yield results in requested page order
+                for page_data in batch_pages:
                     for item in page_data:
                         yield item
-                    if len(page_data) < ps:
-                        last_page_full = False
-                        break
-                
-                if not last_page_full:
-                    break
-                
-                offset += batch_size * ps
-        elif pf > 0:
+
+                advanced_rows = pages_in_batch * ps
+                offset += advanced_rows
+                remaining_rows = max(remaining_rows - advanced_rows, 0)
+
+            return
+
+        # Sequential modes: use +1 lookahead to avoid issuing a terminal out-of-range page.
+        offset = 0
+        page, has_more = fetch_page_with_lookahead(offset)
+        offset += ps
+
+        if pf > 0:
             # Sequential with prefetch (original behavior)
             with ThreadPoolExecutor(max_workers=1) as executor:
-                next_future = executor.submit(fetch_page, offset) if len(page) == ps else None
+                next_future = executor.submit(fetch_page_with_lookahead, offset) if has_more else None
                 while True:
                     for item in page:
                         yield item
-                    if len(page) < ps:
+                    if not has_more:
                         break
-                    next_page = next_future.result() if next_future is not None else fetch_page(offset)
+                    if next_future is not None:
+                        next_page, next_has_more = next_future.result()
+                    else:
+                        next_page, next_has_more = fetch_page_with_lookahead(offset)
                     offset += ps
-                    if len(next_page) == ps and pf > 0:
-                        next_future = executor.submit(fetch_page, offset)
+                    if next_has_more and pf > 0:
+                        next_future = executor.submit(fetch_page_with_lookahead, offset)
                     else:
                         next_future = None
                     page = next_page
+                    has_more = next_has_more
         else:
             # Pure sequential (no prefetch)
             while True:
                 for item in page:
                     yield item
-                if len(page) < ps:
+                if not has_more:
                     break
-                page = fetch_page(offset)
+                page, has_more = fetch_page_with_lookahead(offset)
                 offset += ps
 
     def all(self, as_iterator: bool = False, page_size: Optional[int] = None, prefetch_pages: int = 1) -> Union[List[ModelType], List[Dict[str, Any]], Iterator[Union[ModelType, Dict[str, Any]]]]:
@@ -784,7 +856,9 @@ class Query(Generic[ModelType]):
 
     def count_results(self) -> int:
         """Count the number of results."""
-        count_query = self.count()
+        # ORDER BY columns are not valid after scalar COUNT aggregation in Kuzu.
+        # Keep all filters/joins while stripping ORDER BY for the COUNT query only.
+        count_query = self._copy_with_state(order_by=[]).count()
         result = count_query._execute()
         if type(result) is not list:
             logger.error("Count query returned non-list result type: %r", type(result))
