@@ -72,7 +72,7 @@ def _acquire_handler(db_path: str) -> ATPHandler:
         cfg: Dict[str, Any] = {"db_path": db_path}
         handler: ATPHandler = ATPHandler(DatabaseType.KUZU, cfg)
         _ = handler.get_capability_report()
-        logger.info("kuzualchemy.atp.handler.acquire.ephemeral db_path=%s", db_path)
+        logger.debug("kuzualchemy.atp.handler.acquire.ephemeral db_path=%s", db_path)
         return handler
 
     key = str(Path(db_path).resolve())
@@ -80,7 +80,7 @@ def _acquire_handler(db_path: str) -> ATPHandler:
         handler = _HANDLERS.get(key)
         if handler is not None:
             _HANDLER_REFCOUNTS[key] = _HANDLER_REFCOUNTS.get(key, 0) + 1
-            logger.info(
+            logger.debug(
                 "kuzualchemy.atp.handler.acquire.reuse db_path=%s refcount=%d",
                 key,
                 _HANDLER_REFCOUNTS[key],
@@ -94,7 +94,7 @@ def _acquire_handler(db_path: str) -> ATPHandler:
         _ = handler.get_capability_report()
         _HANDLERS[key] = handler
         _HANDLER_REFCOUNTS[key] = _HANDLER_REFCOUNTS.get(key, 0) + 1
-        logger.info("kuzualchemy.atp.handler.acquire.create db_path=%s refcount=%d", key, _HANDLER_REFCOUNTS[key])
+        logger.debug("kuzualchemy.atp.handler.acquire.create db_path=%s refcount=%d", key, _HANDLER_REFCOUNTS[key])
         return handler
 
 
@@ -126,7 +126,7 @@ def _release_handler(db_path: str, timeout: Optional[float]) -> None:
             do_flush = True
             new_refcount = _HANDLER_REFCOUNTS[key]
 
-    logger.info(
+    logger.debug(
         "kuzualchemy.atp.handler.release db_path=%s refcount=%s shutdown=%s",
         key,
         new_refcount,
@@ -153,7 +153,7 @@ def _release_handler(db_path: str, timeout: Optional[float]) -> None:
             shutdown_err = exc
             logger.error("kuzualchemy.atp.handler.release.shutdown_failed db_path=%s error=%s", key, exc)
         t2 = time.perf_counter()
-        logger.info(
+        logger.debug(
             "kuzualchemy.atp.handler.release.done db_path=%s flush_seconds=%.6f shutdown_seconds=%.6f total_seconds=%.6f",
             key,
             t1 - t0,
@@ -161,7 +161,7 @@ def _release_handler(db_path: str, timeout: Optional[float]) -> None:
             t2 - t0,
         )
     else:
-        logger.info(
+        logger.debug(
             "kuzualchemy.atp.handler.release.flushed db_path=%s flush_seconds=%.6f",
             key,
             t1 - t0,
