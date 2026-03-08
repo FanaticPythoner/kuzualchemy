@@ -127,15 +127,18 @@ class KuzuSession:
         self.bulk_batch_size = bulk_batch_size
         # Optional: upper bound for adaptive ramp-up in pipelined COPY
         self.bulk_batch_size_max = int(bulk_batch_size_max)
-        self._dirty = set()
-        self._new = set()
+        self._dirty: list[Any] = []
+        self._dirty_ids: set[int] = set()
+        self._new: list[Any] = []
+        self._new_ids: set[int] = set()
         self._force_gc = local_force_gc
         # Debug timing flag (read once, no runtime env lookups)
         self._debug_timing = str(os.getenv("KUZU_TIMING", "0")) in ("1", "true", "TRUE", "on", "ON")
         # Allow disabling the pipelined bulk-insert marshalling via env for accurate single-thread profiling
         self._disable_bulk_pipeline = str(os.getenv("KUZU_DISABLE_BULK_PIPELINE", "0")).lower() in ("1", "true", "on")
 
-        self._deleted = set()
+        self._deleted: list[Any] = []
+        self._deleted_ids: set[int] = set()
         self._flushing = False
 
         # || S.1: Use IDENTITY_MAP_INITIAL_SIZE for better memory allocation
@@ -562,7 +565,10 @@ class KuzuSession:
         Args:
             instance: Model instance to add
         """
-        self._new.add(instance)
+        inst_id = id(instance)
+        if inst_id not in self._new_ids:
+            self._new.append(instance)
+            self._new_ids.add(inst_id)
 
         # || Only add nodes to identity map, relationships don't have primary keys
         model_class = type(instance)
@@ -654,6 +660,19 @@ class KuzuSession:
         fixed_rel_routing: Optional[Dict[str, str]] = None
         if is_rel:
             fixed_rel_routing = self._try_get_fixed_relationship_routing(model_class)
+
+        # Deterministic storage order: sort instances by PK before UNWIND.
+        # Without this, thread scheduling under parallel execution produces
+        # different storage order, causing downstream read queries (which
+        # return in storage order) to diverge non-deterministically.
+        if not is_rel and pk_fields:
+            pk0 = pk_fields[0]
+            instances = sorted(instances, key=lambda inst: str(getattr(inst, pk0, '') or ''))
+        elif is_rel:
+            instances = sorted(instances, key=lambda inst: (
+                str(getattr(getattr(inst, 'from_node', None), 'id', '') or ''),
+                str(getattr(getattr(inst, 'to_node', None), 'id', '') or ''),
+            ))
 
         n = len(instances)
         start = 0
@@ -991,12 +1010,17 @@ class KuzuSession:
         Args:
             instance: Model instance to delete
         """
-        self._deleted.add(instance)
+        inst_id = id(instance)
+        if inst_id not in self._deleted_ids:
+            self._deleted.append(instance)
+            self._deleted_ids.add(inst_id)
 
-        if instance in self._new:
-            self._new.remove(instance)
-        if instance in self._dirty:
-            self._dirty.remove(instance)
+        if inst_id in self._new_ids:
+            self._new = [x for x in self._new if id(x) != inst_id]
+            self._new_ids.discard(inst_id)
+        if inst_id in self._dirty_ids:
+            self._dirty = [x for x in self._dirty if id(x) != inst_id]
+            self._dirty_ids.discard(inst_id)
 
         if self.autocommit:
             self.commit()
@@ -1032,12 +1056,18 @@ class KuzuSession:
             # Update existing with new values
             for field_name, field_value in instance.model_dump().items():
                 setattr(existing, field_name, field_value)
-            self._dirty.add(existing)
+            exist_id = id(existing)
+            if exist_id not in self._dirty_ids:
+                self._dirty.append(existing)
+                self._dirty_ids.add(exist_id)
             return existing
         else:
             # Add new instance to _new, not _dirty. Non-existent instances should be treated as new insertions
             self._identity_map[identity_key] = instance
-            self._new.add(instance)
+            inst_id = id(instance)
+            if inst_id not in self._new_ids:
+                self._new.append(instance)
+                self._new_ids.add(inst_id)
             return instance
 
     def flush(self) -> None:
@@ -1086,8 +1116,11 @@ class KuzuSession:
 
             # Clear pending sets
             self._new.clear()
+            self._new_ids.clear()
             self._dirty.clear()
+            self._dirty_ids.clear()
             self._deleted.clear()
+            self._deleted_ids.clear()
         finally:
             self._flushing = False
 
@@ -1106,8 +1139,11 @@ class KuzuSession:
         """
         # Clear all pending changes
         self._new.clear()
+        self._new_ids.clear()
         self._dirty.clear()
+        self._dirty_ids.clear()
         self._deleted.clear()
+        self._deleted_ids.clear()
 
         # Clear identity map
         self._identity_map.clear()
@@ -1171,23 +1207,32 @@ class KuzuSession:
         Note: Kuzu doesn't support savepoints, so this is a best-effort simulation.
         """
         # Save current state
-        saved_new = set(self._new)
-        saved_dirty = set(self._dirty)
-        saved_deleted = set(self._deleted)
+        saved_new = list(self._new)
+        saved_new_ids = set(self._new_ids)
+        saved_dirty = list(self._dirty)
+        saved_dirty_ids = set(self._dirty_ids)
+        saved_deleted = list(self._deleted)
+        saved_deleted_ids = set(self._deleted_ids)
 
         try:
             yield self
         except (RuntimeError, ValueError, TypeError) as e:
             # Restore previous state
             self._new = saved_new
+            self._new_ids = saved_new_ids
             self._dirty = saved_dirty
+            self._dirty_ids = saved_dirty_ids
             self._deleted = saved_deleted
+            self._deleted_ids = saved_deleted_ids
             raise e
         except Exception as e:
             # Restore previous state
             self._new = saved_new
+            self._new_ids = saved_new_ids
             self._dirty = saved_dirty
+            self._dirty_ids = saved_dirty_ids
             self._deleted = saved_deleted
+            self._deleted_ids = saved_deleted_ids
             raise RuntimeError(f"Unexpected error in nested session: {type(e).__name__}: {e}") from e
 
     def _get_primary_key(self, instance: Any) -> Optional[Any]:

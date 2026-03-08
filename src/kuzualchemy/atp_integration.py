@@ -245,10 +245,13 @@ class ATPIntegration:
         from atp_pipeline import execute_parallel_queries, ensure_kuzu_initialized
         
         try:
-            # Ensure database is initialized only once per db_path
+            # Ensure database is initialized only once per db_path.
+            # Protected by _HANDLER_LOCK for thread-safe check-then-act.
             if self._db_path not in _KUZU_INITIALIZED:
-                ensure_kuzu_initialized(self._db_path)
-                _KUZU_INITIALIZED.add(self._db_path)
+                with _HANDLER_LOCK:
+                    if self._db_path not in _KUZU_INITIALIZED:
+                        ensure_kuzu_initialized(self._db_path)
+                        _KUZU_INITIALIZED.add(self._db_path)
             results = execute_parallel_queries(self._db_path, [(query, params or {})])
             if results and len(results) > 0:
                 return results[0]

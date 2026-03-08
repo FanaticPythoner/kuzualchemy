@@ -338,11 +338,11 @@ class CypherQueryBuilder:
         where_already_applied = False
 
         endpoint_aliases: List[Tuple[str, str]] = []
-        # Optimization: when ALL pairs (or nearly all) are requested, skip LABEL() predicates entirely.
-        # This avoids generating massive WHERE clauses with N OR conditions that cause Kuzu to hang.
-        # Threshold: if requesting >= 90% of pairs, treat as "all pairs" since predicate overhead is worse.
-        pairs_ratio = len(pairs) / len(rel_pairs) if rel_pairs else 1.0
-        all_pairs_requested = (subset is None) or (pairs_ratio >= 0.90)
+        # Skip LABEL() predicates only when genuinely ALL pairs are requested.
+        # Any explicit subset (even 99%) MUST generate predicates for strict semantics.
+        # KuzuAlchemy uses negative predicates (NOT) for high-ratio subsets to minimize
+        # the WHERE clause size, so large subsets are efficient without widening.
+        all_pairs_requested = (subset is None) or (len(pairs) == len(rel_pairs))
         
         if len(pairs) > 1:
             # Multi-pair relationships must enforce a *global* SKIP/LIMIT cap.
