@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pytest
 from typing import Optional
-
 from kuzualchemy.kuzu_orm import (
     KuzuBaseModel,
     kuzu_node,
@@ -23,6 +22,7 @@ from kuzualchemy.kuzu_orm import (
     RelationshipMultiplicity,
     KuzuDataType,
 )
+from kuzualchemy.kuzu_query_builder import CypherQueryBuilder, QueryState
 
 
 # @@ STEP 1: Define test node models
@@ -64,6 +64,24 @@ class Device(KuzuBaseModel):
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING, not_null=True)
     device_type: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+
+
+@kuzu_node(name="WithStatement")
+class With(KuzuBaseModel):
+    """With node for canonical string-label resolution tests."""
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+
+
+@kuzu_node(name="Match")
+class Match(KuzuBaseModel):
+    """Match node for reserved-label query builder tests."""
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+
+
+@kuzu_node(name="CaseClause")
+class Case(KuzuBaseModel):
+    """Case node for canonical string-label resolution tests."""
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
 
 
 # @@ STEP 2: Test single-pair relationships
@@ -232,7 +250,6 @@ class TestErrorCases:
             pass
 
         # Test that we can create the relationship pair and get the name
-        from kuzualchemy.kuzu_orm import RelationshipPair
         pair = RelationshipPair(InvalidNode, User)
 
         # This should work because InvalidNode has __name__ attribute
@@ -278,6 +295,13 @@ class TestRelationshipPair:
         assert pair.get_from_name() == "User"
         assert pair.get_to_name() == "Location"
         assert pair.to_ddl_component() == "FROM User TO Location"
+
+    def test_pair_with_string_class_aliases_uses_canonical_node_labels(self):
+        """String aliases should resolve through the registered node class labels."""
+        pair = RelationshipPair("With", "Case")
+        assert pair.get_from_name() == "WithStatement"
+        assert pair.get_to_name() == "CaseClause"
+        assert pair.to_ddl_component() == "FROM WithStatement TO CaseClause"
     
     def test_pair_repr(self):
         """Test string representation of RelationshipPair."""
@@ -347,6 +371,21 @@ class TestDDLGeneration:
         assert parts[1] == "prop1 STRING"
         assert parts[2] == "prop2 INT32"
         assert parts[3] == "MANY_ONE"
+
+
+class TestRelationshipQueryBuilderLabels:
+    def test_single_pair_relationship_query_escapes_reserved_and_canonicalized_labels(self):
+        @kuzu_relationship(
+            name="FlowsTo",
+            pairs=[("Match", "Case")]
+        )
+        class FlowsTo(KuzuBaseModel):
+            pass
+
+        cypher, params = CypherQueryBuilder(QueryState(model_class=FlowsTo, pairs_subset=[0])).build()
+
+        assert cypher == "MATCH (from_node:`Match`)-[n:FlowsTo]->(to_node:`CaseClause`)\nRETURN n, from_node AS from_node, to_node AS to_node"
+        assert params == {}
 
 
 if __name__ == "__main__":

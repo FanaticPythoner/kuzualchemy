@@ -10,7 +10,7 @@ FK constraints, column-level INDEX tags, and correct relationship multiplicity p
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime
 import decimal
 import logging
@@ -917,11 +917,24 @@ class RelationshipPair:
     """
     from_node: Union[Type[Any], str]
     to_node: Union[Type[Any], str]
+    _from_name_cache: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    _to_name_cache: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    @staticmethod
+    def _resolve_string_node_name(node_name: str) -> str:
+        resolved_node = get_node_by_name(node_name)
+        if isinstance(resolved_node, type):
+            resolved_label = getattr(resolved_node, "__kuzu_node_name__", None)
+            if isinstance(resolved_label, str) and resolved_label:
+                return resolved_label
+        return node_name
 
     def get_from_name(self) -> str:
         """Get the name of the FROM node."""
         if isinstance(self.from_node, str):
-            return self.from_node
+            if self._from_name_cache is None:
+                self._from_name_cache = self._resolve_string_node_name(self.from_node)
+            return self._from_name_cache
 
         # Strict validation - sets must be expanded before reaching here
         if isinstance(self.from_node, (set, frozenset)):
@@ -2701,11 +2714,10 @@ class KuzuRelationshipBase(KuzuBaseModel):
             ValueError: If node reference cannot be resolved
         """
         if isinstance(node_ref, str):
-            # @@ STEP: Resolve string reference using registry
-            if node_ref in _kuzu_registry.nodes:
-                return _kuzu_registry.nodes[node_ref]
-            else:
-                raise ValueError(f"Node type '{node_ref}' not found in registry")
+            resolved_node = get_node_by_name(node_ref)
+            if isinstance(resolved_node, type):
+                return resolved_node
+            raise ValueError(f"Node type '{node_ref}' not found in registry")
         elif isinstance(node_ref, type):
             return node_ref
         else:
@@ -3012,10 +3024,6 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
         if full_def != " ".join(parts):
             comment_lines.append(full_def)
 
-    # @@ STEP: Merge Step 3 warnings into comment_lines for visibility in emitted DDL
-    if step3_comments:
-        comment_lines.extend(step3_comments)
-
     # @@ STEP 5: Build DDL items list
     items: List[str] = from_to_components  # Start with FROM-TO pairs
     if prop_cols_min:
@@ -3207,17 +3215,27 @@ def get_node_by_name(name: str) -> Optional[Type[Any]]:
     if node is not None:
         return node
 
-    # Lazy re-registration for classes that were decorated before a registry clear.
-    # Scan loaded modules for classes marked as Kuzu nodes with matching name.
+    placeholder_name = f"_{name}Placeholder"
+
+    for candidate in _kuzu_registry.nodes.values():
+        candidate_name = getattr(candidate, "__name__", None)
+        if candidate_name == name or candidate_name == placeholder_name:
+            return candidate
+
     for module in list(sys.modules.values()):
-        module_dict = getattr(module, "__dict__", None)
-        if not isinstance(module_dict, dict):
+        mod_dict = getattr(module, "__dict__", None)
+        if not isinstance(mod_dict, dict):
             continue
-        for obj in module_dict.values():
+        for obj in mod_dict.values():
             if isinstance(obj, type) and getattr(obj, "__is_kuzu_node__", False):
                 node_name = getattr(obj, "__kuzu_node_name__", None)
+                class_name = getattr(obj, "__name__", None)
                 if node_name == name:
                     _kuzu_registry.register_node(name, obj)
+                    return obj
+                if class_name == name or class_name == placeholder_name:
+                    if isinstance(node_name, str) and node_name:
+                        _kuzu_registry.register_node(node_name, obj)
                     return obj
     return None
 

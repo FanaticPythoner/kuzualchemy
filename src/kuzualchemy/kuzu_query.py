@@ -155,6 +155,8 @@ def _get_rel_label_lookups(
         if cached is not None:
             return cached
 
+        from .kuzu_orm import get_node_by_name
+
         # Build label -> class lookup dicts
         from_label_to_cls: Dict[str, Type[Any]] = {}
         for cls in from_candidates:
@@ -168,10 +170,28 @@ def _get_rel_label_lookups(
             lbl = d['__kuzu_node_name__'] if '__kuzu_node_name__' in d else cls.__name__
             to_label_to_cls[lbl] = cls
 
+        rel_pairs = getattr(rel_cls, '__kuzu_relationship_pairs__', [])
+        for pair in rel_pairs:
+            get_from_name = getattr(pair, 'get_from_name', None)
+            if callable(get_from_name):
+                from_label = get_from_name()
+                if isinstance(from_label, str) and from_label and from_label not in from_label_to_cls:
+                    resolved_from = get_node_by_name(from_label)
+                    if isinstance(resolved_from, type):
+                        from_label_to_cls[from_label] = resolved_from
+
+            get_to_name = getattr(pair, 'get_to_name', None)
+            if callable(get_to_name):
+                to_label = get_to_name()
+                if isinstance(to_label, str) and to_label and to_label not in to_label_to_cls:
+                    resolved_to = get_node_by_name(to_label)
+                    if isinstance(resolved_to, type):
+                        to_label_to_cls[to_label] = resolved_to
+
         # Pre-warm node class metadata for all candidates
-        for cls in from_candidates:
+        for cls in from_label_to_cls.values():
             _get_node_class_meta(cls)
-        for cls in to_candidates:
+        for cls in to_label_to_cls.values():
             _get_node_class_meta(cls)
 
         _REL_LABEL_LOOKUP_CACHE[rel_cls] = (from_label_to_cls, to_label_to_cls)

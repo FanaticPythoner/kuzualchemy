@@ -16,6 +16,13 @@ from .constants import DDLConstants, ValidationMessageConstants, JoinPatternCons
 
 logger = logging.getLogger(__name__)
 
+def _escape_cypher_identifier(identifier: str) -> str:
+    escaped = identifier.replace("`", "``")
+    return f"`{escaped}`"
+
+def _format_labeled_node(alias: str, label: str) -> str:
+    return f"({alias}:{_escape_cypher_identifier(label)})"
+
 @dataclass
 class JoinClause:
     """Represents a join operation in a query."""
@@ -86,7 +93,7 @@ class JoinClause:
                     ValidationMessageConstants.MISSING_KUZU_NODE_NAME.format(self.target_model.__name__)
                 )
             target_label = self.target_model.__kuzu_node_name__
-            pattern = pattern.replace(f"({self.target_alias})", f"({self.target_alias}:{target_label})")
+            pattern = pattern.replace(f"({self.target_alias})", _format_labeled_node(self.target_alias, target_label))
         
         if self.join_type == JoinType.OPTIONAL:
             pattern = f"{JoinPatternConstants.OPTIONAL_MATCH_PREFIX}{pattern}"
@@ -173,7 +180,7 @@ class CypherQueryBuilder:
         self.alias_map[self.state.alias] = self.state.alias
         # Map model class name to alias for QueryField(model=...) resolution
         self.alias_map[self.state.model_class.__name__] = self.state.alias
-        match_pattern = f"({self.state.alias}:{node_name})"
+        match_pattern = _format_labeled_node(self.state.alias, node_name)
 
         if self.state.with_clauses:
             clauses.extend(self.state.with_clauses)
@@ -409,15 +416,15 @@ class CypherQueryBuilder:
 
                 if direction:
                     if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
-                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
                     elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
-                        pattern = f"({from_alias}:{from_name})<-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                        pattern = f"{_format_labeled_node(from_alias, from_name)}<-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
                     elif direction == RelationshipDirection.BOTH:
-                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]-({to_alias}:{to_name})"
+                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
                     else:
-                        pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
                 else:
-                    pattern = f"({from_alias}:{from_name})-[{rel_alias}:{rel_name}]->({to_alias}:{to_name})"
+                    pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
 
                 match_patterns.append(pattern)
 
