@@ -228,11 +228,11 @@ class ATPIntegration:
         # Write clause keywords that indicate a non-readonly query
         write_keywords = (
             'CREATE', 'DELETE', 'DETACH', 'SET', 'REMOVE', 'MERGE',
-            'DROP', 'ALTER', 'COPY', 'CALL', 'BEGIN', 'COMMIT', 'ROLLBACK'
+            'DROP', 'ALTER', 'COPY', 'CALL', 'BEGIN', 'COMMIT', 'ROLLBACK',
+            'CHECKPOINT'
         )
         for kw in write_keywords:
-            # Check for keyword as whole word (not substring)
-            if f' {kw} ' in f' {q} ' or q.startswith(f'{kw} ') or f' {kw}(' in f' {q} ':
+            if re.search(rf"(^|\s){kw}(\s|\(|;|$)", q):
                 return False
         return True
 
