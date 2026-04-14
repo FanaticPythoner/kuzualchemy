@@ -10,7 +10,7 @@ FK constraints, column-level INDEX tags, and correct relationship multiplicity p
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import datetime
 import decimal
 import logging
@@ -31,7 +31,7 @@ from typing import (
 )
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from pydantic.fields import FieldInfo
+from pydantic.fields import FieldInfo, PydanticUndefined
 
 from .constants import (
     CascadeAction,
@@ -52,6 +52,8 @@ from .constants import (
     RelationshipNodeTypeQueryConstants,
     ForeignKeyValidationConstants,
 )
+from .enum_normalization import clear_all_enum_conversion_plans, clear_model_enum_conversion_plan, convert_input_enums_for_model
+from .uuid_normalization import clear_all_uuid_normalization_plans, clear_model_uuid_normalization_plan
 
 if TYPE_CHECKING:
     from .kuzu_query import Query
@@ -65,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 ModelType = TypeVar("ModelType", bound="KuzuBaseModel")
+_KUZU_FIELD_DIRECTIVE_UNSET = object()
 
 
 # -----------------------------------------------------------------------------
@@ -903,6 +906,286 @@ def foreign_key(
     )
 
 
+@dataclass(frozen=True)
+class KuzuFieldDefinitionDirective:
+    kind: str
+    field_name: str
+    annotation: Any
+    field_definition: FieldInfo
+
+
+@dataclass(frozen=True)
+class KuzuFieldEditDirective:
+    field_name: str
+    annotation: Any = _KUZU_FIELD_DIRECTIVE_UNSET
+    field_updates: Dict[str, Any] = field(default_factory=dict)
+    metadata_updates: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class KuzuFieldRemovalDirective:
+    field_name: str
+
+
+KuzuFieldDirective = Union[
+    KuzuFieldDefinitionDirective,
+    KuzuFieldEditDirective,
+    KuzuFieldRemovalDirective,
+]
+
+
+def kuzu_field_add(field_name: str, annotation: Any, field_definition: Any) -> KuzuFieldDefinitionDirective:
+    if not isinstance(field_definition, FieldInfo):
+        raise TypeError(f"kuzu_field_add() requires a FieldInfo for '{field_name}', got {type(field_definition).__name__}")
+    return KuzuFieldDefinitionDirective(
+        kind="add",
+        field_name=field_name,
+        annotation=annotation,
+        field_definition=_clone_field_info(field_definition),
+    )
+
+
+def kuzu_field_override(field_name: str, annotation: Any, field_definition: Any) -> KuzuFieldDefinitionDirective:
+    if not isinstance(field_definition, FieldInfo):
+        raise TypeError(
+            f"kuzu_field_override() requires a FieldInfo for '{field_name}', got {type(field_definition).__name__}"
+        )
+    return KuzuFieldDefinitionDirective(
+        kind="override",
+        field_name=field_name,
+        annotation=annotation,
+        field_definition=_clone_field_info(field_definition),
+    )
+
+
+def kuzu_field_edit(field_name: str, annotation: Any = _KUZU_FIELD_DIRECTIVE_UNSET, **kwargs: Any) -> KuzuFieldEditDirective:
+    field_keys = {"default", "default_factory", "alias", "title", "description", "json_schema_extra"}
+    metadata_keys = {
+        "kuzu_type",
+        "primary_key",
+        "foreign_key",
+        "unique",
+        "not_null",
+        "index",
+        "check_constraint",
+        "auto_increment",
+        "element_type",
+        "is_from_ref",
+        "is_to_ref",
+    }
+    field_updates: Dict[str, Any] = {}
+    metadata_updates: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key in field_keys:
+            field_updates[key] = value
+            continue
+        if key in metadata_keys:
+            metadata_updates[key] = value
+            continue
+        raise TypeError(f"Unsupported kuzu_field_edit() argument '{key}'")
+    return KuzuFieldEditDirective(
+        field_name=field_name,
+        annotation=annotation,
+        field_updates=field_updates,
+        metadata_updates=metadata_updates,
+    )
+
+
+def kuzu_field_remove(field_name: str) -> KuzuFieldRemovalDirective:
+    return KuzuFieldRemovalDirective(field_name=field_name)
+
+
+def _iter_kuzu_field_directives(raw_directives: Any) -> List[KuzuFieldDirective]:
+    if raw_directives is None:
+        return []
+    if isinstance(
+        raw_directives,
+        (KuzuFieldDefinitionDirective, KuzuFieldEditDirective, KuzuFieldRemovalDirective),
+    ):
+        return [raw_directives]
+    if not isinstance(raw_directives, (list, tuple, set, frozenset)):
+        raise TypeError(
+            f"Kuzu field directives must be a directive or collection of directives, got {type(raw_directives).__name__}"
+        )
+    directives: List[KuzuFieldDirective] = []
+    for directive in raw_directives:
+        if not isinstance(
+            directive,
+            (KuzuFieldDefinitionDirective, KuzuFieldEditDirective, KuzuFieldRemovalDirective),
+        ):
+            raise TypeError(f"Unsupported Kuzu field directive type: {type(directive).__name__}")
+        directives.append(directive)
+    return directives
+
+
+def _clear_kuzu_model_field_caches(cls: Type[Any]) -> None:
+    for attr_name in (
+        "__kuzu_cached_all_meta__",
+        "__kuzu_cached_pk_fields__",
+        "__kuzu_cached_fk_fields__",
+        "__kuzu_cached_ai_fields__",
+        "__kuzu_cached_ai_meta__",
+        "__kuzu_cached_has_ai_pk__",
+    ):
+        if attr_name in cls.__dict__:
+            delattr(cls, attr_name)
+
+
+def _clone_field_default(default_value: Any) -> Any:
+    if isinstance(default_value, dict):
+        return dict(default_value)
+    if isinstance(default_value, list):
+        return list(default_value)
+    if isinstance(default_value, set):
+        return set(default_value)
+    if isinstance(default_value, tuple):
+        return tuple(default_value)
+    if isinstance(default_value, frozenset):
+        return frozenset(default_value)
+    if isinstance(default_value, ArrayTypeSpecification):
+        return replace(default_value)
+    if isinstance(default_value, ForeignKeyReference):
+        return replace(default_value)
+    return default_value
+
+
+def _clone_foreign_key_reference(reference: Optional[ForeignKeyReference]) -> Optional[ForeignKeyReference]:
+    if reference is None:
+        return None
+    return replace(reference)
+
+
+def _clone_kuzu_type(
+    kuzu_type: Union[KuzuDataType, ArrayTypeSpecification],
+) -> Union[KuzuDataType, ArrayTypeSpecification]:
+    if isinstance(kuzu_type, ArrayTypeSpecification):
+        return replace(kuzu_type)
+    return kuzu_type
+
+
+def _clone_json_schema_extra(json_schema_extra: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(json_schema_extra, dict):
+        return None
+    return dict(json_schema_extra)
+
+
+def _clone_field_info(field_info: FieldInfo) -> FieldInfo:
+    cloned = field_info._copy()
+    if cloned.default is not PydanticUndefined:
+        cloned.default = _clone_field_default(cloned.default)
+    cloned.json_schema_extra = _clone_json_schema_extra(cloned.json_schema_extra)
+    return cloned
+
+
+def _base_kuzu_field_default(field_info: FieldInfo) -> Any:
+    if field_info.default is PydanticUndefined:
+        return ...
+    return _clone_field_default(field_info.default)
+
+
+def _base_kuzu_field_json_schema_extra(field_info: FieldInfo) -> Optional[Dict[str, Any]]:
+    json_schema_extra = _clone_json_schema_extra(field_info.json_schema_extra)
+    if json_schema_extra is None:
+        return None
+    json_schema_extra.pop(ModelMetadataConstants.KUZU_FIELD_METADATA, None)
+    return json_schema_extra
+
+
+def _build_edited_kuzu_field(field_name: str, field_info: FieldInfo, directive: KuzuFieldEditDirective) -> Tuple[Any, FieldInfo]:
+    metadata = _kuzu_registry.get_field_metadata(field_info)
+    if metadata is None:
+        raise AttributeError(f"Field '{field_name}' does not define Kuzu metadata")
+    element_type = directive.metadata_updates.get("element_type", _KUZU_FIELD_DIRECTIVE_UNSET)
+    if element_type is _KUZU_FIELD_DIRECTIVE_UNSET and isinstance(metadata.kuzu_type, ArrayTypeSpecification):
+        element_type = _clone_field_default(metadata.kuzu_type.element_type)
+    if element_type is _KUZU_FIELD_DIRECTIVE_UNSET:
+        element_type = None
+    kuzu_type = directive.metadata_updates.get("kuzu_type", _KUZU_FIELD_DIRECTIVE_UNSET)
+    if kuzu_type is _KUZU_FIELD_DIRECTIVE_UNSET:
+        kuzu_type = _clone_kuzu_type(metadata.kuzu_type)
+    else:
+        kuzu_type = _clone_kuzu_type(kuzu_type)
+    foreign_key_reference = directive.metadata_updates.get("foreign_key", _KUZU_FIELD_DIRECTIVE_UNSET)
+    if foreign_key_reference is _KUZU_FIELD_DIRECTIVE_UNSET:
+        foreign_key_reference = _clone_foreign_key_reference(metadata.foreign_key)
+    else:
+        foreign_key_reference = _clone_foreign_key_reference(foreign_key_reference)
+    updated_field = kuzu_field(
+        default=directive.field_updates.get("default", _base_kuzu_field_default(field_info)),
+        kuzu_type=kuzu_type,
+        primary_key=directive.metadata_updates.get("primary_key", metadata.primary_key),
+        foreign_key=foreign_key_reference,
+        unique=directive.metadata_updates.get("unique", metadata.unique),
+        not_null=directive.metadata_updates.get("not_null", metadata.not_null),
+        index=directive.metadata_updates.get("index", metadata.index),
+        check_constraint=directive.metadata_updates.get("check_constraint", metadata.check_constraint),
+        default_factory=directive.field_updates.get("default_factory", field_info.default_factory),
+        auto_increment=directive.metadata_updates.get("auto_increment", metadata.auto_increment),
+        element_type=element_type,
+        alias=directive.field_updates.get("alias", field_info.alias),
+        title=directive.field_updates.get("title", field_info.title),
+        description=directive.field_updates.get("description", field_info.description),
+        json_schema_extra=directive.field_updates.get("json_schema_extra", _base_kuzu_field_json_schema_extra(field_info)),
+        is_from_ref=directive.metadata_updates.get("is_from_ref", metadata.is_from_ref),
+        is_to_ref=directive.metadata_updates.get("is_to_ref", metadata.is_to_ref),
+    )
+    annotation = field_info.annotation if directive.annotation is _KUZU_FIELD_DIRECTIVE_UNSET else directive.annotation
+    updated_field.annotation = annotation
+    return annotation, updated_field
+
+
+def _apply_kuzu_field_directives(cls: Type[T], decorator_directives: Any) -> Type[T]:
+    directives = _iter_kuzu_field_directives(cls.__dict__.get("__kuzu_field_directives__"))
+    directives.extend(_iter_kuzu_field_directives(decorator_directives))
+    if not directives:
+        return cls
+    if not isinstance(getattr(cls, "model_fields", None), dict) or not isinstance(getattr(cls, "__pydantic_fields__", None), dict):
+        raise TypeError(f"Kuzu field directives can only be applied to Pydantic model classes, got {cls.__name__}")
+    cls.__annotations__ = dict(getattr(cls, "__annotations__", {}))
+    for directive in directives:
+        if isinstance(directive, KuzuFieldRemovalDirective):
+            if directive.field_name not in cls.model_fields:
+                raise AttributeError(f"Field '{directive.field_name}' not found in {cls.__name__}")
+            cls.model_fields.pop(directive.field_name, None)
+            cls.__pydantic_fields__.pop(directive.field_name, None)
+            cls.__annotations__.pop(directive.field_name, None)
+            if directive.field_name in cls.__dict__:
+                delattr(cls, directive.field_name)
+            continue
+        if isinstance(directive, KuzuFieldDefinitionDirective):
+            field_exists = directive.field_name in cls.model_fields
+            if directive.kind == "add" and field_exists:
+                raise ValueError(f"Field '{directive.field_name}' already exists in {cls.__name__}")
+            if directive.kind == "override" and not field_exists:
+                raise AttributeError(f"Field '{directive.field_name}' not found in {cls.__name__}")
+            field_definition = _clone_field_info(directive.field_definition)
+            field_definition.annotation = directive.annotation
+            cls.model_fields[directive.field_name] = field_definition
+            cls.__pydantic_fields__[directive.field_name] = field_definition
+            cls.__annotations__[directive.field_name] = directive.annotation
+            continue
+        if directive.field_name not in cls.model_fields:
+            raise AttributeError(f"Field '{directive.field_name}' not found in {cls.__name__}")
+        annotation, field_definition = _build_edited_kuzu_field(
+            directive.field_name,
+            cls.model_fields[directive.field_name],
+            directive,
+        )
+        cls.model_fields[directive.field_name] = field_definition
+        cls.__pydantic_fields__[directive.field_name] = field_definition
+        cls.__annotations__[directive.field_name] = annotation
+    _clear_kuzu_model_field_caches(cls)
+    _kuzu_registry._field_metadata_cache.clear()
+    clear_model_enum_conversion_plan(cls)
+    clear_model_uuid_normalization_plan(cls)
+    cls.model_rebuild(force=True)
+    _clear_kuzu_model_field_caches(cls)
+    _kuzu_registry._field_metadata_cache.clear()
+    clear_model_enum_conversion_plan(cls)
+    clear_model_uuid_normalization_plan(cls)
+    return cls
+
+
 # -----------------------------------------------------------------------------
 # Relationship Pair Definition
 # -----------------------------------------------------------------------------
@@ -1171,11 +1454,11 @@ class KuzuRegistry:
         success = True
 
         # @@ STEP: Resolve each foreign key reference
-        for model_name, field_name, foreign_key in self._unresolved_foreign_keys:
-            if not foreign_key.resolve_target_model(self):
-                error_msg = f"Failed to resolve foreign key {model_name}.{field_name} -> {foreign_key.target_model}"
-                if foreign_key._resolution_error:
-                    error_msg += f": {foreign_key._resolution_error}"
+        for model_name, field_name, foreign_key_ref in self._unresolved_foreign_keys:
+            if not foreign_key_ref.resolve_target_model(self):
+                error_msg = f"Failed to resolve foreign key {model_name}.{field_name} -> {foreign_key_ref.target_model}"
+                if foreign_key_ref._resolution_error:
+                    error_msg += f": {foreign_key_ref._resolution_error}"
                 self._resolution_errors.append(error_msg)
                 success = False
 
@@ -1205,11 +1488,11 @@ class KuzuRegistry:
         self._self_references.clear()
 
         # @@ STEP: Build dependency graph from resolved foreign keys
-        for model_name, field_name, foreign_key in self._unresolved_foreign_keys:
-            if not foreign_key.is_resolved():
+        for model_name, field_name, foreign_key_ref in self._unresolved_foreign_keys:
+            if not foreign_key_ref.is_resolved():
                 continue
 
-            target_name = foreign_key.get_resolved_target_name()
+            target_name = foreign_key_ref.get_resolved_target_name()
             if target_name:
                 # @@ STEP: Track dependencies
                 if model_name not in self._model_dependencies:
@@ -1552,10 +1835,12 @@ def kuzu_node(
     compound_indexes: Optional[List[CompoundIndex]] = None,
     table_constraints: Optional[List[str]] = None,
     properties: Optional[Dict[str, Any]] = None,
+    field_directives: Optional[List[KuzuFieldDirective]] = None,
 ) -> Callable[[Type[T]], Type[T]]:
     """Decorator to mark a class as a Kùzu node."""
 
     def decorator(cls: Type[T]) -> Type[T]:
+        cls = _apply_kuzu_field_directives(cls, field_directives)
         node_name = name if name is not None else cls.__name__
 
         cls.__kuzu_node_name__ = node_name # type: ignore
@@ -1587,6 +1872,8 @@ def kuzu_relationship(
 
     properties: Optional[Dict[str, Union[Any, "PropertyMetadata"]]] = None,
 
+    field_directives: Optional[List[KuzuFieldDirective]] = None,
+
     direction: RelationshipDirection = RelationshipDirection.OUTGOING,
     abstract: bool = False,
     discriminator_field: Optional[str] = None,
@@ -1617,6 +1904,7 @@ def kuzu_relationship(
     :raises ValueError: If pairs is empty or None when not abstract.
     """
     def decorator(cls: Type[T]) -> Type[T]:
+        cls = _apply_kuzu_field_directives(cls, field_directives)
         # @@ STEP 1: Build relationship pairs
         rel_name = name if name is not None else cls.__name__
         rel_pairs = []
@@ -1677,6 +1965,11 @@ class KuzuBaseModel(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True, validate_assignment=True, use_enum_values=False
     )
+
+    @model_validator(mode='before')
+    @classmethod
+    def convert_str_to_enum(cls: Type['KuzuBaseModel'], values: Any) -> Any:
+        return convert_input_enums_for_model(model_class=cls, values=values)
 
     def __hash__(self) -> int:
         """Make model instances hashable for use in sets."""
@@ -3204,6 +3497,8 @@ def clear_registry():
     # || IMPORTANT: C-extension allocators can reuse memory addresses, causing id(FieldInfo)
     # || collisions across tests/classes. We must clear the cache to avoid cross-talk.
     _kuzu_registry._field_metadata_cache.clear()
+    clear_all_enum_conversion_plans()
+    clear_all_uuid_normalization_plans()
 
     # @@ STEP 4: No forced garbage collection - let Python handle cleanup naturally
     # || S.S.3: Forced gc.collect() on complex objects with circular refs causes segfaults

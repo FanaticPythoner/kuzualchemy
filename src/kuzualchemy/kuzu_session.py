@@ -955,8 +955,14 @@ class KuzuSession:
         """Materialize auto-increment fields from ATP return rows onto instances."""
         idx_to_obj: Dict[int, Dict[str, Any]] = {}
         for rec in ret_rows:
-            idx = rec.get("__idx") or rec.get("col_0")
-            obj = rec.get(obj_key) or rec.get("col_1")
+            if "__idx" in rec:
+                idx = rec["__idx"]
+            else:
+                idx = rec.get("col_0")
+            if obj_key in rec:
+                obj = rec[obj_key]
+            else:
+                obj = rec.get("col_1")
             if isinstance(idx, int) and isinstance(obj, dict):
                 idx_to_obj[idx] = obj
         for j, inst in enumerate(instances):

@@ -16,7 +16,32 @@ Note: This software is currently in alpha development. APIs may change.
 
 from __future__ import annotations
 
+import ast
 from importlib import metadata
+from pathlib import Path
+
+
+def _resolve_package_version() -> str:
+    try:
+        return metadata.version("kuzualchemy")
+    except metadata.PackageNotFoundError as exc:
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        section_name: str | None = None
+        for raw_line in pyproject_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section_name = line[1:-1].strip()
+                continue
+            if section_name != "project" or not line.startswith("version"):
+                continue
+            _, _, version_literal = line.partition("=")
+            version = ast.literal_eval(version_literal.strip())
+            if isinstance(version, str) and version:
+                return version
+            break
+        raise RuntimeError("Unable to resolve kuzualchemy version from installed metadata or pyproject.toml") from exc
 
 # Constants
 from .constants import (
@@ -247,6 +272,10 @@ from .kuzu_orm import (
     kuzu_relationship,
     # Field functions
     kuzu_field,
+    kuzu_field_add,
+    kuzu_field_override,
+    kuzu_field_edit,
+    kuzu_field_remove,
     foreign_key,
     # Metadata classes
     KuzuFieldMetadata,
@@ -274,6 +303,29 @@ from .kuzu_orm import (
     get_self_references,
     is_registry_finalized,
     get_model_creation_order,
+)
+from .enum_extension import extend_enum, extend_int_enum
+from .enum_extension import (
+    KUZU_INT8ENUM,
+    KUZU_INT16ENUM,
+    KUZU_INT32ENUM,
+    KUZU_INT64ENUM,
+    KUZU_INT128ENUM,
+    KUZU_UINT8ENUM,
+    KUZU_UINT16ENUM,
+    KUZU_UINT32ENUM,
+    KUZU_UINT64ENUM,
+    kuzu_enum,
+    kuzu_int_enum,
+    kuzu_int8enum,
+    kuzu_int16enum,
+    kuzu_int32enum,
+    kuzu_int64enum,
+    kuzu_int128enum,
+    kuzu_uint8enum,
+    kuzu_uint16enum,
+    kuzu_uint32enum,
+    kuzu_uint64enum,
 )
 
 # Query system
@@ -309,12 +361,7 @@ from .kuzu_session import (
 )
 
 # Package metadata - dynamically retrieved from package metadata (PEP 621 compliant)
-try:
-    __version__ = metadata.version("kuzualchemy")
-except Exception as e:
-    print(f"Failed to retrieve version; using 0.0.0+local (it seems we're running from source): {e}")
-    # Fallback when running from source without installed dist-info
-    __version__ = "0.0.0+local"
+__version__ = _resolve_package_version()
 __author__ = "FanaticPythoner"  # From pyproject.toml authors
 __email__ = "info@kuzualchemy.com"  # From pyproject.toml authors
 __license__ = "Apache-2.0"  # From pyproject.toml license
@@ -333,7 +380,33 @@ __all__ = [
     "kuzu_node",
     "kuzu_relationship",
     "kuzu_field",
+    "kuzu_field_add",
+    "kuzu_field_override",
+    "kuzu_field_edit",
+    "kuzu_field_remove",
     "foreign_key",
+    "kuzu_enum",
+    "kuzu_int_enum",
+    "kuzu_int8enum",
+    "kuzu_int16enum",
+    "kuzu_int32enum",
+    "kuzu_int64enum",
+    "kuzu_int128enum",
+    "kuzu_uint8enum",
+    "kuzu_uint16enum",
+    "kuzu_uint32enum",
+    "kuzu_uint64enum",
+    "KUZU_INT8ENUM",
+    "KUZU_INT16ENUM",
+    "KUZU_INT32ENUM",
+    "KUZU_INT64ENUM",
+    "KUZU_INT128ENUM",
+    "KUZU_UINT8ENUM",
+    "KUZU_UINT16ENUM",
+    "KUZU_UINT32ENUM",
+    "KUZU_UINT64ENUM",
+    "extend_enum",
+    "extend_int_enum",
     # Enums and metadata classes
     "KuzuDataType",
     "RelationshipDirection",

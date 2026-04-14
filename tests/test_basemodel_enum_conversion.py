@@ -52,6 +52,16 @@ class StatusStrEnum(StrEnum):
     PENDING = "pending"
 
 
+class PrimaryUnionEnum(StrEnum):
+    """First enum candidate in a multi-enum Union field."""
+    FIRST = "first"
+
+
+class SecondaryUnionEnum(StrEnum):
+    """Second enum candidate in a multi-enum Union field."""
+    SECOND = "second"
+
+
 @kuzu_node("TestAccount")
 class TestAccount(BaseModel):
     """Test model using BaseModel with enum fields."""
@@ -67,6 +77,16 @@ class TestUnionModel(BaseModel):
     """Test model with Union type enum fields."""
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
     union_status: Union[StatusEnum, None] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
+
+
+@kuzu_node("TestMultiEnumUnionModel")
+class TestMultiEnumUnionModel(BaseModel):
+    """Test model with multiple enum candidates in one Union field."""
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
+    union_status: Union[PrimaryUnionEnum, SecondaryUnionEnum, None] = kuzu_field(
+        kuzu_type=KuzuDataType.STRING,
+        default=None,
+    )
 
 
 @kuzu_node("TestNoEnumModel")
@@ -190,6 +210,14 @@ class TestBaseModelEnumConversion:
             "union_status": None
         })
         assert result["union_status"] is None
+
+    def test_validator_union_uses_second_enum_candidate(self):
+        """Test the validator tries every enum candidate declared in a Union."""
+        result = TestMultiEnumUnionModel.convert_str_to_enum({
+            "id": 1,
+            "union_status": "SECOND",
+        })
+        assert result["union_status"] == SecondaryUnionEnum.SECOND
 
     def test_validator_already_enum_instance(self):
         """Test that the validator doesn't convert existing enum instances."""
@@ -335,8 +363,6 @@ class TestBaseModelEnumConversion:
     def test_validator_non_class_type_in_union(self):
         """Test the validator handles non-class types in Union args."""
         # This tests the TypeError handling in Union processing
-        from typing import Union, List
-
         @kuzu_node("ComplexUnionModel")
         class ComplexUnionModel(BaseModel):
             id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
@@ -346,11 +372,19 @@ class TestBaseModelEnumConversion:
         model = ComplexUnionModel(id=1, complex_field="ACTIVE")
         assert model.complex_field == StatusEnum.ACTIVE
 
+    def test_validator_mixed_union_passthroughs_list_branch(self):
+        """Test mixed enum/non-enum unions keep list payloads untouched."""
+        @kuzu_node("ComplexUnionPassthroughModel")
+        class ComplexUnionPassthroughModel(BaseModel):
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
+            complex_field: Union[StatusEnum, List[str], None] = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None)
+
+        model = ComplexUnionPassthroughModel(id=1, complex_field=["ACTIVE", "literal"])
+        assert model.complex_field == ["ACTIVE", "literal"]
+
     def test_validator_non_class_field_type(self):
         """Test the validator handles non-class field types."""
         # This tests the TypeError handling when field_type is not a class
-        from typing import List
-
         @kuzu_node("NonClassFieldModel")
         class NonClassFieldModel(BaseModel):
             id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
@@ -442,6 +476,17 @@ class TestBaseModelEnumListTupleConversion:
         assert model.optional_mixed_list == [None, MixedEnum.INT_VAL]
         assert model.mixed_list[0] == MixedEnum.NONE_VAL
 
+    def test_optional_list_enum_conversion_when_present(self):
+        """Test Optional[List[Enum]] converts actual list payloads."""
+        model = ListEnumModel(
+            id=31,
+            statuses=["ACTIVE"],
+            priorities=["1"],
+            mixed_list=["STRING_VAL"],
+            optional_statuses=["ACTIVE", "inactive"],
+        )
+        assert model.optional_statuses == [StatusEnum.ACTIVE, StatusEnum.INACTIVE]
+
     def test_tuple_enum_conversion_homogeneous(self):
         """Test tuple conversion with homogeneous and fixed-length tuples."""
         model = TupleEnumModel(
@@ -466,7 +511,7 @@ class TestBaseModelEnumListTupleConversion:
 
     def test_invalid_list_element_raises_error(self):
         """Test that invalid elements in lists raise appropriate errors."""
-        with pytest.raises(ValueError, match="Invalid enum value"):
+        with pytest.raises(ValueError, match="Invalid value for field statuses"):
             ListEnumModel(
                 id=6,
                 statuses=["ACTIVE", "BOGUS"],
@@ -664,7 +709,7 @@ class TestListTupleIntStrEnumConversion:
         assert model.int_statuses == [StatusIntEnum.ACTIVE, None, StatusIntEnum.PENDING]
 
 
-class TestBaseModelEnumListTupleConversion:
+class TestBaseModelEnumListTuplePerformance:
     """Test List and Tuple enum conversion functionality."""
 
     def test_large_list_performance(self):
