@@ -27,6 +27,7 @@ from .kuzu_query_expressions import (
 )
 from .kuzu_query_builder import QueryState, JoinClause, CypherQueryBuilder
 from .kuzu_query_fields import QueryField, ModelFieldAccessor
+from .enum_normalization import convert_input_enums_for_model
 from .uuid_normalization import _NULL_UUID
 
 logger = logging.getLogger(__name__)
@@ -1102,6 +1103,7 @@ class Query(Generic[ModelType]):
                         _assert_uuid_seq(v, k)
 
                     clean_props[k] = v
+                clean_props = convert_input_enums_for_model(model_class=node_cls, values=clean_props)
 
                 # 6) Use model_construct for fast instantiation (skip validation - data from DB is valid)
                 inst = node_cls.model_construct(**clean_props)
@@ -1178,6 +1180,7 @@ class Query(Generic[ModelType]):
                     rel_props.pop(DDLConstants.REL_FROM_NODE_FIELD)
                 if DDLConstants.REL_TO_NODE_FIELD in rel_props:
                     rel_props.pop(DDLConstants.REL_TO_NODE_FIELD)
+                rel_props = convert_input_enums_for_model(model_class=result_model_class, values=rel_props)
 
                 # Construct relationship instance using model_construct for speed (data from DB is valid)
                 instance = result_model_class.model_construct(from_node=from_node, to_node=to_node, **rel_props)

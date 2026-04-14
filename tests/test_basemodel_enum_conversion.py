@@ -9,11 +9,21 @@ Tests the automatic enum conversion features in BaseModel.py.
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 from enum import Enum, IntEnum, StrEnum
 from typing import Optional, Union, List, Tuple
-from pydantic import ValidationError
 
-from kuzualchemy import BaseModel, kuzu_node, kuzu_field, KuzuDataType
+from kuzualchemy import (
+    BaseModel,
+    KuzuDataType,
+    KuzuSession,
+    KuzuRelationshipBase,
+    kuzu_field,
+    kuzu_int8enum,
+    kuzu_node,
+    kuzu_relationship,
+)
+from kuzualchemy.test_utilities import initialize_schema
 
 
 class StatusEnum(Enum):
@@ -50,6 +60,15 @@ class StatusStrEnum(StrEnum):
     INACTIVE = "inactive"
     ACTIVE = "active"
     PENDING = "pending"
+
+
+class CanonicalStageEnum(IntEnum):
+    BASELINE = 1
+
+
+@kuzu_int8enum(base_enum=CanonicalStageEnum)
+class ExtendedStageEnum:
+    EXPERIMENTAL = 9
 
 
 class PrimaryUnionEnum(StrEnum):
@@ -410,6 +429,56 @@ class TestBaseModelEnumConversion:
         assert "INVALID_STATUS" in error_message
         assert "Valid names:" in error_message
         assert "valid values:" in error_message
+
+    def test_node_and_relationship_query_round_trip_rehydrates_extended_enums(self, tmp_path: Path):
+        @kuzu_node("EnumRoundTripNode")
+        class EnumRoundTripNode(BaseModel):
+            id: int = kuzu_field(kuzu_type=KuzuDataType.INT32, primary_key=True)
+            stage: ExtendedStageEnum = kuzu_field(kuzu_type=KuzuDataType.INT8)
+
+        @kuzu_relationship("ENUM_ROUND_TRIP", pairs=[(EnumRoundTripNode, EnumRoundTripNode)])
+        class EnumRoundTripRelationship(KuzuRelationshipBase):
+            stage: ExtendedStageEnum = kuzu_field(kuzu_type=KuzuDataType.INT8)
+
+        db_path = tmp_path / "enum_round_trip.kuzu"
+        session = KuzuSession(db_path=db_path)
+
+        from kuzualchemy.kuzu_orm import get_ddl_for_node, get_ddl_for_relationship
+
+        ddl = "\n".join(
+            [
+                get_ddl_for_node(EnumRoundTripNode),
+                get_ddl_for_relationship(EnumRoundTripRelationship),
+            ]
+        )
+        initialize_schema(session, ddl=ddl)
+
+        source = EnumRoundTripNode(id=1, stage=CanonicalStageEnum.BASELINE)
+        target = EnumRoundTripNode(id=2, stage=9)
+        session.add(source)
+        session.add(target)
+        session.commit()
+
+        source_db = session.query(EnumRoundTripNode).filter_by(id=1).first()
+        target_db = session.query(EnumRoundTripNode).filter_by(id=2).first()
+
+        assert source_db is not None
+        assert target_db is not None
+        assert source_db.stage is ExtendedStageEnum.BASELINE
+        assert target_db.stage is ExtendedStageEnum.EXPERIMENTAL
+
+        session.create_relationship(
+            EnumRoundTripRelationship,
+            source_db.id,
+            target_db.id,
+            stage=9,
+        )
+        session.commit()
+
+        relationships = session.query(EnumRoundTripRelationship).all()
+
+        assert len(relationships) == 1
+        assert relationships[0].stage is ExtendedStageEnum.EXPERIMENTAL
 
 
 # Additional tests for list/tuple of Enum conversions
