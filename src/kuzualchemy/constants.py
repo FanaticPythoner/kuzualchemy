@@ -450,56 +450,56 @@ class KuzuDataType(StrEnum):
     """Constants for Kuzu data types."""
 
     # @@ STEP 1: Define integer types
-    INT8: Final[str] = "INT8"
-    INT16: Final[str] = "INT16"
-    INT32: Final[str] = "INT32"
-    INT64: Final[str] = "INT64"
-    INT128: Final[str] = "INT128"
-    UINT8: Final[str] = "UINT8"
-    UINT16: Final[str] = "UINT16"
-    UINT32: Final[str] = "UINT32"
-    UINT64: Final[str] = "UINT64"
+    INT8 = "INT8"
+    INT16 = "INT16"
+    INT32 = "INT32"
+    INT64 = "INT64"
+    INT128 = "INT128"
+    UINT8 = "UINT8"
+    UINT16 = "UINT16"
+    UINT32 = "UINT32"
+    UINT64 = "UINT64"
 
     # @@ STEP 2: Define floating point types
-    FLOAT: Final[str] = "FLOAT"
-    DOUBLE: Final[str] = "DOUBLE"
-    DECIMAL: Final[str] = "DECIMAL"
+    FLOAT = "FLOAT"
+    DOUBLE = "DOUBLE"
+    DECIMAL = "DECIMAL"
 
     # @@ STEP 3: Define special numeric types
-    SERIAL: Final[str] = "SERIAL"
+    SERIAL = "SERIAL"
 
     # @@ STEP 4: Define string types
-    STRING: Final[str] = "STRING"
+    STRING = "STRING"
 
     # @@ STEP 5: Define boolean types
-    BOOL: Final[str] = "BOOL"
-    BOOLEAN: Final[str] = "BOOLEAN"
+    BOOL = "BOOL"
+    BOOLEAN = "BOOLEAN"
 
     # @@ STEP 6: Define temporal types
-    DATE: Final[str] = "DATE"
-    TIME: Final[str] = "TIME"
-    TIMESTAMP: Final[str] = "TIMESTAMP"
-    TIMESTAMP_NS: Final[str] = "TIMESTAMP_NS"
-    TIMESTAMP_MS: Final[str] = "TIMESTAMP_MS"
-    TIMESTAMP_SEC: Final[str] = "TIMESTAMP_SEC"
-    TIMESTAMP_TZ: Final[str] = "TIMESTAMP_TZ"
-    INTERVAL: Final[str] = "INTERVAL"
+    DATE = "DATE"
+    TIME = "TIME"
+    TIMESTAMP = "TIMESTAMP"
+    TIMESTAMP_NS = "TIMESTAMP_NS"
+    TIMESTAMP_MS = "TIMESTAMP_MS"
+    TIMESTAMP_SEC = "TIMESTAMP_SEC"
+    TIMESTAMP_TZ = "TIMESTAMP_TZ"
+    INTERVAL = "INTERVAL"
 
     # @@ STEP 7: Define binary types
-    BLOB: Final[str] = "BLOB"
+    BLOB = "BLOB"
 
     # @@ STEP 8: Define identifier types
-    UUID: Final[str] = "UUID"
+    UUID = "UUID"
 
     # @@ STEP 9: Define complex types
-    ARRAY: Final[str] = "ARRAY"
-    STRUCT: Final[str] = "STRUCT"
-    MAP: Final[str] = "MAP"
-    UNION: Final[str] = "UNION"
+    ARRAY = "ARRAY"
+    STRUCT = "STRUCT"
+    MAP = "MAP"
+    UNION = "UNION"
 
     # @@ STEP 10: Define node/relationship references
-    NODE: Final[str] = "NODE"
-    REL: Final[str] = "REL"
+    NODE = "NODE"
+    REL = "REL"
 
 
 

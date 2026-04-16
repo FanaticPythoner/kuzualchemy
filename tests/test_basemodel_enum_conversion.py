@@ -71,6 +71,11 @@ class ExtendedStageEnum:
     EXPERIMENTAL = 9
 
 
+def test_extended_stage_enum_preserves_inherited_and_declared_members() -> None:
+    assert ExtendedStageEnum.BASELINE.value == CanonicalStageEnum.BASELINE.value
+    assert ExtendedStageEnum.EXPERIMENTAL.value == 9
+
+
 class PrimaryUnionEnum(StrEnum):
     """First enum candidate in a multi-enum Union field."""
     FIRST = "first"

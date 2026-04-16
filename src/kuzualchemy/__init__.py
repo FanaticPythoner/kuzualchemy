@@ -306,6 +306,7 @@ from .kuzu_orm import (
 )
 from .enum_extension import extend_enum, extend_int_enum
 from .enum_extension import (
+    KuzuEnumClassShimMeta,
     KUZU_INT8ENUM,
     KUZU_INT16ENUM,
     KUZU_INT32ENUM,
@@ -316,6 +317,7 @@ from .enum_extension import (
     KUZU_UINT32ENUM,
     KUZU_UINT64ENUM,
     kuzu_enum,
+    kuzu_enum_member,
     kuzu_int_enum,
     kuzu_int8enum,
     kuzu_int16enum,
@@ -385,7 +387,9 @@ __all__ = [
     "kuzu_field_edit",
     "kuzu_field_remove",
     "foreign_key",
+    "KuzuEnumClassShimMeta",
     "kuzu_enum",
+    "kuzu_enum_member",
     "kuzu_int_enum",
     "kuzu_int8enum",
     "kuzu_int16enum",
