@@ -311,29 +311,57 @@ class ATPIntegration:
         return None
 
     def create_nodes(self, label: str, rows: List[Dict[str, Any]], *, return_rows: bool = False, pk_fields: Optional[List[str]] = None) -> Optional[List[Dict[str, Any]]]:
-        # Bulk create via rows list (UNWIND in executor). When return_rows=True, request cypher_results rows.
+        spec = self.create_nodes_spec(label, rows, return_rows=return_rows, pk_fields=pk_fields)
+        res = self.submit_specs([spec])[0]
+        if return_rows:
+            return self._extract_post_cypher_rows(res)
+        return None
+
+    def create_nodes_spec(
+        self,
+        label: str,
+        rows: List[Dict[str, Any]],
+        *,
+        return_rows: bool = False,
+        pk_fields: Optional[List[str]] = None,
+    ) -> OperationSpec:
         returns = ReturnSpec(modes=ReturnMode.POST_CYPHER) if return_rows else None
         ctx: Dict[str, Any] = {"db_path": self._db_path, "label": label}
         if pk_fields:
             ctx["pk_fields"] = pk_fields
-        spec = OperationSpec(
+        return OperationSpec(
             kind=OpKind.CREATE_NODE,
             label=label,
             props={"rows": rows},
             returns=returns,
             context=ctx,
         )
-        tk = self._handler.submit(spec)
-        try:
-            res = tk.result(None)
-        except Exception as e:
-            raise RuntimeError(f"Execute failed: {e}") from e
-        if return_rows and isinstance(res, dict):
-            cr = res.get("cypher_results")
-            if isinstance(cr, list) and cr and isinstance(cr[0], list):
-                return cr[0]
+
+    def submit_specs(self, specs: List[OperationSpec]) -> List[Dict[str, Any]]:
+        if not isinstance(specs, list) or not all(isinstance(spec, OperationSpec) for spec in specs):
+            raise ValueError("specs must be a list of OperationSpec instances")
+        if not specs:
             return []
-        return None
+        try:
+            tickets = self._handler.submit_many(specs)
+        except Exception as e:
+            raise RuntimeError(f"Submit failed: {e}") from e
+        results: List[Dict[str, Any]] = []
+        for ticket in tickets:
+            try:
+                res = ticket.result(None)
+            except Exception as e:
+                raise RuntimeError(f"Execute failed: {e}") from e
+            if not isinstance(res, dict):
+                raise RuntimeError(f"Execute failed: expected dict result, got {type(res).__name__}")
+            results.append(res)
+        return results
+
+    def _extract_post_cypher_rows(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cr = result.get("cypher_results")
+        if isinstance(cr, list) and cr and isinstance(cr[0], list):
+            return cr[0]
+        return []
 
     def update_node(self, *, label: str, pk: Dict[str, Any], props: Dict[str, Any]) -> None:
         """Update a node by label and primary key fields with provided properties via ATP."""
@@ -406,12 +434,30 @@ class ATPIntegration:
         src_pk_field: str,
         dst_pk_field: str,
     ) -> Optional[List[Dict[str, Any]]]:
-        # Bulk relationship create using typed rows with from_pk/to_pk + props
-        returns = None
-        if any("__atp_row_idx" in r for r in rows):
-            # Request rows only when client provided per-row index for mapping
-            returns = ReturnSpec(modes=ReturnMode.POST_CYPHER)
-        # Build context; omit fixed labels/pk fields when wildcard '*' provided to enable dynamic grouping in Rust
+        spec = self.create_edges_spec(
+            rel_name=rel_name,
+            src_label=src_label,
+            dst_label=dst_label,
+            rows=rows,
+            src_pk_field=src_pk_field,
+            dst_pk_field=dst_pk_field,
+        )
+        res = self.submit_specs([spec])[0]
+        if spec.returns is not None:
+            return self._extract_post_cypher_rows(res)
+        return None
+
+    def create_edges_spec(
+        self,
+        *,
+        rel_name: str,
+        src_label: str,
+        dst_label: str,
+        rows: List[Dict[str, Any]],
+        src_pk_field: str,
+        dst_pk_field: str,
+    ) -> OperationSpec:
+        returns = ReturnSpec(modes=ReturnMode.POST_CYPHER) if any("__atp_row_idx" in r for r in rows) else None
         ctx: Dict[str, Any] = {"db_path": self._db_path, "rel_type": rel_name}
         if src_label and src_label != "*":
             ctx["src_label"] = src_label
@@ -422,7 +468,7 @@ class ATPIntegration:
         if dst_pk_field and dst_pk_field != "*":
             ctx["dst_pk_field"] = dst_pk_field
 
-        spec = OperationSpec(
+        return OperationSpec(
             kind=OpKind.CREATE_EDGE,
             rel_type=rel_name,
             src=(src_label, {}),
@@ -431,17 +477,6 @@ class ATPIntegration:
             returns=returns,
             context=ctx,
         )
-        tk = self._handler.submit(spec)
-        try:
-            res = tk.result(None)
-        except Exception as e:
-            raise RuntimeError(f"Execute failed: {e}") from e
-        if returns is not None and isinstance(res, dict):
-            cr = res.get("cypher_results")
-            if isinstance(cr, list) and cr and isinstance(cr[0], list):
-                return cr[0]
-            return []
-        return None
 
     def flush(self, timeout: Optional[float] = None) -> None:
         self._handler.flush(timeout)
