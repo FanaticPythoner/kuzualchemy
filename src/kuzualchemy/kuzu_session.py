@@ -11,10 +11,11 @@ error handling with precision.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast, Callable, get_origin, get_args
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, Iterator, cast, Callable
 from contextlib import contextmanager
 from pathlib import Path
 from collections import defaultdict, OrderedDict
+from dataclasses import dataclass
 import logging
 import uuid
 # enum.Enum - Rust py_to_value handles Enum.value unwrapping
@@ -31,11 +32,27 @@ from .atp_integration import ATPIntegration
 from .constants import PerformanceConstants
 from .constants import DDLConstants
 from .kuzu_orm import get_node_by_name, KuzuRelationshipBase, get_registered_nodes
+from .uuid_normalization import normalize_uuid_value_for_kuzu_write
+from atp_pipeline import OperationSpec
 # DefaultFunctionBase - Rust is_default_fn_sentinel handles filtering
 
 
 ModelType = TypeVar("ModelType")
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _BulkCreateOperation:
+    spec: OperationSpec
+    model_class: Type[Any]
+    instances: List[Any]
+    auto_fields: List[str]
+    excluded_auto_fields: List[str]
+    object_key: str
+
+    @property
+    def needs_return_rows(self) -> bool:
+        return bool(self.excluded_auto_fields or (self.auto_fields and self.object_key == "r"))
 
 
 class KuzuConnection:
