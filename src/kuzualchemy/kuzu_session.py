@@ -607,6 +607,12 @@ class KuzuSession:
         for instance in instances:
             self.add(instance)
 
+    def bulk_insert_immediate(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
+        """Insert instances through the grouped bulk path."""
+        if not isinstance(instances, list):
+            raise ValueError("instances must be a list")
+        self._bulk_insert(instances, batch_size)
+
     def _bulk_insert(self, instances: List[Any], batch_size: Optional[int] = None) -> None:
         """Bulk insert by grouping model types and delegating to ATP's create_nodes/edges via existing helpers."""
         if not instances:
@@ -619,10 +625,11 @@ class KuzuSession:
         model_groups = defaultdict(list)
         for instance in instances:
             model_groups[type(instance)].append(instance)
-        # Use existing per-type bulk path (UNWIND rows -> ATP.create_nodes/create_edges)
         eff_batch = batch_size if batch_size is not None else self.bulk_batch_size
+        operations: List[_BulkCreateOperation] = []
         for model_class, group in model_groups.items():
-            self._bulk_insert_model_type(model_class, group, eff_batch)
+            operations.extend(self._build_bulk_create_operations(model_class, group, eff_batch))
+        self._execute_bulk_create_operations(operations)
 
     def _bulk_insert_model_type(self, model_class: Type[Any], instances: List[Any], batch_size: int) -> None:
         """
@@ -651,11 +658,19 @@ class KuzuSession:
         """
         if not instances:
             return
+        operations = self._build_bulk_create_operations(model_class, instances, batch_size)
+        self._execute_bulk_create_operations(operations)
 
-        # Determine if node or relationship
+    def _build_bulk_create_operations(
+        self,
+        model_class: Type[Any],
+        instances: List[Any],
+        batch_size: int,
+    ) -> List[_BulkCreateOperation]:
+        if not instances:
+            return []
         is_rel = hasattr(model_class, '__kuzu_rel_name__') or hasattr(model_class, '__kuzu_relationship_name__')
 
-        # Get table/rel name
         if is_rel:
             table_name = getattr(model_class, '__kuzu_rel_name__', None) or getattr(model_class, '__kuzu_relationship_name__')
         else:
@@ -663,23 +678,14 @@ class KuzuSession:
         if not table_name:
             raise ValueError(f"Model {model_class.__name__} is not a registered node or relationship")
 
-        # Get auto-increment fields once
         auto_fields = getattr(model_class, 'get_auto_increment_fields', lambda: [])()
         has_auto_increment = bool(auto_fields)
-
-        # Get PK fields once for nodes
         pk_fields = getattr(model_class, 'get_primary_key_fields', lambda: [])() if not is_rel else []
 
-        # Relationship bulk insert optimization: when the relationship is defined for exactly one
-        # (from_label,to_label) pair, precompute routing once and avoid per-row routing fields.
         fixed_rel_routing: Optional[Dict[str, str]] = None
         if is_rel:
             fixed_rel_routing = self._try_get_fixed_relationship_routing(model_class)
 
-        # Deterministic storage order: sort instances by PK before UNWIND.
-        # Without this, thread scheduling under parallel execution produces
-        # different storage order, causing downstream read queries (which
-        # return in storage order) to diverge non-deterministically.
         if not is_rel and pk_fields:
             pk0 = pk_fields[0]
             instances = sorted(instances, key=lambda inst: str(getattr(inst, pk0, '') or ''))
@@ -692,38 +698,37 @@ class KuzuSession:
         n = len(instances)
         start = 0
         cur_batch = max(1, int(batch_size))
+        operations: List[_BulkCreateOperation] = []
 
         while start < n:
             slice_len = min(cur_batch, n - start)
             inst_ref = instances[start:start + slice_len]
 
             if not is_rel:
-                # === NODE BULK INSERT ===
-                # Build minimal rows - ATP py_to_value handles type conversion and default function filtering
                 rows = self._build_node_rows(model_class, inst_ref, auto_fields)
                 if not rows:
                     start += slice_len
                     continue
 
-                # Determine if we need return rows (for auto-increment fields not provided)
                 sample = inst_ref[0].model_dump(exclude_unset=True)
                 excluded_auto = [f for f in auto_fields if sample.get(f) is None]
-                need_return = bool(excluded_auto)
-
-                ret_rows: Optional[List[Dict[str, Any]]] = None
-                try:
-                    ret_rows = self._conn._atp.create_nodes(
-                        table_name, rows, return_rows=need_return, pk_fields=pk_fields
+                spec = self._conn._atp.create_nodes_spec(
+                    table_name,
+                    rows,
+                    return_rows=bool(excluded_auto),
+                    pk_fields=pk_fields,
+                )
+                operations.append(
+                    _BulkCreateOperation(
+                        spec=spec,
+                        model_class=model_class,
+                        instances=inst_ref,
+                        auto_fields=auto_fields,
+                        excluded_auto_fields=excluded_auto,
+                        object_key='n',
                     )
-                except Exception as e:
-                    self._raise_bulk_error("Bulk insert", table_name, e)
-
-                # Materialize auto-increment fields from return rows
-                if need_return and ret_rows:
-                    self._materialize_auto_fields(inst_ref, ret_rows, excluded_auto, 'n')
-                    self._update_identity_map(model_class, inst_ref, pk_fields)
+                )
             else:
-                # === RELATIONSHIP BULK INSERT ===
                 if fixed_rel_routing is not None:
                     rows_r = self._build_rel_rows_fixed(inst_ref, has_auto_increment)
                 else:
@@ -739,27 +744,66 @@ class KuzuSession:
                     src_pk_field = fixed_rel_routing['from_pk_field']
                     dst_pk_field = fixed_rel_routing['to_pk_field']
 
-                ret_rows_r: Optional[List[Dict[str, Any]]] = None
-                try:
-                    ret_rows_r = self._conn._atp.create_edges(
-                        rel_name=table_name,
-                        src_label=src_label,
-                        dst_label=dst_label,
-                        rows=rows_r,
-                        src_pk_field=src_pk_field,
-                        dst_pk_field=dst_pk_field,
+                spec = self._conn._atp.create_edges_spec(
+                    rel_name=table_name,
+                    src_label=src_label,
+                    dst_label=dst_label,
+                    rows=rows_r,
+                    src_pk_field=src_pk_field,
+                    dst_pk_field=dst_pk_field,
+                )
+                operations.append(
+                    _BulkCreateOperation(
+                        spec=spec,
+                        model_class=model_class,
+                        instances=inst_ref,
+                        auto_fields=auto_fields,
+                        excluded_auto_fields=[],
+                        object_key='r',
                     )
-                except Exception as e:
-                    self._raise_bulk_error("Bulk relationship insert", table_name, e)
+                )
 
-                if has_auto_increment and ret_rows_r:
-                    self._materialize_auto_fields(inst_ref, ret_rows_r, auto_fields, 'r')
-
-            # Advance and adapt batch size
             start += slice_len
             target_max = getattr(self, 'bulk_batch_size_max', batch_size)
             if cur_batch < target_max:
                 cur_batch = min(target_max, int(cur_batch * 2))
+
+        return operations
+
+    def _execute_bulk_create_operations(self, operations: List[_BulkCreateOperation]) -> None:
+        if not operations:
+            return
+        try:
+            results = self._conn._atp.submit_specs([operation.spec for operation in operations])
+        except Exception as e:
+            labels = ",".join(str(operation.spec.label or operation.spec.rel_type) for operation in operations)
+            self._raise_bulk_error("Bulk insert", labels, e)
+
+        if len(results) != len(operations):
+            raise RuntimeError("bulk insert result count mismatch")
+
+        for operation, result in zip(operations, results):
+            if not operation.needs_return_rows:
+                continue
+            ret_rows = self._conn._atp._extract_post_cypher_rows(result)
+            if not ret_rows:
+                continue
+            if operation.object_key == 'n':
+                self._materialize_auto_fields(
+                    operation.instances,
+                    ret_rows,
+                    operation.excluded_auto_fields,
+                    operation.object_key,
+                )
+                pk_fields = getattr(operation.model_class, 'get_primary_key_fields', lambda: [])()
+                self._update_identity_map(operation.model_class, operation.instances, pk_fields)
+            else:
+                self._materialize_auto_fields(
+                    operation.instances,
+                    ret_rows,
+                    operation.auto_fields,
+                    operation.object_key,
+                )
 
     def _build_node_rows(self, model_class: Type[Any], instances: List[Any], auto_fields: List[str]) -> List[Dict[str, Any]]:
         """Build node rows for bulk insert.
