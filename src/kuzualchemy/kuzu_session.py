@@ -813,10 +813,30 @@ class KuzuSession:
         - Default function sentinel detection and filtering via is_default_fn_sentinel
         - Null value filtering (Kuzu driver doesn't support untyped NULL in parameters)
         """
-        return [
-            {"__atp_row_idx": j, **inst.model_dump(exclude_unset=True)}
-            for j, inst in enumerate(instances)
-        ]
+        rows: List[Dict[str, Any]] = []
+        for j, inst in enumerate(instances):
+            d0 = getattr(inst, '__dict__', None)
+            fields_set = getattr(inst, '__pydantic_fields_set__', None)
+            if isinstance(d0, dict) and isinstance(fields_set, set):
+                row: Dict[str, Any] = {"__atp_row_idx": j}
+                for key in sorted(fields_set):
+                    if key in d0:
+                        value = normalize_uuid_value_for_kuzu_write(
+                            model_class=model_class,
+                            field_name=key,
+                            value=d0.get(key),
+                        )
+                        if value is not None:
+                            row[key] = value
+                rows.append(row)
+            else:
+                values = self._normalize_write_property_map(
+                    model_class,
+                    inst.model_dump(exclude_unset=True),
+                    skip_none=True,
+                )
+                rows.append({"__atp_row_idx": j, **values})
+        return rows
 
     def _build_rel_rows(self, model_class: Type[Any], instances: List[Any], has_auto_increment: bool) -> List[Dict[str, Any]]:
         """Build relationship rows for bulk insert.
@@ -892,12 +912,20 @@ class KuzuSession:
                 for k in fields_set:
                     if k in exclude_fields:
                         continue
-                    v = d0.get(k)
+                    v = normalize_uuid_value_for_kuzu_write(
+                        model_class=model_class,
+                        field_name=k,
+                        value=d0.get(k),
+                    )
                     if v is None:
                         continue
                     row[k] = v
             else:
-                props = inst.model_dump(exclude_unset=True)
+                props = self._normalize_write_property_map(
+                    model_class,
+                    inst.model_dump(exclude_unset=True),
+                    skip_none=True,
+                )
                 for k, v in props.items():
                     if k in exclude_fields:
                         continue
@@ -974,12 +1002,20 @@ class KuzuSession:
                 for k in fields_set:
                     if k in exclude_fields:
                         continue
-                    v = d0.get(k)
+                    v = normalize_uuid_value_for_kuzu_write(
+                        model_class=type(inst),
+                        field_name=k,
+                        value=d0.get(k),
+                    )
                     if v is None:
                         continue
                     row[k] = v
             else:
-                props = inst.model_dump(exclude_unset=True)
+                props = self._normalize_write_property_map(
+                    type(inst),
+                    inst.model_dump(exclude_unset=True),
+                    skip_none=True,
+                )
                 for k, v in props.items():
                     if k in exclude_fields:
                         continue
@@ -1417,9 +1453,12 @@ class KuzuSession:
         self._validate_manual_auto_increment_values(manual_values, model_class)
 
         # Build props dict - ATP py_to_value handles Enum.value, UUID, datetime conversion
-        properties = instance.model_dump(exclude_unset=True)
+        properties = self._normalize_write_property_map(
+            model_class,
+            instance.model_dump(exclude_unset=True),
+            skip_none=True,
+        )
         properties.update({k: v for k, v in manual_values.items() if v is not None})
-        properties = {k: v for k, v in properties.items() if v is not None}
 
         # Delegate to ATP and request object return for auto-increment fields
         new_obj = self._conn._atp.create_node(node_name, props=properties, pk=None, return_object=True)
@@ -1691,7 +1730,11 @@ class KuzuSession:
             DDLConstants.REL_FROM_NODE_FIELD, DDLConstants.REL_TO_NODE_FIELD,
             DDLConstants.REL_FROM_NODE_PK_FIELD, DDLConstants.REL_TO_NODE_PK_FIELD,
         }
-        properties = instance.model_dump(exclude_unset=True)
+        properties = self._normalize_write_property_map(
+            model_class,
+            instance.model_dump(exclude_unset=True),
+            skip_none=True,
+        )
         properties = {k: v for k, v in properties.items() if k not in internal_fields and v is not None}
         properties.update({k: v for k, v in manual_values.items() if v is not None})
 
@@ -1809,7 +1852,11 @@ class KuzuSession:
             raise ValueError("Cannot update instance without primary key")
 
         pk_fields = self._get_pk_fields_cached(model_class)
-        properties = instance.model_dump(exclude_unset=True)
+        properties = self._normalize_write_property_map(
+            model_class,
+            instance.model_dump(exclude_unset=True),
+            skip_none=True,
+        )
         properties = {k: v for k, v in properties.items() if k not in pk_fields and v is not None}
 
         if properties:
