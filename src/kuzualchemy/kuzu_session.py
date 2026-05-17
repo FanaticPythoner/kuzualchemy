@@ -339,31 +339,10 @@ class KuzuSession:
 
         label = model_class.__kuzu_node_name__
 
-        def _normalize_uuid_value(field: str, v: Any, *, optional: bool) -> Any:
-            if v is None:
-                if optional:
-                    return None
-                raise TypeError(f"Field {label}.{field} is not optional and cannot be None")
-            if isinstance(v, uuid.UUID):
-                return v
-            raise TypeError(f"Field {label}.{field} expects uuid.UUID{'|None' if optional else ''}, got {type(v)}")
-
         def _normalize_row_types(r: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(r, dict):
                 raise ValueError("each row must be a dict")
-            out: Dict[str, Any] = dict(r)
-            for fname, fi in model_class.model_fields.items():
-                if fname not in out:
-                    continue
-                ann = fi.annotation
-                origin = get_origin(ann)
-                if ann is uuid.UUID:
-                    out[fname] = _normalize_uuid_value(fname, out[fname], optional=False)
-                elif origin is Union:
-                    args = get_args(ann)
-                    if uuid.UUID in args and type(None) in args:
-                        out[fname] = _normalize_uuid_value(fname, out[fname], optional=True)
-            return out
+            return self._normalize_write_property_map(model_class, r, skip_none=False)
 
         # Validate PK presence and determine SET fields deterministically
         set_fields: List[str] = []
@@ -437,6 +416,25 @@ class KuzuSession:
         if not ("constraint" in em_l or "duplicate" in em_l or "primary" in em_l):
             hint = " (constraint violation)"
         raise RuntimeError(f"{kind} failed for {name}: {type(exc).__name__}: {em}{hint}") from exc
+
+    def _normalize_write_property_map(
+        self,
+        model_class: Type[Any],
+        values: Dict[str, Any],
+        *,
+        skip_none: bool,
+    ) -> Dict[str, Any]:
+        normalized: Dict[str, Any] = {}
+        for key, raw_value in values.items():
+            value = normalize_uuid_value_for_kuzu_write(
+                model_class=model_class,
+                field_name=key,
+                value=raw_value,
+            )
+            if skip_none and value is None:
+                continue
+            normalized[key] = value
+        return normalized
 
     def _generate_identity_key(self, model_class: Type[Any], pk_value: Any) -> str:
         """Generate optimized identity key for identity map."""

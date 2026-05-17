@@ -87,6 +87,8 @@ def normalize_uuid_fields_for_model(
     if not isinstance(data, dict):
         raise TypeError("data must be a dict")
 
+    optional_null_uuid_sentinel = _NULL_UUID if null_uuid_sentinel is None else null_uuid_sentinel
+
     for fname, kind in _get_model_uuid_field_kinds(model_class):
         if fname not in data:
             continue
@@ -96,7 +98,7 @@ def normalize_uuid_fields_for_model(
             continue
 
         if kind == "optional_uuid":
-            if null_uuid_sentinel is not None and v == null_uuid_sentinel:
+            if v == optional_null_uuid_sentinel:
                 data[fname] = None
             else:
                 data[fname] = coerce_optional_uuid(v)
@@ -107,3 +109,29 @@ def normalize_uuid_fields_for_model(
             continue
 
     return data
+
+
+def normalize_uuid_value_for_kuzu_write(
+    *,
+    model_class: type[Any],
+    field_name: str,
+    value: Any,
+) -> Any:
+    if not isinstance(value, uuid.UUID) or value != _NULL_UUID:
+        return value
+
+    all_meta_getter = getattr(model_class, "get_all_kuzu_metadata", None)
+    if not callable(all_meta_getter):
+        return value
+
+    metadata = all_meta_getter().get(field_name)
+    if metadata is None:
+        return value
+
+    kuzu_type = getattr(metadata, "kuzu_type", None)
+    if kuzu_type != "UUID":
+        return value
+
+    if bool(getattr(metadata, "primary_key", False)) or bool(getattr(metadata, "not_null", False)):
+        raise ValueError(f"UUID field {model_class.__name__}.{field_name} cannot use nil UUID sentinel")
+    return None
