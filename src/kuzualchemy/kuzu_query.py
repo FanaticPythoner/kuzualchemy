@@ -33,6 +33,20 @@ from .uuid_normalization import _NULL_UUID
 logger = logging.getLogger(__name__)
 
 _ENV_ATP_READONLY_POOL_MAX_SIZE = "ATP_READONLY_POOL_MAX_SIZE"
+_ENV_KUZUALCHEMY_QUERY_TIMING_LOG = "KUZUALCHEMY_QUERY_TIMING_LOG"
+_ENV_FORGE_QUERY_PROFILE_ENABLED = "FORGE_QUERY_PROFILE_ENABLED"
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def query_timing_log_enabled(session: Any | None = None) -> bool:
+    """Return true when query timing logs are explicitly enabled."""
+    if session is not None and getattr(session, "_debug_timing", False):
+        return True
+    for env_name in (_ENV_KUZUALCHEMY_QUERY_TIMING_LOG, _ENV_FORGE_QUERY_PROFILE_ENABLED):
+        raw = os.getenv(env_name)
+        if isinstance(raw, str) and raw.strip().casefold() in _TRUE_ENV_VALUES:
+            return True
+    return False
 
 
 def _read_required_positive_int_env(var_name: str) -> int:
@@ -634,13 +648,15 @@ class Query(Generic[ModelType]):
         pairs_subset_meta = getattr(self._state, "pairs_subset", None)
         
         model_name = getattr(self._state.model_class, "__name__", str(self._state.model_class))
-        logger.info(
-            "kuzu.query.iter.open rel=%s page_size=%s prefetch_pages=%s pairs_subset=%s",
-            model_name,
-            int(page_size),
-            int(prefetch_pages),
-            pairs_subset_meta,
-        )
+        log_query_timing = query_timing_log_enabled(self._session)
+        if log_query_timing:
+            logger.info(
+                "kuzu.query.iter.open rel=%s page_size=%s prefetch_pages=%s pairs_subset=%s",
+                model_name,
+                int(page_size),
+                int(prefetch_pages),
+                pairs_subset_meta,
+            )
 
         # Check if parallel execution is available and beneficial
         pool_size = _read_required_positive_int_env(_ENV_ATP_READONLY_POOL_MAX_SIZE)
@@ -655,7 +671,7 @@ class Query(Generic[ModelType]):
             mapped = q._map_results(raw)
             t2 = time.perf_counter()
 
-            if getattr(self._session, "_debug_timing", False) or ((t2 - t0) >= 0.25):
+            if log_query_timing:
                 raw_rows = len(raw) if isinstance(raw, list) else None
                 mapped_rows = len(mapped) if isinstance(mapped, list) else None
                 logger.info(
@@ -685,7 +701,7 @@ class Query(Generic[ModelType]):
             has_more = len(mapped) > ps
             page_data = mapped[:ps] if has_more else mapped
 
-            if getattr(self._session, "_debug_timing", False) or ((t2 - t0) >= 0.25):
+            if log_query_timing:
                 raw_rows = len(raw) if isinstance(raw, list) else None
                 mapped_rows = len(page_data) if isinstance(page_data, list) else None
                 logger.info(
@@ -730,7 +746,7 @@ class Query(Generic[ModelType]):
                 m0 = time.perf_counter()
                 mapped = q._map_results(raw)
                 m1 = time.perf_counter()
-                if getattr(self._session, "_debug_timing", False) or ((m1 - m0) >= 0.25):
+                if log_query_timing:
                     raw_rows = len(raw) if isinstance(raw, list) else None
                     mapped_rows = len(mapped) if isinstance(mapped, list) else None
                     logger.info(
@@ -1187,7 +1203,7 @@ class Query(Generic[ModelType]):
                 mapped.append(instance)
 
             t_map_end = time.perf_counter()
-            if getattr(self._session, "_debug_timing", False) or ((t_map_end - t_map_start) >= 0.25):
+            if query_timing_log_enabled(self._session):
                 logger.info(
                     "kuzu.query.map_results rel=%s rows=%d endpoints_unique=%d cache_hits=%d cache_misses=%d seconds=%.6f",
                     result_model_class.__name__,
