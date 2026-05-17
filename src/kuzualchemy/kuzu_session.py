@@ -22,7 +22,7 @@ import os
 import time
 # datetime/date imports removed - ATP returns properly typed Python objects
 
-from .kuzu_query import Query
+from .kuzu_query import Query, query_timing_log_enabled
 from .constants import (
     ErrorMessages,
     KuzuDataType,
@@ -224,7 +224,7 @@ class KuzuSession:
         result = self._conn.execute(query, parameters)
         dt = time.perf_counter() - t0
 
-        if self._debug_timing or dt >= 0.25:
+        if query_timing_log_enabled(self):
             rows = len(result) if isinstance(result, list) else None
             logger.info(
                 "kuzu.session.exec_raw_for_query rows=%s seconds=%.6f",
