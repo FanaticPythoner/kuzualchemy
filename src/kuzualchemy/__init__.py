@@ -1,18 +1,7 @@
 # SPDX-FileCopyrightText: 2025 FanaticPythoner
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-KuzuAlchemy - A SQLAlchemy-like ORM for Kuzu graph database.
-
-This package provides a comprehensive ORM for Kuzu graph database with:
-- SQLAlchemy-like query interface
-- Pydantic-based model definitions
-- Relationship management
-- Session and transaction support
-- Type-safe field definitions
-
-Note: This software is currently in alpha development. APIs may change.
-"""
+"""Expose KuzuAlchemy ORM metadata, AST, session, and materialization APIs."""
 
 from __future__ import annotations
 

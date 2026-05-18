@@ -150,6 +150,7 @@ def test_bulk_relationship_nonnull_nil_uuid_is_rejected(tmp_path: Path) -> None:
         nullable_uuid=None,
         strict_uuid=uuid.UUID(int=0),
     )
+    session.bulk_insert_immediate([parent, child])
 
     with pytest.raises(ValueError, match="strict_uuid"):
-        session._build_rel_rows_fixed([relationship], has_auto_increment=False)
+        session.bulk_insert_immediate([relationship])

@@ -169,8 +169,7 @@ class Query(Generic[ModelType]):
     def all(self) -> list[Any]:
         return list(self.iter())
     def first(self) -> Any | None:
-        rows = self.limit(1).all()
-        return rows[0] if rows else None
+        return (rows[0] if (rows := self.limit(1).all()) else None)
     def one(self) -> Any:
         rows = self.limit(2).all()
         if len(rows) != 1:
@@ -181,10 +180,8 @@ class Query(Generic[ModelType]):
         if len(rows) > 1:
             raise ValueError(f"Expected one or no results, got {len(rows)}")
         return rows[0] if rows else None
-    def exists(self) -> bool:
-        return self.limit(1).first() is not None
-    def count_results(self) -> int:
-        return len(self.all())
+    def exists(self) -> bool: return self.limit(1).first() is not None
+    def count_results(self) -> int: return len(self.all())
     def _materialize(self, rows: list[dict[str, Any]]) -> list[Any]:
         if self._state.return_raw or self._state.select_fields or self._state.aggregations:
             return rows
@@ -199,12 +196,24 @@ class Query(Generic[ModelType]):
                 raise TypeError("ORM materialization requires a dictionary payload")
             if hasattr(model_class, "__kuzu_rel_name__"):
                 payload = dict(payload)
-                payload["from_node"] = row.get("from_node")
-                payload["to_node"] = row.get("to_node")
-            values.append(model_class(**payload))
+                payload["from_node"] = _materialize_node_endpoint(row.get("from_node"))
+                payload["to_node"] = _materialize_node_endpoint(row.get("to_node"))
+            values.append(model_class(**_model_payload(model_class, payload)))
         return values
-    def __iter__(self) -> Iterator[Any]:
-        return self.iter()
+    def __iter__(self) -> Iterator[Any]: return self.iter()
     def __repr__(self) -> str:
         query, _ = self.to_cypher()
         return f"Query({self._state.model_class.__name__}, {query!r})"
+def _model_payload(model_class: Type[Any], payload: dict[str, Any]) -> dict[str, Any]:
+    fields = getattr(model_class, "model_fields", None)
+    if isinstance(fields, dict):
+        return {key: value for key, value in payload.items() if key in fields}
+    raise TypeError(f"{model_class.__name__} has no Pydantic field map")
+def _materialize_node_endpoint(value: Any) -> Any:
+    if not isinstance(value, dict): return value
+    label = value.get("_label")
+    if not isinstance(label, str) or not label: raise TypeError("relationship endpoint payload missing _label")
+    from .kuzu_orm import get_node_by_name
+    model_class = get_node_by_name(label)
+    if model_class is None: raise TypeError(f"relationship endpoint label is not registered: {label}")
+    return model_class(**_model_payload(model_class, value))

@@ -36,11 +36,13 @@ class User(KuzuBaseModel):
 from kuzualchemy import KuzuSession, get_all_ddl
 
 session = KuzuSession(db_path="graph.db")
-session._conn.schema_apply(get_all_ddl().split(";"))
+session.connection.schema_apply(get_all_ddl().split(";"))
 session.bulk_insert_immediate([User(id=1, name="Ada")])
 rows = session.execute("MATCH (u:User) RETURN u.id AS id")
 session.close()
 ```
+
+`get_all_ddl()` emits model metadata DDL. ATP normalizes Kuzu identifiers and executes the schema work through the typed native boundary.
 
 ## Queries
 
@@ -64,8 +66,8 @@ Node and relationship routing metadata is extracted from decorators and sent to 
 ## Checkpoint And Integrity
 
 ```python
-session._conn.checkpoint()
-report = session._conn.snapshot_integrity()
+session.connection.checkpoint()
+report = session.connection.snapshot_integrity()
 ```
 
 The checkpoint call is an ATP barrier ticket. Integrity checks return typed count fields and raise on invalid result shapes.

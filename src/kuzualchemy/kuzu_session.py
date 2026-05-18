@@ -5,6 +5,7 @@ from typing import Any, Iterator, Type, TypeVar
 from atp_pipeline import DbBulkAction
 from .kuzu_connection import KuzuConnection
 from .kuzu_orm import KuzuRelationshipBase, get_node_by_name
+from .uuid_normalization import normalize_uuid_value_for_kuzu_write
 ModelType = TypeVar("ModelType")
 class KuzuSession:
     """Collect ORM objects and submit typed DB work to ATP."""
@@ -36,6 +37,9 @@ class KuzuSession:
         self._identity_map: dict[str, Any] = {}
     def get_db_path(self) -> str:
         return str(self._conn.db_path)
+    @property
+    def connection(self) -> KuzuConnection:
+        return self._conn
     def query(self, model_class: Type[ModelType], alias: str = "n"):
         from .kuzu_query import Query
         return Query(model_class, session=self, alias=alias)
@@ -57,8 +61,6 @@ class KuzuSession:
     def _execute_many_for_query_object(self, queries: list[tuple[str, dict[str, Any]]]) -> list[list[dict[str, Any]]]:
         self._flush_for_read()
         return self._conn.execute_many(queries)
-    def schema_apply(self, statements: list[str]) -> None:
-        self._conn.schema_apply(statements)
     def iterate(
         self,
         query: str,
@@ -104,6 +106,8 @@ class KuzuSession:
         self._write_instances(DbBulkAction.CREATE, instances)
     def bulk_update_nodes(self, model_class: Type[Any], rows: list[dict[str, Any]]) -> None:
         self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), rows, _primary_key_fields(model_class))
+        # normalized = [_normalize_write_row(model_class, row) for row in rows]
+        # self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), normalized, _primary_key_fields(model_class))
     def bulk_delete_nodes(self, model_class: Type[Any], pks: list[Any]) -> None:
         key_fields = _primary_key_fields(model_class)
         self._conn.bulk_write_nodes(DbBulkAction.DELETE, _node_label(model_class), [_pk_row(key_fields, pk) for pk in pks], key_fields)
@@ -188,6 +192,7 @@ def _primary_key_fields(model_class: type[Any]) -> list[str]:
     return fields
 def _node_row(instance: Any) -> dict[str, Any]:
     return dict(instance.model_dump(mode="python"))
+    # return _normalize_write_row(type(instance), dict(instance.model_dump(mode="python")))
 def _node_delete_row(instance: Any) -> dict[str, Any]:
     return {field: getattr(instance, field) for field in _primary_key_fields(type(instance))}
 def _pk_row(fields: list[str], value: Any) -> dict[str, Any]:
@@ -198,10 +203,16 @@ def _pk_row(fields: list[str], value: Any) -> dict[str, Any]:
     return {field: value[index] for index, field in enumerate(fields)}
 def _relationship_row(instance: Any) -> dict[str, Any]:
     row = dict(instance.model_dump(mode="python", exclude={"from_node", "to_node"}))
+    # row = _normalize_write_row(type(instance), dict(instance.model_dump(mode="python", exclude={"from_node", "to_node"})))
     source = _endpoint(instance.from_node, type(instance), "from")
     target = _endpoint(instance.to_node, type(instance), "to")
     row.update({"from_label": source[0], "to_label": target[0], "from_pk_field": source[1], "to_pk_field": target[1], "from_pk": source[2], "to_pk": target[2]})
     return row
+# def _normalize_write_row(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
+#     return {
+#         field: normalize_uuid_value_for_kuzu_write(model_class=model_class, field_name=field, value=value)
+#         for field, value in row.items()
+#     }
 def _endpoint(value: Any, rel_cls: type[Any], side: str) -> tuple[str, str, Any]:
     if hasattr(type(value), "__kuzu_node_name__"):
         cls = type(value)
