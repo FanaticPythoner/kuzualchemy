@@ -52,13 +52,32 @@ class _CaptureATP:
 
 class _CaptureConnection:
     def __init__(self, atp: _CaptureATP) -> None:
-        self._atp = atp
+        self.atp = atp
+
+    def create_nodes_spec(
+        self,
+        label: str,
+        rows: list[dict[str, Any]],
+        return_rows: bool,
+        pk_fields: list[str],
+    ) -> OperationSpec:
+        return self.atp.create_nodes_spec(
+            label,
+            rows,
+            return_rows=return_rows,
+            pk_fields=pk_fields,
+        )
+
+    def submit_specs(self, specs: list[OperationSpec]) -> list[dict[str, Any]]:
+        return self.atp.submit_specs(specs)
+
+    def extract_post_cypher_rows(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.atp._extract_post_cypher_rows(result)
 
 
 def _session_for_capture(atp: _CaptureATP) -> KuzuSession:
     session = KuzuSession.__new__(KuzuSession)
     session._conn = _CaptureConnection(atp)
-    session._disable_bulk_pipeline = False
     session.bulk_batch_size = 1000
     session.bulk_batch_size_max = 1000
     session._metadata_cache = OrderedDict()

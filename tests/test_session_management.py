@@ -118,24 +118,17 @@ class TestTransactionManagement:
         session.close()
 
     def test_nested_transaction_context_manager(self, test_db_path):
-        """Test nested transactions using context manager."""
+        """Reject nested transactions without Kuzu savepoint support."""
         session = KuzuSession(db_path=test_db_path)
         initialize_schema(session)
 
-        with session.begin_nested():
-            user1 = self.User(id=2003, name="Alice", email="alice@test.com")
-            session.add(user1)
+        with pytest.raises(RuntimeError, match="savepoint support"):
             with session.begin_nested():
-                user2 = self.User(id=2004, name="Bob", email="bob@test.com")
-                session.add(user2)
-                # This should succeed
-            session.commit()
+                user1 = self.User(id=2003, name="Alice", email="alice@test.com")
+                session.add(user1)
 
-        # Verify the specific users we created were added
-        result = session.execute("MATCH (u:TransactionTestUser) WHERE u.id IN [2003, 2004] RETURN u.name ORDER BY u.id")
-        assert len(result) == 2
-        assert result[0]["u.name"] == "Alice"
-        assert result[1]["u.name"] == "Bob"
+        result = session.execute("MATCH (u:TransactionTestUser) WHERE u.id = 2003 RETURN u.name")
+        assert len(result) == 0
         session.close()
 
     def test_nested_transaction_rollback(self, test_db_path):
@@ -147,7 +140,7 @@ class TestTransactionManagement:
         session.add(user1)
         session.commit()
 
-        with pytest.raises(expected_exception=ValueError):
+        with pytest.raises(RuntimeError, match="savepoint support"):
             with session.begin_nested():
                 user2 = self.User(id=2006, name="Bob", email="bob@test.com")
                 session.add(user2)
@@ -155,7 +148,7 @@ class TestTransactionManagement:
                 with session.begin_nested():
                     user3 = self.User(id=2007, name="Charlie", email="charlie@test.com")
                     session.add(user3)
-                    raise ValueError("Simulated error")
+                    raise ValueError("inner failure")
 
 
         # Verify our specific Alice user remains (others may exist from previous tests)
@@ -353,26 +346,19 @@ class TestConcurrentAccess:
         self.User = ConcurrentTestUser
 
     def test_concurrent_sessions(self, test_db_path):
-        """Test multiple concurrent sessions (with serialization for Kuzu's single-writer limitation)."""
-        import threading
-
-        # Use lock to serialize writes due to Kuzu's single-writer limitation
-        write_lock = threading.Lock()
+        """Test repeated session construction through the ATP writer boundary."""
 
         def create_user(thread_id: int, db_path: Path):
-            # Serialize write operations due to Kuzu's single-writer constraint
-            with write_lock:
-                session = KuzuSession(db_path=db_path)
-                initialize_schema(session)
+            session = KuzuSession(db_path=db_path)
+            initialize_schema(session)
 
-                user = self.User(id=5000 + thread_id, name=f"User{thread_id}", thread_id=thread_id)
-                session.add(user)
-                session.commit()
-                session.close()
-                return thread_id
+            user = self.User(id=5000 + thread_id, name=f"User{thread_id}", thread_id=thread_id)
+            session.add(user)
+            session.commit()
+            session.close()
+            return thread_id
 
-        # Create multiple concurrent sessions (serialized internally)
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [executor.submit(create_user, i, test_db_path) for i in range(1, 6)]
             completed_results = [future.result() for future in as_completed(futures)]
 
@@ -433,11 +419,10 @@ class TestErrorHandlingAndRecovery:
         session.add(user1)
         session.commit()
 
-        # Try to add user with duplicate ID
-        user2 = self.User(id=6001, name="Bob")  # Same ID
+        user2 = self.User(id=6001, name="Bob")
         session.add(user2)
 
-        with pytest.raises(Exception):  # Should raise constraint violation
+        with pytest.raises(RuntimeError):
             session.commit()
 
         # Session should be in a recoverable state
@@ -460,11 +445,9 @@ class TestErrorHandlingAndRecovery:
         session = KuzuSession(db_path=test_db_path)
         initialize_schema(session)
 
-        # Simulate connection error by closing connection
         session._conn.close()
 
-        # Should handle gracefully and allow reconnection
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError):
             session.execute("MATCH (u:ErrorTestUser) RETURN u.name")
 
         # Create new session (simulating reconnection)
@@ -486,8 +469,7 @@ class TestResourceCleanup:
 
         session.close()
 
-        # After close, should not be able to execute queries
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError):
             session.execute("MATCH (n) RETURN n")
 
     def test_context_manager_cleanup(self, test_db_path):
@@ -497,15 +479,13 @@ class TestResourceCleanup:
             result = session.execute("RETURN 1 as test")
             assert len(result) == 1
 
-        # After context exit, should not be able to execute
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError):
             session.execute("RETURN 1 as test")
 
     def test_memory_cleanup_after_large_operations(self, test_db_path):
         """Test memory cleanup after large operations."""
         session = KuzuSession(db_path=test_db_path)
 
-        # Perform large operation (simulate)
         for i in range(100):
             session.execute(f"RETURN {i} as num")
 

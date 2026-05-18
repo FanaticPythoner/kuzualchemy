@@ -54,7 +54,7 @@ class TestConnectionReuseExceptionHandling:
     def test_runtime_error_propagates_under_atp(self, test_db_path):
         """RuntimeError in underlying execution should propagate under ATP (write path)."""
         session = KuzuSession(db_path=test_db_path)
-        session._conn._atp.run_cypher = Mock(side_effect=RuntimeError("Database runtime error"))
+        session._conn.execute = Mock(side_effect=RuntimeError("Database runtime error"))
         with pytest.raises(RuntimeError, match="Database runtime error"):
             session._execute_with_connection_reuse("CREATE (n:Test)")
     

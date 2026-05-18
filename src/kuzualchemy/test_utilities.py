@@ -100,7 +100,7 @@ class DDLExecutor:
         
         # @@ STEP: Execute statement with specific error handling
         try:
-            self.session.execute(statement)
+            self.session.schema_apply([statement])
             
             # || S.1: Track successful execution
             if entity_type == SessionOperationConstants.NODE_ENTITY:
@@ -199,7 +199,7 @@ def execute_ddl_safe(session: KuzuSession, statement: str, ignore_exists: bool =
     :raises RuntimeError: For non-idempotent errors
     """
     try:
-        session.execute(statement)
+        session.schema_apply([statement])
         return True
     except RuntimeError as e:
         if SessionOperationConstants.ALREADY_EXISTS_PATTERN in str(e):

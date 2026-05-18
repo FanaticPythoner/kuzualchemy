@@ -343,7 +343,7 @@ class ErrorMessages:
 
     # @@ STEP 8: Define generic errors
     INVALID_ARGUMENT: Final[str] = "Invalid argument: {argument}"
-    NOT_IMPLEMENTED: Final[str] = "Feature not implemented: {feature}"
+    UNSUPPORTED_FEATURE: Final[str] = "Unsupported feature: {feature}"
     INTERNAL_ERROR: Final[str] = "Internal error: {error}"
 
 # ============================================================================

@@ -359,8 +359,8 @@ from .kuzu_query_expressions import (
 # Session management
 from .kuzu_session import (
     KuzuSession,
-    KuzuConnection,
 )
+from .kuzu_connection import KuzuConnection
 
 # Package metadata - dynamically retrieved from package metadata (PEP 621 compliant)
 __version__ = _resolve_package_version()
