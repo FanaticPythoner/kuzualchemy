@@ -4,8 +4,19 @@ from pathlib import Path
 from typing import Any, Iterator, Type, TypeVar
 from atp_pipeline import DbBulkAction
 from .kuzu_connection import KuzuConnection
-from .kuzu_orm import KuzuRelationshipBase, get_node_by_name
-from .uuid_normalization import normalize_uuid_value_for_kuzu_write
+from .kuzu_orm import KuzuRelationshipBase
+from .kuzu_relationship_read import relationship_read_direction, relationship_read_name, relationship_read_pairs
+from .kuzu_session_rows import (
+    RelationshipRoute,
+    _node_delete_row,
+    _node_label,
+    _node_row,
+    _pk_row,
+    _primary_key_fields,
+    _relationship_route,
+    _relationship_row,
+    _relationship_update_row,
+)
 ModelType = TypeVar("ModelType")
 class KuzuSession:
     """Collect ORM objects and submit typed DB work to ATP."""
@@ -58,6 +69,20 @@ class KuzuSession:
     def _execute_for_query_object(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self._flush_for_read()
         return self._conn.execute(query, parameters or {})
+    def _execute_relationship_read_for_query_object(
+        self,
+        relationship_class: Type[Any],
+        alias: str,
+        pairs_subset: list[int] | None,
+    ) -> list[dict[str, Any]]:
+        self._flush_for_read()
+        return self._conn.read_relationships(
+            relationship=relationship_read_name(relationship_class),
+            alias=alias,
+            direction=relationship_read_direction(relationship_class),
+            pairs=relationship_read_pairs(relationship_class),
+            pairs_subset=list(pairs_subset or []),
+        )
     def _execute_many_for_query_object(self, queries: list[tuple[str, dict[str, Any]]]) -> list[list[dict[str, Any]]]:
         self._flush_for_read()
         return self._conn.execute_many(queries)
@@ -106,15 +131,27 @@ class KuzuSession:
         self._write_instances(DbBulkAction.CREATE, instances)
     def bulk_update_nodes(self, model_class: Type[Any], rows: list[dict[str, Any]]) -> None:
         self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), rows, _primary_key_fields(model_class))
-        # normalized = [_normalize_write_row(model_class, row) for row in rows]
-        # self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), normalized, _primary_key_fields(model_class))
     def bulk_delete_nodes(self, model_class: Type[Any], pks: list[Any]) -> None:
         key_fields = _primary_key_fields(model_class)
         self._conn.bulk_write_nodes(DbBulkAction.DELETE, _node_label(model_class), [_pk_row(key_fields, pk) for pk in pks], key_fields)
-    def bulk_update_relationships(self, *, rel_type: str, from_label: str, to_label: str, rows: list[dict[str, Any]], from_key_fields: list[str], to_key_fields: list[str]) -> None:
-        self._conn.bulk_write_relationships(DbBulkAction.UPDATE, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
-    def bulk_delete_relationships(self, *, rel_type: str, from_label: str, to_label: str, rows: list[dict[str, Any]], from_key_fields: list[str], to_key_fields: list[str]) -> None:
-        self._conn.bulk_write_relationships(DbBulkAction.DELETE, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
+    def bulk_update_relationships(self, instances: list[Any], fields: list[str]) -> None:
+        rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
+        for instance in instances:
+            cls = type(instance)
+            if not hasattr(cls, "__kuzu_rel_name__"):
+                raise TypeError(f"{cls.__name__} is not a registered Kuzu relationship")
+            row = _relationship_update_row(instance, fields)
+            rels.setdefault(_relationship_route(cls, row), []).append(row)
+        for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items():
+            self._conn.bulk_write_relationships(
+                DbBulkAction.UPDATE,
+                rel_type,
+                from_label,
+                to_label,
+                rows,
+                [from_key],
+                [to_key],
+            )
     def flush(self) -> None:
         self._write_instances(DbBulkAction.CREATE, self._new)
         self._write_instances(DbBulkAction.UPDATE, self._dirty)
@@ -159,7 +196,7 @@ class KuzuSession:
         return f"{cls.__module__}.{cls.__qualname__}:{values!r}"
     def _write_instances(self, action: DbBulkAction, instances: list[Any]) -> None:
         nodes: dict[type[Any], list[dict[str, Any]]] = {}
-        rels: dict[str, list[dict[str, Any]]] = {}
+        rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
         for instance in instances:
             cls = type(instance)
             if hasattr(cls, "__kuzu_node_name__"):
@@ -170,59 +207,11 @@ class KuzuSession:
                 else:
                     self._remember(instance)
             elif hasattr(cls, "__kuzu_rel_name__"):
-                rels.setdefault(cls.__kuzu_rel_name__, []).append(_relationship_row(instance))
+                row = _relationship_row(instance)
+                rels.setdefault(_relationship_route(cls, row), []).append(row)
             else:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu model")
         for cls, rows in nodes.items():
             self._conn.bulk_write_nodes(action, _node_label(cls), rows, _primary_key_fields(cls))
-        for rel_type, rows in rels.items():
-            self._conn.bulk_write_relationships(action, rel_type, "*", "*", rows, ["*"], ["*"])
-def _node_label(model_class: type[Any]) -> str:
-    label = getattr(model_class, "__kuzu_node_name__", None)
-    if not isinstance(label, str) or not label:
-        raise ValueError(f"{model_class.__name__} is not a registered Kuzu node")
-    return label
-def _primary_key_fields(model_class: type[Any]) -> list[str]:
-    getter = getattr(model_class, "get_primary_key_fields", None)
-    if not callable(getter):
-        raise ValueError(f"{model_class.__name__} has no primary key metadata")
-    fields = getter()
-    if not isinstance(fields, list) or not fields:
-        raise ValueError(f"{model_class.__name__} primary key metadata is empty")
-    return fields
-def _node_row(instance: Any) -> dict[str, Any]:
-    return dict(instance.model_dump(mode="python"))
-    # return _normalize_write_row(type(instance), dict(instance.model_dump(mode="python")))
-def _node_delete_row(instance: Any) -> dict[str, Any]:
-    return {field: getattr(instance, field) for field in _primary_key_fields(type(instance))}
-def _pk_row(fields: list[str], value: Any) -> dict[str, Any]:
-    if len(fields) == 1:
-        return {fields[0]: value[0] if isinstance(value, tuple) else value}
-    if not isinstance(value, tuple) or len(value) != len(fields):
-        raise ValueError("composite primary key value must match primary key field count")
-    return {field: value[index] for index, field in enumerate(fields)}
-def _relationship_row(instance: Any) -> dict[str, Any]:
-    row = dict(instance.model_dump(mode="python", exclude={"from_node", "to_node"}))
-    # row = _normalize_write_row(type(instance), dict(instance.model_dump(mode="python", exclude={"from_node", "to_node"})))
-    source = _endpoint(instance.from_node, type(instance), "from")
-    target = _endpoint(instance.to_node, type(instance), "to")
-    row.update({"from_label": source[0], "to_label": target[0], "from_pk_field": source[1], "to_pk_field": target[1], "from_pk": source[2], "to_pk": target[2]})
-    return row
-# def _normalize_write_row(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
-#     return {
-#         field: normalize_uuid_value_for_kuzu_write(model_class=model_class, field_name=field, value=value)
-#         for field, value in row.items()
-#     }
-def _endpoint(value: Any, rel_cls: type[Any], side: str) -> tuple[str, str, Any]:
-    if hasattr(type(value), "__kuzu_node_name__"):
-        cls = type(value)
-        field = _primary_key_fields(cls)[0]
-        return _node_label(cls), field, getattr(value, field)
-    pairs = getattr(rel_cls, "__kuzu_relationship_pairs__", [])
-    if len(pairs) != 1:
-        raise ValueError(f"{rel_cls.__name__} raw {side} endpoint requires one relationship pair")
-    label = pairs[0].get_from_name() if side == "from" else pairs[0].get_to_name()
-    node_cls = get_node_by_name(label)
-    if node_cls is None:
-        raise ValueError(f"{rel_cls.__name__} endpoint label is not registered: {label}")
-    return label, _primary_key_fields(node_cls)[0], value
+        for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items():
+            self._conn.bulk_write_relationships(action, rel_type, from_label, to_label, rows, [from_key], [to_key])

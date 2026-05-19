@@ -13,6 +13,7 @@ from atp_pipeline import (
     OpPriority,
 )
 from .constants import ErrorMessages
+from .kuzu_relationship_read import relationship_read_work
 class KuzuConnection:
     """Submit Kuzu work through the native ATP handler."""
     def __init__(self, db_path: str | Path) -> None:
@@ -35,9 +36,7 @@ class KuzuConnection:
             DbWorkSpec(DbWorkKind.SCHEMA_APPLY, statements=[_statement(query, parameters or {})]),
             expect_rows=False,
         )
-    def execute_many(
-        self, queries: Iterable[tuple[str, dict[str, Any]]]
-    ) -> list[list[dict[str, Any]]]:
+    def execute_many(self, queries: Iterable[tuple[str, dict[str, Any]]]) -> list[list[dict[str, Any]]]:
         statements = [_statement(query, params) for query, params in queries]
         if not statements:
             return []
@@ -45,11 +44,10 @@ class KuzuConnection:
             DbWorkSpec(DbWorkKind.QUERY_READ, statements=statements),
             expect_rows=True,
         )
-        return _tables(result)
-    def read_many(
-        self, queries: Iterable[tuple[str, dict[str, Any]]]
-    ) -> list[list[dict[str, Any]]]:
-        return self.execute_many(queries)
+        tables = _tables(result)
+        if len(tables) != len(statements):
+            raise RuntimeError("native DB result table count must match statement count")
+        return tables
     def write_many(self, queries: Iterable[tuple[str, dict[str, Any]]]) -> None:
         statements = [_statement(query, params) for query, params in queries]
         if statements:
@@ -57,10 +55,26 @@ class KuzuConnection:
                 DbWorkSpec(DbWorkKind.SCHEMA_APPLY, statements=statements),
                 expect_rows=False,
             )
-    def query_read(
-        self, statements: Iterable[tuple[str, dict[str, Any]]]
-    ) -> list[list[dict[str, Any]]]:
-        return self.execute_many(statements)
+    def read_relationships(
+        self,
+        *,
+        relationship: str,
+        alias: str,
+        direction: str,
+        pairs: list[dict[str, str]],
+        pairs_subset: list[int],
+    ) -> list[dict[str, Any]]:
+        result = self._submit_work(
+            relationship_read_work(
+                relationship=relationship,
+                alias=alias,
+                direction=direction,
+                pairs=pairs,
+                pairs_subset=pairs_subset,
+            ),
+            expect_rows=True,
+        )
+        return _first_table(result)
     def schema_apply(self, statements: Iterable[str]) -> None:
         payload = [_statement(statement, {}) for statement in statements if statement.strip()]
         if payload:
@@ -93,24 +107,6 @@ class KuzuConnection:
         }
     def checkpoint(self) -> None:
         self._open_handler().checkpoint_barrier()
-    def checkpoint_barrier(self) -> None:
-        self.checkpoint()
-    def bulk_create_nodes(
-        self,
-        label: str,
-        rows: list[dict[str, Any]],
-        *,
-        return_rows: bool = False,
-        pk_fields: list[str] | None = None,
-    ) -> list[dict[str, Any]] | None:
-        result = self._submit_work(
-            DbWorkSpec(
-                DbWorkKind.NODE_BULK_WRITE,
-                node_bulk=DbBulkEntity(DbBulkAction.CREATE, label, rows, pk_fields or []),
-            ),
-            expect_rows=return_rows,
-        )
-        return _first_table(result) if return_rows else None
     def bulk_write_nodes(
         self,
         action: DbBulkAction,
@@ -123,33 +119,6 @@ class KuzuConnection:
             node_bulk=DbBulkEntity(action, label, rows, key_fields),
         )
         self._submit_work(work, expect_rows=False)
-    def bulk_create_relationships(
-        self,
-        *,
-        rel_name: str,
-        src_label: str,
-        dst_label: str,
-        rows: list[dict[str, Any]],
-        src_pk_field: str,
-        dst_pk_field: str,
-        return_rows: bool,
-    ) -> list[dict[str, Any]] | None:
-        result = self._submit_work(
-            DbWorkSpec(
-                DbWorkKind.RELATIONSHIP_BULK_WRITE,
-                relationship_bulk=DbBulkRelationship(
-                    DbBulkAction.CREATE,
-                    rel_name,
-                    src_label,
-                    dst_label,
-                    rows,
-                    [src_pk_field],
-                    [dst_pk_field],
-                ),
-            ),
-            expect_rows=return_rows,
-        )
-        return _first_table(result) if return_rows else None
     def bulk_write_relationships(
         self,
         action: DbBulkAction,
@@ -202,14 +171,19 @@ def _tables(result: Any) -> list[list[dict[str, Any]]]:
         raise RuntimeError("native DB result must be a dictionary")
     tables = result.get("cypher_results")
     if not isinstance(tables, list):
-        return []
+        raise RuntimeError("native DB result missing cypher_results table list")
     for table in tables:
         if not isinstance(table, list):
             raise RuntimeError("native DB result table must be a list")
+        for row in table:
+            if not isinstance(row, dict):
+                raise RuntimeError("native DB result row must be a dictionary")
     return tables
 def _first_table(result: Any) -> list[dict[str, Any]]:
     tables = _tables(result)
-    return tables[0] if tables else []
+    if not tables:
+        raise RuntimeError("native DB result missing first table")
+    return tables[0]
 def _count_table(rows: Any, name: str) -> int:
     if not isinstance(rows, list) or not rows:
         raise RuntimeError(f"{name} missing count row")

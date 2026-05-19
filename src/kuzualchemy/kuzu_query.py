@@ -4,6 +4,7 @@ from .constants import ValidationMessageConstants
 from .kuzu_query_builder import CypherQueryBuilder, JoinClause, QueryState
 from .kuzu_query_expressions import AggregateFunction, FilterExpression, JoinType, OrderDirection
 from .kuzu_query_fields import ModelFieldAccessor, QueryField
+from .kuzu_relationship_read import can_use_native_relationship_read, materialize_endpoint_node
 if TYPE_CHECKING:
     from .kuzu_session import KuzuSession
 ModelType = TypeVar("ModelType")
@@ -162,6 +163,13 @@ class Query(Generic[ModelType]):
     def _execute(self) -> list[Any]:
         if self._session is None:
             raise RuntimeError("query execution requires a session")
+        if can_use_native_relationship_read(self._state):
+            rows = self._session._execute_relationship_read_for_query_object(
+                self._state.model_class,
+                self._state.alias,
+                self._state.pairs_subset,
+            )
+            return self._materialize(rows)
         query, params = self.to_cypher()
         return self._materialize(self._session._execute_for_query_object(query, params))
     def iter(self, page_size: int | None = None, prefetch_pages: int = 1) -> Iterator[Any]:
@@ -196,8 +204,8 @@ class Query(Generic[ModelType]):
                 raise TypeError("ORM materialization requires a dictionary payload")
             if hasattr(model_class, "__kuzu_rel_name__"):
                 payload = dict(payload)
-                payload["from_node"] = _materialize_node_endpoint(row.get("from_node"))
-                payload["to_node"] = _materialize_node_endpoint(row.get("to_node"))
+                payload["from_node"] = materialize_endpoint_node(row.get("from_node"))
+                payload["to_node"] = materialize_endpoint_node(row.get("to_node"))
             values.append(model_class(**_model_payload(model_class, payload)))
         return values
     def __iter__(self) -> Iterator[Any]: return self.iter()
@@ -209,11 +217,3 @@ def _model_payload(model_class: Type[Any], payload: dict[str, Any]) -> dict[str,
     if isinstance(fields, dict):
         return {key: value for key, value in payload.items() if key in fields}
     raise TypeError(f"{model_class.__name__} has no Pydantic field map")
-def _materialize_node_endpoint(value: Any) -> Any:
-    if not isinstance(value, dict): return value
-    label = value.get("_label")
-    if not isinstance(label, str) or not label: raise TypeError("relationship endpoint payload missing _label")
-    from .kuzu_orm import get_node_by_name
-    model_class = get_node_by_name(label)
-    if model_class is None: raise TypeError(f"relationship endpoint label is not registered: {label}")
-    return model_class(**_model_payload(model_class, value))

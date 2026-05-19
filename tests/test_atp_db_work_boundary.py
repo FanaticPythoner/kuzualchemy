@@ -99,19 +99,15 @@ def test_atp_db_work_updates_relationships(tmp_path: Path) -> None:
         )
 
         session.bulk_update_relationships(
-            rel_type="BoundaryAuthored",
-            from_label="BoundaryAuthor",
-            to_label="BoundaryPost",
-            rows=[
-                {
-                    "from_pk": author.id,
-                    "to_pk": post.id,
-                    "rank": 9,
-                    "marker": None,
-                }
+            [
+                BoundaryAuthored.create_between(
+                    author.id,
+                    post.id,
+                    rank=9,
+                    marker=None,
+                )
             ],
-            from_key_fields=["id"],
-            to_key_fields=["id"],
+            ["rank", "marker"],
         )
 
         rows = session.execute(
@@ -121,19 +117,46 @@ def test_atp_db_work_updates_relationships(tmp_path: Path) -> None:
 
         assert rows == [{"rank": 9, "marker": None}]
 
-        session.bulk_delete_relationships(
-            rel_type="BoundaryAuthored",
-            from_label="BoundaryAuthor",
-            to_label="BoundaryPost",
-            rows=[{"from_pk": author.id, "to_pk": post.id}],
-            from_key_fields=["id"],
-            to_key_fields=["id"],
+        session.delete(
+            BoundaryAuthored.create_between(
+                author.id,
+                post.id,
+                rank=9,
+                marker=None,
+            )
         )
+        session.flush()
 
         rows_after_delete = session.execute(
             "MATCH (:BoundaryAuthor)-[r:BoundaryAuthored]->(:BoundaryPost) RETURN count(r) AS count"
         )
 
         assert rows_after_delete == [{"count": 0}]
+    finally:
+        session.close()
+
+
+def test_atp_relationship_read_uses_native_route_metadata(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    try:
+        author = BoundaryAuthor(id=1, name="alpha", score=1)
+        post = BoundaryPost(id=10, title="first")
+        session.bulk_insert_immediate([author, post])
+        session.bulk_insert_immediate(
+            [
+                BoundaryAuthored.create_between(
+                    author.id,
+                    post.id,
+                    rank=3,
+                    marker="route",
+                )
+            ]
+        )
+
+        rels = session.query(BoundaryAuthored).all()
+
+        assert [(rel.rank, rel.marker, rel.from_node, rel.to_node) for rel in rels] == [
+            (3, "route", 1, 10)
+        ]
     finally:
         session.close()
