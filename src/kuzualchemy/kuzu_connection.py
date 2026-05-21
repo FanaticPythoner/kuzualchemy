@@ -114,11 +114,14 @@ class KuzuConnection:
         rows: list[dict[str, Any]],
         key_fields: list[str],
     ) -> None:
-        work = DbWorkSpec(
-            DbWorkKind.NODE_BULK_WRITE,
-            node_bulk=DbBulkEntity(action, label, rows, key_fields),
-        )
-        self._submit_work(work, expect_rows=False)
+        self.bulk_write_nodes_many([(action, label, rows, key_fields)])
+    def bulk_write_nodes_many(
+        self,
+        batches: Iterable[tuple[DbBulkAction, str, list[dict[str, Any]], list[str]]],
+    ) -> None:
+        works = [_node_bulk_work(action, label, rows, key_fields) for action, label, rows, key_fields in batches if rows]
+        if works:
+            self._submit_many_work(works, expect_rows=False)
     def bulk_write_relationships(
         self,
         action: DbBulkAction,
@@ -129,9 +132,17 @@ class KuzuConnection:
         from_key_fields: list[str],
         to_key_fields: list[str],
     ) -> None:
-        work = DbWorkSpec(
-            DbWorkKind.RELATIONSHIP_BULK_WRITE,
-            relationship_bulk=DbBulkRelationship(
+        self.bulk_write_relationships_many([
+            (action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
+        ])
+    def bulk_write_relationships_many(
+        self,
+        batches: Iterable[
+            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        works = [
+            _relationship_bulk_work(
                 action,
                 rel_type,
                 from_label,
@@ -139,9 +150,39 @@ class KuzuConnection:
                 rows,
                 from_key_fields,
                 to_key_fields,
-            ),
+            )
+            for action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields in batches
+            if rows
+        ]
+        if works:
+            self._submit_many_work(works, expect_rows=False)
+    def bulk_write_nodes_and_relationships_many(
+        self,
+        node_batches: Iterable[tuple[DbBulkAction, str, list[dict[str, Any]], list[str]]],
+        relationship_batches: Iterable[
+            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        works = [
+            _node_bulk_work(action, label, rows, key_fields)
+            for action, label, rows, key_fields in node_batches
+            if rows
+        ]
+        works.extend(
+            _relationship_bulk_work(
+                action,
+                rel_type,
+                from_label,
+                to_label,
+                rows,
+                from_key_fields,
+                to_key_fields,
+            )
+            for action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields in relationship_batches
+            if rows
         )
-        self._submit_work(work, expect_rows=False)
+        if works:
+            self._submit_many_work(works, expect_rows=False)
     def close(self) -> None:
         if self._closed:
             return
@@ -160,12 +201,56 @@ class KuzuConnection:
             expect_rows=expect_rows,
             priority=priority,
         ).result(None)
+    def _submit_many_work(
+        self,
+        works: list[DbWorkSpec],
+        *,
+        expect_rows: bool,
+        priority: OpPriority = OpPriority.NORMAL,
+    ) -> list[Any]:
+        tickets = self._open_handler().submit_many_work(
+            works,
+            expect_rows=expect_rows,
+            priority=priority,
+        )
+        return [ticket.result(None) for ticket in tickets]
 def _statement(query: str, parameters: dict[str, Any]) -> DbStatement:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string")
     if not isinstance(parameters, dict):
         raise TypeError("parameters must be a dict")
     return DbStatement(query, parameters)
+def _node_bulk_work(
+    action: DbBulkAction,
+    label: str,
+    rows: list[dict[str, Any]],
+    key_fields: list[str],
+) -> DbWorkSpec:
+    return DbWorkSpec(
+        DbWorkKind.NODE_BULK_WRITE,
+        node_bulk=DbBulkEntity(action, label, rows, key_fields),
+    )
+def _relationship_bulk_work(
+    action: DbBulkAction,
+    rel_type: str,
+    from_label: str,
+    to_label: str,
+    rows: list[dict[str, Any]],
+    from_key_fields: list[str],
+    to_key_fields: list[str],
+) -> DbWorkSpec:
+    return DbWorkSpec(
+        DbWorkKind.RELATIONSHIP_BULK_WRITE,
+        relationship_bulk=DbBulkRelationship(
+            action,
+            rel_type,
+            from_label,
+            to_label,
+            rows,
+            from_key_fields,
+            to_key_fields,
+        ),
+    )
 def _tables(result: Any) -> list[list[dict[str, Any]]]:
     if not isinstance(result, dict):
         raise RuntimeError("native DB result must be a dictionary")

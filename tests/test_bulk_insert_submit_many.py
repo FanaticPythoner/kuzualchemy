@@ -38,6 +38,7 @@ class _CaptureConnection:
         self.node_writes: list[tuple[str, list[dict[str, Any]], list[str]]] = []
         self.relationship_writes: list[tuple[str, str, str, list[dict[str, Any]], list[str], list[str]]] = []
         self.relationship_reads: list[tuple[str, str, str, list[dict[str, str]], list[int]]] = []
+        self.combined_write_count = 0
 
     def bulk_write_nodes(
         self,
@@ -47,6 +48,13 @@ class _CaptureConnection:
         key_fields: list[str],
     ) -> None:
         self.node_writes.append((label, rows, key_fields))
+
+    def bulk_write_nodes_many(
+        self,
+        batches: list[tuple[object, str, list[dict[str, Any]], list[str]]],
+    ) -> None:
+        for _action, label, rows, key_fields in batches:
+            self.node_writes.append((label, rows, key_fields))
 
     def bulk_write_relationships(
         self,
@@ -61,6 +69,36 @@ class _CaptureConnection:
         self.relationship_writes.append(
             (rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
         )
+
+    def bulk_write_relationships_many(
+        self,
+        batches: list[
+            tuple[object, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        for (
+            _action,
+            rel_type,
+            from_label,
+            to_label,
+            rows,
+            from_key_fields,
+            to_key_fields,
+        ) in batches:
+            self.relationship_writes.append(
+                (rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
+            )
+
+    def bulk_write_nodes_and_relationships_many(
+        self,
+        node_batches: list[tuple[object, str, list[dict[str, Any]], list[str]]],
+        relationship_batches: list[
+            tuple[object, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        self.combined_write_count += 1
+        self.bulk_write_nodes_many(node_batches)
+        self.bulk_write_relationships_many(relationship_batches)
 
     def read_relationships(
         self,
@@ -112,6 +150,7 @@ def test_bulk_insert_submits_label_batches_by_model() -> None:
     b_rows = conn.node_writes[1][1]
     assert [row["id"] for row in a_rows] == [3, 1]
     assert [row["id"] for row in b_rows] == [2, 4]
+    assert conn.combined_write_count == 1
 
 
 def test_bulk_insert_submits_concrete_relationship_routes() -> None:
@@ -140,6 +179,7 @@ def test_bulk_insert_submits_concrete_relationship_routes() -> None:
             ["id"],
         )
     ]
+    assert conn.combined_write_count == 1
 
 
 def test_relationship_query_submits_metadata_to_atp_relationship_read() -> None:

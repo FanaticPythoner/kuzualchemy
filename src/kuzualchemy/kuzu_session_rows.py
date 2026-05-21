@@ -1,15 +1,18 @@
 from __future__ import annotations
+from functools import cache
 from typing import Any
 from .kuzu_orm import get_node_by_name
 
 RelationshipRoute = tuple[str, str, str, str, str]
 
+@cache
 def _node_label(model_class: type[Any]) -> str:
     label = getattr(model_class, "__kuzu_node_name__", None)
     if not isinstance(label, str) or not label:
         raise ValueError(f"{model_class.__name__} is not a registered Kuzu node")
     return label
 
+@cache
 def _primary_key_fields(model_class: type[Any]) -> list[str]:
     getter = getattr(model_class, "get_primary_key_fields", None)
     if not callable(getter):

@@ -129,8 +129,25 @@ class KuzuSession:
         return current
     def bulk_insert_immediate(self, instances: list[Any], batch_size: int | None = None) -> None:
         self._write_instances(DbBulkAction.CREATE, instances)
+    def bulk_insert_graph_immediate(
+        self,
+        node_instances: list[Any],
+        relationship_instances: list[Any],
+    ) -> None:
+        self._write_instance_groups(
+            DbBulkAction.CREATE,
+            node_instances,
+            relationship_instances,
+        )
     def bulk_update_nodes(self, model_class: Type[Any], rows: list[dict[str, Any]]) -> None:
         self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), rows, _primary_key_fields(model_class))
+    def bulk_update_node_groups(self, rows_by_class: dict[Type[Any], list[dict[str, Any]]]) -> None:
+        self._conn.bulk_write_nodes_many(
+            [
+                (DbBulkAction.UPDATE, _node_label(cls), rows, _primary_key_fields(cls))
+                for cls, rows in rows_by_class.items()
+            ]
+        )
     def bulk_delete_nodes(self, model_class: Type[Any], pks: list[Any]) -> None:
         key_fields = _primary_key_fields(model_class)
         self._conn.bulk_write_nodes(DbBulkAction.DELETE, _node_label(model_class), [_pk_row(key_fields, pk) for pk in pks], key_fields)
@@ -142,16 +159,12 @@ class KuzuSession:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu relationship")
             row = _relationship_update_row(instance, fields)
             rels.setdefault(_relationship_route(cls, row), []).append(row)
-        for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items():
-            self._conn.bulk_write_relationships(
-                DbBulkAction.UPDATE,
-                rel_type,
-                from_label,
-                to_label,
-                rows,
-                [from_key],
-                [to_key],
-            )
+        self._conn.bulk_write_relationships_many(
+            [
+                (DbBulkAction.UPDATE, rel_type, from_label, to_label, rows, [from_key], [to_key])
+                for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items()
+            ]
+        )
     def flush(self) -> None:
         self._write_instances(DbBulkAction.CREATE, self._new)
         self._write_instances(DbBulkAction.UPDATE, self._dirty)
@@ -211,7 +224,42 @@ class KuzuSession:
                 rels.setdefault(_relationship_route(cls, row), []).append(row)
             else:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu model")
-        for cls, rows in nodes.items():
-            self._conn.bulk_write_nodes(action, _node_label(cls), rows, _primary_key_fields(cls))
-        for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items():
-            self._conn.bulk_write_relationships(action, rel_type, from_label, to_label, rows, [from_key], [to_key])
+        self._write_grouped_rows(action, nodes, rels)
+    def _write_instance_groups(
+        self,
+        action: DbBulkAction,
+        node_instances: list[Any],
+        relationship_instances: list[Any],
+    ) -> None:
+        nodes: dict[type[Any], list[dict[str, Any]]] = {}
+        rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
+        for instance in node_instances:
+            cls = type(instance)
+            if not hasattr(cls, "__kuzu_node_name__"):
+                raise TypeError(f"{cls.__name__} is not a registered Kuzu node")
+            row = _node_delete_row(instance) if action == DbBulkAction.DELETE else _node_row(instance)
+            nodes.setdefault(cls, []).append(row)
+            if action == DbBulkAction.DELETE:
+                self.expire(instance)
+            else:
+                self._remember(instance)
+        for instance in relationship_instances:
+            cls = type(instance)
+            if not hasattr(cls, "__kuzu_rel_name__"):
+                raise TypeError(f"{cls.__name__} is not a registered Kuzu relationship")
+            row = _relationship_row(instance)
+            rels.setdefault(_relationship_route(cls, row), []).append(row)
+        self._write_grouped_rows(action, nodes, rels)
+    def _write_grouped_rows(
+        self,
+        action: DbBulkAction,
+        nodes: dict[type[Any], list[dict[str, Any]]],
+        rels: dict[RelationshipRoute, list[dict[str, Any]]],
+    ) -> None:
+        self._conn.bulk_write_nodes_and_relationships_many(
+            [(action, _node_label(cls), rows, _primary_key_fields(cls)) for cls, rows in nodes.items()],
+            [
+                (action, rel_type, from_label, to_label, rows, [from_key], [to_key])
+                for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items()
+            ],
+        )

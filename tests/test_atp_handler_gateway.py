@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from atp_pipeline import DbWorkKind
+from atp_pipeline import DbBulkAction, DbWorkKind
 from kuzualchemy.atp_integration import ATPIntegration
 from kuzualchemy.kuzu_connection import KuzuConnection
 
@@ -26,6 +26,16 @@ class _GatewayHandler:
     def submit_work(self, work: Any, *, expect_rows: bool = False, priority: Any = None) -> _Ticket:
         self.calls.append(("submit_work", work, expect_rows))
         return _Ticket({"cypher_results": [[{"n": 1}]]} if expect_rows else {})
+
+    def submit_many_work(
+        self,
+        works: list[Any],
+        *,
+        expect_rows: bool = False,
+        priority: Any = None,
+    ) -> list[_Ticket]:
+        self.calls.append(("submit_many_work", works, expect_rows))
+        return [_Ticket({}) for _ in works]
 
 
 class _MalformedReadHandler:
@@ -74,6 +84,52 @@ def test_read_and_write_batches_route_to_typed_work() -> None:
     assert write_work.kind == DbWorkKind.SCHEMA_APPLY
     assert handler.calls[0][2] is True
     assert handler.calls[1][2] is False
+
+
+def test_bulk_write_nodes_many_routes_to_single_handler_call() -> None:
+    handler = _GatewayHandler()
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    connection._handler = handler
+
+    connection.bulk_write_nodes_many(
+        [
+            (DbBulkAction.CREATE, "A", [{"id": 1}], ["id"]),
+            (DbBulkAction.CREATE, "B", [{"id": 2}], ["id"]),
+        ]
+    )
+
+    assert len(handler.calls) == 1
+    kind, works, expect_rows = handler.calls[0]
+    assert kind == "submit_many_work"
+    assert [work.kind for work in works] == [DbWorkKind.NODE_BULK_WRITE] * 2
+    assert [work.node_bulk.label for work in works] == ["A", "B"]
+    assert expect_rows is False
+
+
+def test_bulk_write_nodes_and_relationships_many_preserves_typed_work_items() -> None:
+    handler = _GatewayHandler()
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    connection._handler = handler
+
+    connection.bulk_write_nodes_and_relationships_many(
+        [(DbBulkAction.CREATE, "A", [{"id": 1}], ["id"])],
+        [(DbBulkAction.CREATE, "REL", "A", "B", [{"from_pk": 1, "to_pk": 2}], ["id"], ["id"])],
+    )
+
+    assert len(handler.calls) == 1
+    kind, works, expect_rows = handler.calls[0]
+    assert kind == "submit_many_work"
+    assert [work.kind for work in works] == [
+        DbWorkKind.NODE_BULK_WRITE,
+        DbWorkKind.RELATIONSHIP_BULK_WRITE,
+    ]
+    assert works[0].node_bulk.label == "A"
+    assert works[1].relationship_bulk.rel_type == "REL"
+    assert expect_rows is False
 
 
 def test_kuzu_connection_rejects_malformed_native_read_result() -> None:
