@@ -133,6 +133,7 @@ def _session_for_capture(conn: _CaptureConnection) -> KuzuSession:
     session = KuzuSession.__new__(KuzuSession)
     session._conn = conn
     session._identity_map = {}
+    session._identity_keys_by_object_id = {}
     session.autoflush = False
     session._new = []
     session._dirty = []

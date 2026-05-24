@@ -309,17 +309,14 @@ class TestBaseModelEnumConversion:
         result = NoAnnotationsModel.convert_str_to_enum({})
         assert result == {}
 
-    def test_enum_cache_functionality(self):
-        """Test that enum cache is populated and used correctly."""
-        # First creation should populate cache
+    def test_repeated_enum_conversion_is_value_consistent(self):
+        """Test repeated enum conversion results."""
         account1 = TestAccount(
             id=1,
             status="ACTIVE",
             priority="HIGH",
             mixed_field="STRING_VAL"
         )
-
-        # Second creation should use cache
         account2 = TestAccount(
             id=2,
             status="INACTIVE",
@@ -593,15 +590,15 @@ class TestBaseModelEnumListTupleConversion:
                 mixed_list=["STRING_VAL"],
             )
 
-    def test_converter_function_performance(self):
-        """Test that converter function handles various input types efficiently."""
-        # Test the converter function directly
-        converter = BaseModel._create_enum_converter(StatusEnum)
+    def test_model_validator_conversion_contract(self):
+        """Test model validator enum conversion contract."""
+        by_name = TestAccount.convert_str_to_enum({"status": "ACTIVE"})
+        by_value = TestAccount.convert_str_to_enum({"status": "active"})
+        by_instance = TestAccount.convert_str_to_enum({"status": StatusEnum.INACTIVE})
 
-        # Test various input types
-        assert converter("ACTIVE") == StatusEnum.ACTIVE
-        assert converter("active") == StatusEnum.ACTIVE
-        assert converter(StatusEnum.INACTIVE) == StatusEnum.INACTIVE
+        assert by_name["status"] == StatusEnum.ACTIVE
+        assert by_value["status"] == StatusEnum.ACTIVE
+        assert by_instance["status"] == StatusEnum.INACTIVE
 
 
 class TestIntEnumConversion:

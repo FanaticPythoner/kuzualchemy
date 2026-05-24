@@ -271,9 +271,10 @@ class TestAutoIncrementFields:
 
         # User should be in identity map after commit
         assert user.id is not None
-        identity_key = f"{self.AutoUser.__name__}:{user.id}"
+        identity_key = session._identity_key(user)
         assert identity_key in session._identity_map
         assert session._identity_map[identity_key] is user
+        assert all("(None,)" not in key for key in session._identity_map)
 
         session.close()
 
@@ -717,10 +718,7 @@ class TestAutoIncrementFields:
 
     def test_raw_primary_key_node_type_determination(self, test_db_path):
         """
-        test: Node type determination from raw primary key values.
-
-        Tests the correctness of the _get_node_type_name method
-        when dealing with raw primary key values instead of model instances.
+        test: ATP-backed node-label discovery from raw primary key values.
         """
         session = KuzuSession(db_path=test_db_path)
 
@@ -751,21 +749,20 @@ class TestAutoIncrementFields:
         session.add_all([entity_a1, entity_a2, entity_b1, entity_b2])
         session.commit()
 
-        # Test node type determination from raw primary key values
-        # This tests the _get_node_type_name method's database querying logic
+        node_specs = [
+            (TypeA.__kuzu_node_name__, "id"),
+            (TypeB.__kuzu_node_name__, "id"),
+        ]
+        overlapping = session.connection.find_node_labels_for_primary_key(
+            node_specs,
+            entity_a1.id,
+        )
+        assert set(overlapping) == {"TypeA", "TypeB"}
 
-        # Test case 1: Overlapping primary keys should raise TypeError (normal in graph databases)
-        # Both TypeA and TypeB will have nodes with id=0, id=1, etc.
-        with pytest.raises(TypeError, match="Primary key value 0 exists in multiple node types"):
-            session._get_node_type_name(entity_a1.id)  # ID 0 exists in both TypeA and TypeB
+        missing = session.connection.find_node_labels_for_primary_key(node_specs, 999)
+        assert missing == []
 
-        # Test case 4: Non-existent primary key should raise TypeError
-        with pytest.raises(TypeError, match="Primary key value 999 does not exist in any registered node type"):
-            session._get_node_type_name(999)
-
-        # Test case 5: Model instance should work directly
-        type_name_instance = session._get_node_type_name(entity_a2)
-        assert type_name_instance == "TypeA", f"Expected 'TypeA', got '{type_name_instance}'"
+        assert type(entity_a2).__kuzu_node_name__ == "TypeA"
 
         session.close()
 
@@ -827,7 +824,7 @@ class TestAutoIncrementFields:
         invalid_rel = RestrictedRel(from_node=node_y, to_node=node_z, rel_data="Invalid")
         session.add(invalid_rel)
 
-        with pytest.raises(ValueError, match="No matching relationship pair found"):
+        with pytest.raises(ValueError, match="RestrictedRel endpoint route is ambiguous"):
             session.commit()
 
         session.close()

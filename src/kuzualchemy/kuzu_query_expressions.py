@@ -763,24 +763,27 @@ class TemporalExpression(FilterExpression):
 
         if not isinstance(self.left, (int, float)) and not isinstance(self.left, QueryField):
             # Check if it's a temporal literal (DATE, TIMESTAMP, INTERVAL strings)
-            if isinstance(self.left, str) and any(keyword in self.left.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL(']):
-                # It's a temporal literal, don't parameterize
-                pass
-            elif not isinstance(self.left, str):
+            if not (
+                isinstance(self.left, str)
+                and any(keyword in self.left.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL('])
+            ) and not isinstance(self.left, str):
                 params[self.parameter_name_left] = self.left
-            else:
-                # It's a dynamic string parameter
+            elif not (
+                isinstance(self.left, str)
+                and any(keyword in self.left.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL('])
+            ):
                 params[self.parameter_name_left] = self.left
 
         if not isinstance(self.right, (int, float)) and not isinstance(self.right, QueryField):
-            # Check if it's a temporal literal (DATE, TIMESTAMP, INTERVAL strings)
-            if isinstance(self.right, str) and any(keyword in self.right.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL(']):
-                # It's a temporal literal, don't parameterize
-                pass
-            elif not isinstance(self.right, str):
+            if not (
+                isinstance(self.right, str)
+                and any(keyword in self.right.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL('])
+            ) and not isinstance(self.right, str):
                 params[self.parameter_name_right] = self.right
-            else:
-                # It's a dynamic string parameter
+            elif not (
+                isinstance(self.right, str)
+                and any(keyword in self.right.upper() for keyword in ['DATE(', 'TIMESTAMP(', 'INTERVAL('])
+            ):
                 params[self.parameter_name_right] = self.right
 
         # Add parameters from nested expressions
@@ -1083,10 +1086,7 @@ class FunctionFilterExpression(FilterExpression):
         from .kuzu_query_fields import QueryField as _QF
         if isinstance(self.value, (FunctionExpression, ArithmeticExpression, TemporalExpression, PatternExpression)):
             params.update(self.value.get_parameters())
-        elif isinstance(self.value, _QF):
-            # Field references are inlined, no parameter
-            pass
-        else:
+        elif not isinstance(self.value, _QF):
             if not isinstance(self.value, (int, float, bool)) and self.operator not in (
                 ComparisonOperator.IS_NULL, ComparisonOperator.IS_NOT_NULL
             ):
@@ -1413,7 +1413,7 @@ class CaseExpression(FilterExpression):
     _param_counter = 0
 
     def __init__(self, input_expr: Any = None):
-        self.input_expr = input_expr  # For simple form
+        self.input_expr = input_expr
         self.when_clauses: List[Tuple[Any, Any]] = []  # (condition, result) pairs
         self.else_clause: Any = None
 
@@ -1435,7 +1435,6 @@ class CaseExpression(FilterExpression):
         """Convert to Cypher CASE expression."""
         parts = ["CASE"]
 
-        # Add input expression for simple form
         if self.input_expr is not None:
             input_expr = self._format_operand(self.input_expr, alias_map, param_prefix, relationship_alias, post_with)
             parts.append(input_expr)

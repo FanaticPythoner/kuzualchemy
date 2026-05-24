@@ -7,18 +7,21 @@ Query state management and Cypher query builder for Kuzu ORM.
 
 from __future__ import annotations
 from typing import Any, Optional, Type, Dict, List, Tuple
-import logging
 from dataclasses import dataclass, field
+from atp_pipeline import normalize_relationship_direction, quote_cypher_identifier
 from .kuzu_query_expressions import (
     FilterExpression, AggregateFunction, OrderDirection, JoinType
 )
-from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants, QueryReturnAliasConstants
-
-logger = logging.getLogger(__name__)
+from .constants import DDLConstants, ValidationMessageConstants, JoinPatternConstants, RelationshipDirection, CypherConstants
 
 def _escape_cypher_identifier(identifier: str) -> str:
-    escaped = identifier.replace("`", "``")
-    return f"`{escaped}`"
+    return quote_cypher_identifier(identifier)
+
+def _query_direction(direction: Any) -> str:
+    if direction is None:
+        return RelationshipDirection.OUTGOING
+    value = getattr(direction, "value", None) or getattr(direction, "name", None) or direction
+    return normalize_relationship_direction(str(value))
 
 def _format_labeled_node(alias: str, label: str) -> str:
     return f"({alias}:{_escape_cypher_identifier(label)})"
@@ -39,11 +42,8 @@ class JoinClause:
     min_hops: int = 1
     max_hops: int = 1
     
-    def to_cypher(self, source: str, alias_map: Dict[str, str]) -> str:
+    def to_cypher(self, source: str) -> str:
         """Convert join to Cypher pattern."""
-        # @@ STEP: alias_map parameter reserved for future use in complex join patterns
-        _ = alias_map  # Mark as intentionally unused
-
         if self.pattern:
             return self.pattern.format(
                 source=source,
@@ -71,21 +71,15 @@ class JoinClause:
             prop_str = JoinPatternConstants.PROPERTY_SEPARATOR.join(f"{k}: {JoinPatternConstants.PROPERTY_PREFIX}{v}" for k, v in self.properties.items())
             rel_pattern += f" {{{prop_str}}}"
         
-        if self.direction:
-            # Handle both enum and string direction values
-            if (self.direction == RelationshipDirection.OUTGOING or
-                (hasattr(self.direction, 'name') and self.direction.name == 'FORWARD')):
-                pattern = JoinPatternConstants.OUTGOING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-            elif (self.direction == RelationshipDirection.INCOMING or
-                  (hasattr(self.direction, 'name') and self.direction.name == 'BACKWARD')):
-                pattern = JoinPatternConstants.INCOMING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-            elif self.direction == RelationshipDirection.BOTH:
-                pattern = JoinPatternConstants.BOTH_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-            else:
-                # Default to outgoing for unknown directions
-                pattern = JoinPatternConstants.OUTGOING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
-        else:
+        direction = _query_direction(self.direction)
+        if direction == RelationshipDirection.OUTGOING:
             pattern = JoinPatternConstants.OUTGOING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
+        elif direction == RelationshipDirection.INCOMING:
+            pattern = JoinPatternConstants.INCOMING_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
+        elif direction == RelationshipDirection.BOTH:
+            pattern = JoinPatternConstants.BOTH_PATTERN.format(source=source, rel_pattern=rel_pattern, target=self.target_alias)
+        else:
+            raise ValueError(f"relationship direction is unsupported: {self.direction}")
         
         if self.target_model:
             if not hasattr(self.target_model, '__kuzu_node_name__'):
@@ -97,9 +91,7 @@ class JoinClause:
         
         if self.join_type == JoinType.OPTIONAL:
             pattern = f"{JoinPatternConstants.OPTIONAL_MATCH_PREFIX}{pattern}"
-        elif self.join_type == JoinType.MANDATORY:
-            pass
-        else:
+        elif self.join_type != JoinType.MANDATORY:
             pattern = f"{JoinPatternConstants.MATCH_PREFIX}{pattern}"
         
         return pattern
@@ -187,8 +179,9 @@ class CypherQueryBuilder:
         
         clauses.append(f"{CypherConstants.MATCH} {match_pattern}")
         
+        join_filters: List[FilterExpression] = []
         for join in self.state.joins:
-            join_cypher = join.to_cypher(self.state.alias, self.alias_map)
+            join_cypher = join.to_cypher(self.state.alias)
             if join.target_alias:
                 self.alias_map[join.target_alias] = join.target_alias
                 if join.target_model is not None:
@@ -204,9 +197,9 @@ class CypherQueryBuilder:
             else:
                 clauses.append(join_cypher)
 
-            self.state.filters.extend(join.conditions)
+            join_filters.extend(join.conditions)
 
-        where_clause = self._build_where_clause()
+        where_clause = self._build_where_clause(extra_filters=join_filters)
         if where_clause:
             clauses.append(where_clause)
         
@@ -237,8 +230,7 @@ class CypherQueryBuilder:
                         # Use the field name as alias (Kuzu requires aliases in WITH)
                         final_return_items.append(fld)
 
-                for alias, (func, fld) in self.state.aggregations.items():
-                    _ = func, fld  # Mark as intentionally unused - only alias is needed in RETURN
+                for alias in self.state.aggregations:
                     final_return_items.append(alias)
 
                 clauses.append(f"{CypherConstants.RETURN} {', '.join(final_return_items)}")
@@ -361,17 +353,15 @@ class CypherQueryBuilder:
             self.alias_map[from_alias] = from_alias
             self.alias_map[to_alias] = to_alias
 
-            if direction:
-                if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
-                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
-                elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
-                    pattern = f"({from_alias})<-[{rel_alias}:{rel_name}]-({to_alias})"
-                elif direction == RelationshipDirection.BOTH:
-                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]-({to_alias})"
-                else:
-                    pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
-            else:
+            direction = _query_direction(direction)
+            if direction == RelationshipDirection.OUTGOING:
                 pattern = f"({from_alias})-[{rel_alias}:{rel_name}]->({to_alias})"
+            elif direction == RelationshipDirection.INCOMING:
+                pattern = f"({from_alias})<-[{rel_alias}:{rel_name}]-({to_alias})"
+            elif direction == RelationshipDirection.BOTH:
+                pattern = f"({from_alias})-[{rel_alias}:{rel_name}]-({to_alias})"
+            else:
+                raise ValueError(f"relationship direction is unsupported: {direction}")
             clauses.append(f"MATCH {pattern}")
 
             self.alias_map[rel_alias] = rel_alias
@@ -414,17 +404,15 @@ class CypherQueryBuilder:
                 self.alias_map[from_alias] = from_alias
                 self.alias_map[to_alias] = to_alias
 
-                if direction:
-                    if direction == RelationshipDirection.FORWARD or direction == RelationshipDirection.OUTGOING:
-                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
-                    elif direction == RelationshipDirection.BACKWARD or direction == RelationshipDirection.INCOMING:
-                        pattern = f"{_format_labeled_node(from_alias, from_name)}<-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
-                    elif direction == RelationshipDirection.BOTH:
-                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
-                    else:
-                        pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
-                else:
+                direction = _query_direction(direction)
+                if direction == RelationshipDirection.OUTGOING:
                     pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]->{_format_labeled_node(to_alias, to_name)}"
+                elif direction == RelationshipDirection.INCOMING:
+                    pattern = f"{_format_labeled_node(from_alias, from_name)}<-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
+                elif direction == RelationshipDirection.BOTH:
+                    pattern = f"{_format_labeled_node(from_alias, from_name)}-[{rel_alias}:{rel_name}]-{_format_labeled_node(to_alias, to_name)}"
+                else:
+                    raise ValueError(f"relationship direction is unsupported: {direction}")
 
                 match_patterns.append(pattern)
 
@@ -488,8 +476,7 @@ class CypherQueryBuilder:
                         # Use the field name as alias (Kuzu requires aliases in WITH)
                         final_return_items.append(fld)
 
-                for alias, (func, fld) in self.state.aggregations.items():
-                    _ = func, fld  # Mark as intentionally unused - only alias is needed in RETURN
+                for alias in self.state.aggregations:
                     final_return_items.append(alias)
 
                 return_clause = f"RETURN {', '.join(final_return_items)}"
@@ -605,13 +592,18 @@ class CypherQueryBuilder:
                 parts.append(f"(label({from_var}) = ${p_from} AND label({to_var}) = ${p_to})")
             return "(" + " OR ".join(parts) + ")"
     
-    def _build_where_clause(self, relationship_alias: Optional[str] = None) -> str:
+    def _build_where_clause(
+        self,
+        relationship_alias: Optional[str] = None,
+        extra_filters: Optional[List[FilterExpression]] = None,
+    ) -> str:
         """Build WHERE clause from filters."""
-        if not self.state.filters:
+        filters = [*self.state.filters, *(extra_filters or [])]
+        if not filters:
             return ""
 
         conditions = []
-        for filter_expr in self.state.filters:
+        for filter_expr in filters:
             cypher = filter_expr.to_cypher(self.alias_map, self.state.parameter_prefix, relationship_alias)
             conditions.append(cypher)
             params = filter_expr.get_parameters()
@@ -729,88 +721,3 @@ class CypherQueryBuilder:
                 f"Missing fields: {missing_fields}. "
                 f"Current GROUP BY: {self.state.group_by}"
             )
-
-    def _build_multi_pair_union_query(self, match_patterns: List[str], endpoint_aliases: List[Tuple[str, str]], rel_alias: str, rel_pairs: List[Any]) -> str:
-        """
-        Build a UNION ALL query for multi-pair relationships.
-
-        This method creates a Cypher query that uses UNION ALL to handle
-        relationships that can exist between multiple node type pairs. Each pattern
-        is executed as a separate subquery, and results are combined using UNION ALL.
-
-        The WHERE clause is applied within each subquery to filter correctly before
-        the UNION. The RETURN clause explicitly returns the relationship variable and
-        endpoints to maintain consistent typing across the union.
-
-        Args:
-            match_patterns: List of MATCH patterns for each relationship pair
-            endpoint_aliases: List of (from_alias, to_alias) tuples for each pair
-            rel_alias: Alias for the relationship in the query
-            rel_pairs: List of relationship pairs (reserved for future use)
-
-        Returns:
-            Cypher query string with UNION ALL structure
-        """
-        # rel_pairs reserved for future use in complex relationship handling
-        _ = rel_pairs
-
-        # Build subqueries with WHERE applied within each branch for correct filtering
-        # Kuzu doesn't support complex outer query wrapping for UNION, so filters
-        # and ordering must be applied within each subquery
-        final_subqueries = []
-
-        for (pattern, (from_alias, to_alias)) in zip(match_patterns, endpoint_aliases):
-            # || S.S.6: Rebuild each subquery with proper filtering and ordering
-            subquery_clauses = [f"MATCH {pattern}"]
-
-            # || S.S.7: Add WHERE clause if filters exist
-            where_clause = self._build_where_clause(relationship_alias=rel_alias)
-            if where_clause:
-                subquery_clauses.append(where_clause)
-
-            # || S.S.8: Return the full relationship variable for consistent typing across UNIONs
-            # || Returning the variable ensures stable column types; include endpoints explicitly
-            # Use neutral endpoint aliases to avoid binder conflicts in UNION
-            # Normalize endpoint typing across UNION branches by rematching endpoints via ID to unlabeled variables
-            subquery_clauses.append(f"WITH {from_alias}, {to_alias}, {rel_alias}")
-            subquery_clauses.append(f"MATCH (f) WHERE ID(f) = ID({from_alias})")
-            subquery_clauses.append(f"MATCH (t) WHERE ID(t) = ID({to_alias})")
-            return_line = (
-                f"RETURN {rel_alias} AS {self.state.alias}, "
-                f"f AS {QueryReturnAliasConstants.FROM_ENDPOINT}, "
-                f"t AS {QueryReturnAliasConstants.TO_ENDPOINT}, "
-                f"ID(f) AS {QueryReturnAliasConstants.FROM_ID}, "
-                f"ID(t) AS {QueryReturnAliasConstants.TO_ID}"
-            )
-            subquery_clauses.append(return_line)
-
-            # || S.S.9: Add ORDER BY if specified
-            if self.state.order_by:
-                order_items = []
-                for ob_field, direction in self.state.order_by:
-                    if "." in ob_field:
-                        order_items.append(f"{ob_field} {direction.value}")
-                    else:
-                        order_items.append(f"{rel_alias}.{ob_field} {direction.value}")
-                subquery_clauses.append(f"{CypherConstants.ORDER_BY} {', '.join(order_items)}")
-
-            # || S.S.10: Add SKIP and LIMIT if specified
-            if self.state.offset_value is not None:
-                subquery_clauses.append(f"{CypherConstants.SKIP} {self.state.offset_value}")
-            if self.state.limit_value is not None:
-                subquery_clauses.append(f"{CypherConstants.LIMIT} {self.state.limit_value}")
-
-            final_subqueries.append(" ".join(subquery_clauses))
-
-        # || S.S.11: Clear problematic parameters that don't exist in the query
-        # || The node aliases are hardcoded in the patterns, not parameterized
-        params_to_remove = []
-        for param_name in self.parameters:
-            if param_name.startswith(('from_node_', 'to_node_')):
-                params_to_remove.append(param_name)
-
-        for param_name in params_to_remove:
-            del self.parameters[param_name]
-
-        # || S.S.12: Combine with UNION ALL
-        return f" {CypherConstants.UNION_ALL} ".join(final_subqueries)

@@ -42,42 +42,42 @@ class TestConnectionReuseExceptionHandling:
         session = KuzuSession(db_path=test_db_path)
         session._conn.execute = Mock(side_effect=ConnectionError("Connection lost"))
         with pytest.raises(ConnectionError, match="Connection lost"):
-            session._execute_with_connection_reuse("RETURN 1")
+            session.execute("RETURN 1")
     
     def test_os_error_propagates_under_atp(self, test_db_path):
         """OSError in underlying execution should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
         session._conn.execute = Mock(side_effect=OSError("File descriptor error"))
         with pytest.raises(OSError, match="File descriptor error"):
-            session._execute_with_connection_reuse("MATCH (n) RETURN n")
+            session.execute("MATCH (n) RETURN n")
     
     def test_runtime_error_propagates_under_atp(self, test_db_path):
         """RuntimeError in underlying execution should propagate under ATP (write path)."""
         session = KuzuSession(db_path=test_db_path)
-        session._conn.execute = Mock(side_effect=RuntimeError("Database runtime error"))
+        session._conn.execute_write = Mock(side_effect=RuntimeError("Database runtime error"))
         with pytest.raises(RuntimeError, match="Database runtime error"):
-            session._execute_with_connection_reuse("CREATE (n:Test)")
+            session.execute("CREATE (n:Test)")
     
     def test_value_error_propagates_under_atp(self, test_db_path):
         """ValueError in underlying execution should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
         session._conn.execute = Mock(side_effect=ValueError("Connection validation error"))
         with pytest.raises(ValueError, match="Connection validation error"):
-            session._execute_with_connection_reuse("RETURN 1")
+            session.execute("RETURN 1")
     
     def test_unexpected_exception_propagates_under_atp(self, test_db_path):
         """Unexpected exceptions should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
         session._conn.execute = Mock(side_effect=TypeError("Unexpected type error"))
         with pytest.raises(TypeError, match="Unexpected type error"):
-            session._execute_with_connection_reuse("RETURN 1")
+            session.execute("RETURN 1")
 
     def test_memory_error_propagates_under_atp(self, test_db_path):
         """MemoryError should propagate under ATP."""
         session = KuzuSession(db_path=test_db_path)
         session._conn.execute = Mock(side_effect=MemoryError("Out of memory"))
         with pytest.raises(MemoryError, match="Out of memory"):
-            session._execute_with_connection_reuse("MATCH (n) RETURN n LIMIT 1000000")
+            session.execute("MATCH (n) RETURN n LIMIT 1000000")
 
 
 # @@ STEP: UUID Type Safety Enforcement Tests
@@ -393,7 +393,7 @@ class TestConcurrentUUIDHandling:
 
         def execute_query_in_thread(query: str, thread_id: int):
             try:
-                result = session._execute_with_connection_reuse(query)
+                result = session.execute(query)
                 return (thread_id, result, None)
             except Exception as e:
                 return (thread_id, None, str(e))

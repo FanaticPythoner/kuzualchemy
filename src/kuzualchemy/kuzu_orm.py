@@ -15,7 +15,6 @@ import datetime
 import decimal
 import logging
 import uuid
-import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,6 +31,7 @@ from typing import (
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from pydantic.fields import FieldInfo, PydanticUndefined
+from atp_pipeline import resolve_kuzu_relationship_node_names
 
 from .constants import (
     CascadeAction,
@@ -50,10 +50,8 @@ from .constants import (
     ValidationMessageConstants,
     RegistryResolutionConstants,
     RelationshipNodeTypeQueryConstants,
-    ForeignKeyValidationConstants,
 )
-from .enum_normalization import clear_all_enum_conversion_plans, clear_model_enum_conversion_plan, convert_input_enums_for_model
-from .uuid_normalization import clear_all_uuid_normalization_plans, clear_model_uuid_normalization_plan
+from .enum_normalization import convert_input_enums_for_model
 
 if TYPE_CHECKING:
     from .kuzu_query import Query
@@ -267,6 +265,7 @@ DefaultValueHandlerRegistry.register_handler(bool, DefaultValueHandlerRegistry._
 DefaultValueHandlerRegistry.register_handler(int, DefaultValueHandlerRegistry._int_handler)
 DefaultValueHandlerRegistry.register_handler(float, DefaultValueHandlerRegistry._float_handler)
 DefaultValueHandlerRegistry.register_handler(str, DefaultValueHandlerRegistry._string_handler)
+DefaultValueHandlerRegistry.register_handler(KuzuDefaultFunction, DefaultValueHandlerRegistry._kuzu_default_function_handler)
 DefaultValueHandlerRegistry.register_handler(type(None), lambda v: DefaultValueConstants.NULL_KEYWORD)
 # Add handler for lists (arrays)
 DefaultValueHandlerRegistry.register_handler(list, lambda v: f"{DefaultValueConstants.DEFAULT_PREFIX} [{', '.join(str(item) if isinstance(item, (int, float)) else f'{DefaultValueConstants.QUOTE_CHAR}{item}{DefaultValueConstants.QUOTE_CHAR}' for item in v)}]")
@@ -281,21 +280,21 @@ class BulkInsertValueGeneratorRegistry:
     values that the functions would produce.
     """
 
-    _generators: Dict[type, Callable[[Any], str]] = {}
+    _generators: Dict[type, Callable[[Any], Any]] = {}
 
     @classmethod
-    def register_generator(cls, function_type: type, generator: Callable[[Any], str]) -> None:
+    def register_generator(cls, function_type: type, generator: Callable[[Any], Any]) -> None:
         """Register a value generator for a specific function type."""
         cls._generators[function_type] = generator
 
     @classmethod
-    def get_generator(cls, function_obj: Any) -> Optional[Callable[[Any], str]]:
+    def get_generator(cls, function_obj: Any) -> Optional[Callable[[Any], Any]]:
         """Get the generator for a function object's type."""
         function_type = type(function_obj)
         return cls._generators.get(function_type)
 
     @classmethod
-    def generate_value(cls, default_function: Any) -> str:
+    def generate_value(cls, default_function: Any) -> Any:
         """
         Generate actual value from a Kuzu default function reference.
 
@@ -331,7 +330,7 @@ class BulkInsertValueGeneratorRegistry:
         return generator(func_obj)
 
     @staticmethod
-    def _time_function_generator(func_obj: Any) -> str:
+    def _time_function_generator(func_obj: Any) -> Any:
         """Generate values for TimeFunction instances using enum-based dispatch."""
         from datetime import datetime, date
         from .constants import KuzuDefaultFunction
@@ -341,25 +340,24 @@ class BulkInsertValueGeneratorRegistry:
             if enum_value.value is func_obj:
                 # Use enum-based dispatch instead of string matching
                 if enum_value == KuzuDefaultFunction.CURRENT_TIMESTAMP:
-                    return datetime.now().isoformat()
+                    return datetime.now()
                 elif enum_value == KuzuDefaultFunction.CURRENT_DATE:
-                    return date.today().isoformat()
+                    return date.today()
                 elif enum_value == KuzuDefaultFunction.CURRENT_TIME:
-                    return datetime.now().time().isoformat()
+                    return datetime.now().time()
                 elif enum_value == KuzuDefaultFunction.NOW:
-                    return datetime.now().isoformat()
+                    return datetime.now()
                 else:
-                    # Unknown time function - raise error instead of fallback
                     raise ValueError(f"Unknown time function: {enum_value}")
 
         # If no enum found, raise error
         raise ValueError(f"Function object {func_obj} not found in KuzuDefaultFunction enum")
 
     @staticmethod
-    def _uuid_function_generator(func_obj: Any) -> str:
+    def _uuid_function_generator(func_obj: Any) -> Any:
         """Generate values for UUIDFunction instances."""
         import uuid
-        return str(uuid.uuid4())
+        return uuid.uuid4()
 
     @staticmethod
     def _sequence_function_generator(func_obj: Any) -> str:
@@ -447,49 +445,39 @@ class ForeignKeyReference:
 
         self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_RESOLVING
 
-        try:
-            target_type = self.get_target_type()
+        target_type = self.get_target_type()
 
-            if target_type == RegistryResolutionConstants.TARGET_TYPE_STRING:
-                # @@ STEP: Resolve string reference
-                resolved_class = registry.get_model_by_name(self.target_model)
-                if resolved_class is None:
-                    self._resolution_error = f"{RegistryResolutionConstants.ERROR_TARGET_NOT_FOUND}: {self.target_model}"
-                    self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-                    return False
+        if target_type == RegistryResolutionConstants.TARGET_TYPE_STRING:
+            resolved_class = registry.get_model_by_name(self.target_model)
+            if resolved_class is None:
+                self._resolution_error = f"{RegistryResolutionConstants.ERROR_TARGET_NOT_FOUND}: {self.target_model}"
+                self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                return False
 
-                self._resolved_target_model = resolved_class
-                self._resolved_target_name = self.target_model
+            self._resolved_target_model = resolved_class
+            self._resolved_target_name = self.target_model
 
-            elif target_type == RegistryResolutionConstants.TARGET_TYPE_CALLABLE:
-                # @@ STEP: Resolve callable reference
-                try:
-                    resolved_class = self.target_model()
-                    if not isinstance(resolved_class, type):
-                        self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: Callable must return a class"
-                        self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-                        return False
+        elif target_type == RegistryResolutionConstants.TARGET_TYPE_CALLABLE:
+            try:
+                resolved_class = self.target_model()
+            except (AttributeError, LookupError, RuntimeError, TypeError, ValueError) as exc:
+                self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: {exc}"
+                self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                raise TypeError(self._resolution_error) from exc
+            if not isinstance(resolved_class, type):
+                self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: Callable must return a class"
+                self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
+                return False
 
-                    self._resolved_target_model = resolved_class
-                    self._resolved_target_name = self._extract_model_name(resolved_class)
+            self._resolved_target_model = resolved_class
+            self._resolved_target_name = self._extract_model_name(resolved_class)
 
-                except Exception as e:
-                    self._resolution_error = f"{RegistryResolutionConstants.ERROR_INVALID_TARGET_TYPE}: {str(e)}"
-                    self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-                    raise TypeError(self._resolution_error) from e
+        else:
+            self._resolved_target_model = self.target_model
+            self._resolved_target_name = self._extract_model_name(self.target_model)
 
-            else:  # TARGET_TYPE_CLASS
-                # @@ STEP: Direct class reference
-                self._resolved_target_model = self.target_model
-                self._resolved_target_name = self._extract_model_name(self.target_model)
-
-            self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_RESOLVED
-            return True
-
-        except Exception as e:
-            self._resolution_error = str(e)
-            self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_ERROR
-            raise RuntimeError(f"Registry resolution failed: {type(e).__name__}: {e}") from e
+        self._resolution_state = RegistryResolutionConstants.RESOLUTION_STATE_RESOLVED
+        return True
 
     def _extract_model_name(self, model_class: Type[Any]) -> str:
         """
@@ -514,8 +502,7 @@ class ForeignKeyReference:
         if hasattr(model_class, '__qualname__'):
             return model_class.__qualname__.split('.')[-1]
 
-        # || S.4: Fallback to string representation
-        return str(model_class)
+        raise TypeError(f"Cannot extract model name from {model_class!r}")
 
     def get_resolved_target_name(self) -> Optional[str]:
         """Get the resolved target model name, if available."""
@@ -679,8 +666,8 @@ class KuzuFieldMetadata:
         """Generate DDL for field definition."""
         return self.to_ddl_column_definition(field_name)
 
-    # ---- Column-level DDL renderer used by tests directly ----
-    def to_ddl_column_definition(self, field_name: str, is_node_table: bool = True) -> str:
+    # ---- Column-level DDL renderer ----
+    def to_ddl_column_definition(self, field_name: str) -> str:
         """
         Render the column definition for Kuzu DDL.
 
@@ -690,9 +677,6 @@ class KuzuFieldMetadata:
 
         NOT supported in NODE tables: NOT NULL, UNIQUE, CHECK
         """
-        # @@ STEP: is_node_table parameter reserved for future REL table support
-        _ = is_node_table  # Mark as intentionally unused - current implementation assumes NODE table behavior
-
         dtype = self._canonical_type_name(self.kuzu_type)
         parts: List[str] = [field_name, dtype]
 
@@ -700,7 +684,6 @@ class KuzuFieldMetadata:
         is_serial = isinstance(self.kuzu_type, KuzuDataType) and self.kuzu_type == KuzuDataType.SERIAL
         if self.default_value is not None and not is_serial:
             default_clause = self._render_default(self.default_value)
-            # Only add if we got a non-empty DEFAULT clause
             if default_clause:
                 parts.append(default_clause)
 
@@ -709,9 +692,6 @@ class KuzuFieldMetadata:
             parts.append(DDLConstants.PRIMARY_KEY)
             return " ".join(parts)
 
-        # @@ STEP: For NODE tables, ignore unsupported constraints
-        # || S.1: CHECK, UNIQUE, NOT NULL are NOT supported in Kuzu NODE tables
-        # || S.2: These constraints will be silently ignored to generate valid DDL
         return " ".join(parts)
 
     @staticmethod
@@ -844,7 +824,7 @@ def kuzu_field(
         elif kuzu_type == KuzuDataType.UUID:
             # || S.1.2: UUID auto-increment keeps UUID type but gets DEFAULT gen_random_uuid()
             # || This will be handled in the field metadata creation below
-            pass
+            kuzu_type = KuzuDataType.UUID
         else:
             # || S.1.3: Only INT64/SERIAL and UUID support auto-increment
             raise ValueError(
@@ -1038,19 +1018,6 @@ def _iter_kuzu_field_directives(raw_directives: Any) -> List[KuzuFieldDirective]
     return directives
 
 
-def _clear_kuzu_model_field_caches(cls: Type[Any]) -> None:
-    for attr_name in (
-        "__kuzu_cached_all_meta__",
-        "__kuzu_cached_pk_fields__",
-        "__kuzu_cached_fk_fields__",
-        "__kuzu_cached_ai_fields__",
-        "__kuzu_cached_ai_meta__",
-        "__kuzu_cached_has_ai_pk__",
-    ):
-        if attr_name in cls.__dict__:
-            delattr(cls, attr_name)
-
-
 def _clone_field_default(default_value: Any) -> Any:
     if isinstance(default_value, dict):
         return dict(default_value)
@@ -1198,15 +1165,7 @@ def _apply_kuzu_field_directives(cls: Type[T], decorator_directives: Any) -> Typ
         cls.model_fields[directive.field_name] = field_definition
         cls.__pydantic_fields__[directive.field_name] = field_definition
         cls.__annotations__[directive.field_name] = annotation
-    _clear_kuzu_model_field_caches(cls)
-    _kuzu_registry._field_metadata_cache.clear()
-    clear_model_enum_conversion_plan(cls)
-    clear_model_uuid_normalization_plan(cls)
     cls.model_rebuild(force=True)
-    _clear_kuzu_model_field_caches(cls)
-    _kuzu_registry._field_metadata_cache.clear()
-    clear_model_enum_conversion_plan(cls)
-    clear_model_uuid_normalization_plan(cls)
     return cls
 
 
@@ -1224,8 +1183,6 @@ class RelationshipPair:
     """
     from_node: Union[Type[Any], str]
     to_node: Union[Type[Any], str]
-    _from_name_cache: Optional[str] = field(default=None, init=False, repr=False, compare=False)
-    _to_name_cache: Optional[str] = field(default=None, init=False, repr=False, compare=False)
 
     @staticmethod
     def _resolve_string_node_name(node_name: str) -> str:
@@ -1239,9 +1196,7 @@ class RelationshipPair:
     def get_from_name(self) -> str:
         """Get the name of the FROM node."""
         if isinstance(self.from_node, str):
-            if self._from_name_cache is None:
-                self._from_name_cache = self._resolve_string_node_name(self.from_node)
-            return self._from_name_cache
+            return self._resolve_string_node_name(self.from_node)
 
         # Strict validation - sets must be expanded before reaching here
         if isinstance(self.from_node, (set, frozenset)):
@@ -1250,21 +1205,17 @@ class RelationshipPair:
                 f"Sets must be expanded in _process_relationship_pairs before creating RelationshipPair instances."
             )
 
-        # Try to get the kuzu node name first, fall back to __name__ for backward compatibility
-        try:
-            return self.from_node.__kuzu_node_name__
-        except AttributeError:
-            try:
-                return self.from_node.__name__
-            except AttributeError as e:
-                raise ValueError(
-                    f"Target model {self.from_node} is not a decorated node - missing __kuzu_node_name__ attribute"
-                ) from e
+        node_name = getattr(self.from_node, "__kuzu_node_name__", None)
+        if isinstance(node_name, str) and node_name:
+            return node_name
+        raise ValueError(
+            f"Target model {self.from_node} is not a decorated node - missing __kuzu_node_name__ attribute"
+        )
 
     def get_to_name(self) -> str:
         """Get the name of the TO node."""
         if isinstance(self.to_node, str):
-            return self.to_node
+            return self._resolve_string_node_name(self.to_node)
 
         # Strict validation - sets must be expanded before reaching here
         if isinstance(self.to_node, (set, frozenset)):
@@ -1273,16 +1224,12 @@ class RelationshipPair:
                 f"Sets must be expanded in _process_relationship_pairs before creating RelationshipPair instances."
             )
 
-        # Try to get the kuzu node name first, fall back to __name__ for backward compatibility
-        try:
-            return self.to_node.__kuzu_node_name__
-        except AttributeError:
-            try:
-                return self.to_node.__name__
-            except AttributeError as e:
-                raise ValueError(
-                    f"Target model {self.to_node} is not a decorated node - missing __kuzu_node_name__ attribute"
-                ) from e
+        node_name = getattr(self.to_node, "__kuzu_node_name__", None)
+        if isinstance(node_name, str) and node_name:
+            return node_name
+        raise ValueError(
+            f"Target model {self.to_node} is not a decorated node - missing __kuzu_node_name__ attribute"
+        )
 
     def to_ddl_component(self) -> str:
         """Convert to DDL component for CREATE REL TABLE."""
@@ -1325,6 +1272,7 @@ class KuzuRegistry:
 
         # @@ STEP 1: Core model storage
         self.nodes: Dict[str, Type[Any]] = {}
+        self._node_aliases: Dict[str, Set[str]] = {}
         self.relationships: Dict[str, Type[Any]] = {}
         self.models: Dict[str, Type[Any]] = {}
 
@@ -1337,15 +1285,6 @@ class KuzuRegistry:
         # @@ STEP 3: Circular dependency tracking
         self._circular_dependencies: Set[Tuple[str, str]] = set()
         self._self_references: Set[str] = set()
-
-        # @@ STEP 4: Foreign key validation caching system
-        # || S.S: Cache validation results to avoid double-validation and improve performance
-        self._foreign_key_validation_cache: Dict[str, Tuple[str, List[str]]] = {}
-        self._registry_state_hash: Optional[str] = None
-
-        # @@ STEP 5: Field metadata cache (hot path)
-        # Keyed by id(field_info) because FieldInfo may not be hashable; values are KuzuFieldMetadata or None
-        self._field_metadata_cache: Dict[int, Optional[KuzuFieldMetadata]] = {}
 
     def _cleanup_model_references(self, model_name: str) -> None:
         """
@@ -1375,6 +1314,10 @@ class KuzuRegistry:
             if from_model != model_name and to_model != model_name
         }
         self._self_references.discard(model_name)
+        for alias, labels in list(self._node_aliases.items()):
+            labels.discard(model_name)
+            if not labels:
+                del self._node_aliases[alias]
 
         # @@ STEP 5: Clear any resolution errors related to this model
         self._resolution_errors = [
@@ -1396,13 +1339,25 @@ class KuzuRegistry:
             self._cleanup_model_references(name)
 
         self.nodes[name] = cls
+        self._node_aliases.setdefault(cls.__name__, set()).add(name)
         self.models[name] = cls
 
         # @@ STEP: Store unresolved foreign keys for later resolution
         self._collect_unresolved_foreign_keys(name, cls)
 
-        # @@ STEP: Invalidate foreign key validation cache due to registry state change
-        self._invalidate_foreign_key_cache()
+    def get_node(self, name: str) -> Optional[Type[Any]]:
+        node = self.nodes.get(name)
+        if node is not None:
+            return node
+        labels = self._node_aliases.get(name)
+        if labels is None:
+            return None
+        live_labels = sorted(label for label in labels if label in self.nodes)
+        if len(live_labels) == 1:
+            return self.nodes[live_labels[0]]
+        if len(live_labels) > 1:
+            raise ValueError(f"Node alias '{name}' is ambiguous: {', '.join(live_labels)}")
+        return None
 
     def register_relationship(self, name: str, cls: Type[Any]) -> None:
         """
@@ -1422,19 +1377,6 @@ class KuzuRegistry:
 
         # @@ STEP: Store unresolved foreign keys for later resolution
         self._collect_unresolved_foreign_keys(name, cls)
-
-        # @@ STEP: CRITICAL PERFORMANCE FIX - Build cache immediately upon registration
-        # || S.S: Cache must be built when decorator is triggered, not on first query
-        # @@ STEP: Compliant attribute checking without hasattr() or dictionary access
-        if getattr(cls, '_build_node_type_cache', None) is not None and \
-            not getattr(cls, '__kuzu_is_abstract__', False):
-            # @@ STEP: Initialize query result cache BEFORE building node type cache
-            cls._query_result_cache = {}
-            # @@ STEP: Explicit exception handling - no silent failures
-            cls._build_node_type_cache()
-
-        # @@ STEP: Invalidate foreign key validation cache due to registry state change
-        self._invalidate_foreign_key_cache()
 
     def _collect_unresolved_foreign_keys(self, model_name: str, cls: Type[Any]) -> None:
         """
@@ -1488,9 +1430,6 @@ class KuzuRegistry:
 
         if success:
             self._resolution_phase = RegistryResolutionConstants.PHASE_DEPENDENCY_ANALYSIS
-            # @@ STEP: Invalidate foreign key validation cache after successful resolution
-            self._invalidate_foreign_key_cache()
-
         return success
 
     def analyze_dependencies(self) -> bool:
@@ -1567,20 +1506,18 @@ class KuzuRegistry:
             if name in visited:
                 return
             if name in visiting:
-                # @@ STEP: Circular dependency detected - this is OK for self-references
-                if name in self._self_references:
-                    return  # Self-reference is allowed
-                else:
-                    # @@ STEP: True circular dependency - handle gracefully
-                    logger.warning(f"Circular dependency detected involving {name}")
-                    return
+                return
 
             visiting.add(name)
 
             # @@ STEP: Visit dependencies first
-            for dep in self._model_dependencies.get(name, set()):
-                if dep != name:  # Skip self-references in dependency traversal
-                    visit(dep)
+            for dep in sorted(self._model_dependencies.get(name, set())):
+                if dep == name:
+                    continue
+                if dep in visiting:
+                    self._circular_dependencies.add((name, dep))
+                    continue
+                visit(dep)
 
             visiting.remove(name)
             visited.add(name)
@@ -1614,7 +1551,7 @@ class KuzuRegistry:
             self.get_creation_order()
             self._resolution_phase = RegistryResolutionConstants.PHASE_FINALIZED
             return True
-        except Exception as e:
+        except ValueError as e:
             msg = f"Failed to determine creation order: {type(e).__name__}: {e}"
             self._resolution_errors.append(msg)
             raise RuntimeError(msg) from e
@@ -1631,64 +1568,9 @@ class KuzuRegistry:
         """Get models with self-references."""
         return self._self_references.copy()
 
-    def _get_registry_state_hash(self) -> str:
-        """
-        Generate a hash of the current registry state for cache invalidation.
-
-        This hash includes:
-        - Registered node and relationship names
-        - Resolution phase
-        - Resolved foreign key references
-        - Dependency graph state
-
-        Returns:
-            str: Hash string representing current registry state
-        """
-        import hashlib
-
-        # @@ STEP: Collect state components for hashing
-        state_components = [
-            # @@ STEP: Include resolution phase
-            self._resolution_phase,
-
-            # @@ STEP: Include registered model names (sorted for consistency)
-            "|".join(sorted(self.nodes.keys())),
-            "|".join(sorted(self.relationships.keys())),
-
-            # @@ STEP: Include resolved foreign key state
-            str(len([fk for _, _, fk in self._unresolved_foreign_keys if fk.is_resolved()])),
-
-            # @@ STEP: Include dependency graph state
-            str(len(self._model_dependencies)),
-            str(len(self._circular_dependencies)),
-            str(len(self._self_references)),
-        ]
-
-        # @@ STEP: Create hash from state components
-        state_string = ForeignKeyValidationConstants.CACHE_KEY_SEPARATOR.join(state_components)
-        return hashlib.sha256(state_string.encode()).hexdigest()[:16]  # Use first 16 chars for efficiency
-
-    def _invalidate_foreign_key_cache(self) -> None:
-        """
-        Invalidate the foreign key validation cache when registry state changes.
-
-        This method should be called whenever the registry state changes in a way
-        that could affect foreign key validation results.
-        """
-        # @@ STEP: Clear the validation cache
-        self._foreign_key_validation_cache.clear()
-
-        # @@ STEP: Reset the registry state hash
-        self._registry_state_hash = None
-
-        logger.debug("Foreign key validation cache invalidated due to registry state change")
-
     def _validate_foreign_keys_for_node(self, node_name: str, node_class: Type[Any]) -> List[str]:
         """
-        Validate foreign keys for a specific node with caching.
-
-        This method uses caching to avoid repeated validation of the same node
-        when the registry state hasn't changed.
+        Validate foreign keys for a specific node.
 
         Args:
             node_name: The name of the node to validate
@@ -1701,61 +1583,14 @@ class KuzuRegistry:
         if self._resolution_phase == RegistryResolutionConstants.PHASE_REGISTRATION:
             return []
 
-        # @@ STEP: Generate current registry state hash
-        current_state_hash = self._get_registry_state_hash()
-
-        # @@ STEP: Check cache for existing validation results
-        cache_key = f"{node_name}{ForeignKeyValidationConstants.CACHE_KEY_SEPARATOR}{current_state_hash}"
-
-        if cache_key in self._foreign_key_validation_cache:
-            cached_state_hash, cached_errors = self._foreign_key_validation_cache[cache_key]
-            if cached_state_hash == current_state_hash:
-                logger.debug(f"Using cached foreign key validation results for {node_name}")
-                return cached_errors
-
-        # @@ STEP: Perform validation using existing method from KuzuBaseModel
-        try:
-            validation_errors = node_class.validate_foreign_keys()
-        except Exception as e:
-            # Graceful degradation: log and return as non-critical error, do not raise
-            logger.warning(
-                "Foreign key validation failed for %s: %s: %s",
-                node_name,
-                type(e).__name__,
-                e,
-            )
-            # Return a message containing 'error'/'failed' so caller treats it as non-critical
-            return [f"validation failed: {type(e).__name__}: {e}"]
-
-        # @@ STEP: Cache the validation results
-        if len(self._foreign_key_validation_cache) >= ForeignKeyValidationConstants.CACHE_MAX_SIZE:
-            # @@ STEP: Clear oldest entries (simple FIFO eviction)
-            oldest_keys = list(self._foreign_key_validation_cache.keys())[:100]
-            for old_key in oldest_keys:
-                del self._foreign_key_validation_cache[old_key]
-        self._foreign_key_validation_cache[cache_key] = (current_state_hash, validation_errors)
-
-        return validation_errors
+        return node_class.validate_foreign_keys()
 
     def is_finalized(self) -> bool:
         """Check if the registry has been finalized."""
         return self._resolution_phase == RegistryResolutionConstants.PHASE_FINALIZED
 
     def get_field_metadata(self, field_info: FieldInfo) -> Optional[KuzuFieldMetadata]:
-        """
-        Get Kuzu metadata from field info with caching (hot path).
-
-        :param field_info: Pydantic field info
-        :type field_info: FieldInfo
-        :returns: Kuzu field metadata or None
-        :rtype: Optional[KuzuFieldMetadata]
-        """
-        # @@ STEP: Cache by identity of FieldInfo (stable per model class)
-        cache_key = id(field_info)
-        cached = self._field_metadata_cache.get(cache_key, None)
-        if cached is not None or cache_key in self._field_metadata_cache:
-            return cached
-
+        """Return Kuzu metadata from field info."""
         result: Optional[KuzuFieldMetadata] = None
         if field_info.json_schema_extra and isinstance(field_info.json_schema_extra, dict):
             kuzu_meta = field_info.json_schema_extra.get(ModelMetadataConstants.KUZU_FIELD_METADATA)
@@ -1771,9 +1606,6 @@ class KuzuRegistry:
                             elem = getattr(KuzuDataType, elem)
                         kuzu_meta["kuzu_type"] = ArrayTypeSpecification(element_type=elem)
                     result = KuzuFieldMetadata(**kuzu_meta)
-
-        # Store even when None to avoid repeated dict lookups and type checks
-        self._field_metadata_cache[cache_key] = result
         return result
 
 
@@ -1943,7 +1775,7 @@ def kuzu_relationship(
 
         # @@ STEP 2: Store relationship metadata
         cls.__kuzu_relationship_name__ = rel_name # type: ignore
-        cls.__kuzu_rel_name__ = rel_name # type: ignore  # Keep for backward compatibility
+        cls.__kuzu_rel_name__ = rel_name # type: ignore
 
         # Store relationship pairs
         cls.__kuzu_relationship_pairs__ = rel_pairs # type: ignore
@@ -2006,17 +1838,8 @@ class KuzuBaseModel(BaseModel):
             try:
                 pk_value = self.__dict__[primary_key_field]
 
-                # Special handling for auto-increment fields
-                if pk_value is None:
-                    # Check if this is an auto-increment field that wasn't explicitly set
-                    auto_increment_fields = self.get_auto_increment_fields()
-                    if primary_key_field in auto_increment_fields:
-                        fields_set = getattr(self, '__pydantic_fields_set__', set())
-                        if primary_key_field not in fields_set:
-                            # For auto-increment fields that are unset, use object identity
-                            # This ensures that multiple instances with unset auto-increment PKs
-                            # are treated as different objects in sets
-                            return hash(id(self))
+                if pk_value is None and primary_key_field in self.get_auto_increment_fields():
+                    return hash(id(self))
 
                 return hash((self.__class__.__name__, pk_value))
             except KeyError:
@@ -2025,9 +1848,7 @@ class KuzuBaseModel(BaseModel):
                     f"Cannot compute hash for {self.__class__.__name__}: "
                     f"primary key field '{primary_key_field}' is not set"
                 )
-        logger.warning(f"Cannot compute hash for {self.__class__.__name__}: no primary key field")
-        # Fallback to hashing based on object identity
-        return hash(id(self))
+        raise ValueError(f"Cannot compute hash for {self.__class__.__name__}: no primary key field")
 
     def __eq__(self, other: object) -> bool:
         """Define equality based on primary key or object identity."""
@@ -2042,6 +1863,11 @@ class KuzuBaseModel(BaseModel):
             try:
                 self_pk = self.__dict__[primary_key_field]
                 other_pk = other.__dict__[primary_key_field]
+                if (
+                    primary_key_field in self.get_auto_increment_fields()
+                    and (self_pk is None or other_pk is None)
+                ):
+                    return self is other
                 return self_pk == other_pk
             except KeyError as e:
                 # One or both PKs not set - THIS IS AN ERROR
@@ -2049,8 +1875,7 @@ class KuzuBaseModel(BaseModel):
                     f"Cannot compare {self.__class__.__name__} instances: "
                     f"primary key field '{primary_key_field}' is not set. Error: {e}"
                 )
-        logger.warning(f"Cannot compare {self.__class__.__name__} instances: no primary key field")
-        return id(self) == id(other)
+        raise ValueError(f"Cannot compare {self.__class__.__name__} instances: no primary key field")
 
     @classmethod
     def query(cls, session: Optional["KuzuSession"] = None) -> "Query":
@@ -2075,42 +1900,29 @@ class KuzuBaseModel(BaseModel):
 
     @classmethod
     def get_all_kuzu_metadata(cls) -> Dict[str, KuzuFieldMetadata]:
-        cached = cls.__dict__.get("__kuzu_cached_all_meta__")
-        if cached is not None:
-            return cached  # type: ignore[return-value]
         res: Dict[str, KuzuFieldMetadata] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta:
                 res[field_name] = meta
-        # cache on class for subsequent lookups
-        setattr(cls, "__kuzu_cached_all_meta__", res)
         return res
 
     @classmethod
     def get_primary_key_fields(cls) -> List[str]:
-        cached = cls.__dict__.get("__kuzu_cached_pk_fields__")
-        if cached is not None:
-            return cached  # type: ignore[return-value]
         pks: List[str] = []
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.primary_key:
                 pks.append(field_name)
-        setattr(cls, "__kuzu_cached_pk_fields__", pks)
         return pks
 
     @classmethod
     def get_foreign_key_fields(cls) -> Dict[str, ForeignKeyReference]:
-        cached = cls.__dict__.get("__kuzu_cached_fk_fields__")
-        if cached is not None:
-            return cached  # type: ignore[return-value]
         fks: Dict[str, ForeignKeyReference] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.foreign_key:
                 fks[field_name] = meta.foreign_key
-        setattr(cls, "__kuzu_cached_fk_fields__", fks)
         return fks
 
     @classmethod
@@ -2121,15 +1933,11 @@ class KuzuBaseModel(BaseModel):
         Returns:
             List of field names that are auto-increment (SERIAL) fields
         """
-        cached = cls.__dict__.get("__kuzu_cached_ai_fields__")
-        if cached is not None:
-            return cached  # type: ignore[return-value]
         auto_inc_fields: List[str] = []
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.auto_increment:
                 auto_inc_fields.append(field_name)
-        setattr(cls, "__kuzu_cached_ai_fields__", auto_inc_fields)
         return auto_inc_fields
 
     @classmethod
@@ -2140,15 +1948,11 @@ class KuzuBaseModel(BaseModel):
         Returns:
             Dictionary mapping field names to their KuzuFieldMetadata for auto-increment fields
         """
-        cached = cls.__dict__.get("__kuzu_cached_ai_meta__")
-        if cached is not None:
-            return cached  # type: ignore[return-value]
         auto_inc_meta: Dict[str, KuzuFieldMetadata] = {}
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.auto_increment:
                 auto_inc_meta[field_name] = meta
-        setattr(cls, "__kuzu_cached_ai_meta__", auto_inc_meta)
         return auto_inc_meta
 
     @classmethod
@@ -2159,15 +1963,10 @@ class KuzuBaseModel(BaseModel):
         Returns:
             True if there's a primary key field with auto_increment=True
         """
-        cached = cls.__dict__.get("__kuzu_cached_has_ai_pk__")
-        if cached is not None:
-            return bool(cached)
         for field_name, field_info in cls.model_fields.items():
             meta = _kuzu_registry.get_field_metadata(field_info)
             if meta and meta.primary_key and meta.auto_increment:
-                setattr(cls, "__kuzu_cached_has_ai_pk__", True)
                 return True
-        setattr(cls, "__kuzu_cached_has_ai_pk__", False)
         return False
 
     def get_auto_increment_fields_needing_generation(self) -> List[str]:
@@ -2233,8 +2032,7 @@ class KuzuBaseModel(BaseModel):
         # || S.3.2: Defensive handling of missing or invalid __pydantic_fields_set__
         fields_set = getattr(self, '__pydantic_fields_set__', set())
         if not isinstance(fields_set, set):
-            # || S.3.3: Handle corrupted __pydantic_fields_set__ gracefully
-            fields_set = set()
+            raise TypeError("__pydantic_fields_set__ must be a set")
 
         # @@ STEP 4: Find intersection of auto-increment fields and explicitly set fields
         # || S.4.1: Use set intersection for precision and performance
@@ -2302,16 +2100,14 @@ class KuzuBaseModel(BaseModel):
                     )
 
             else:
-                # @@ STEP: Handle unresolved references
                 target_type = fk_ref.get_target_type()
 
                 if target_type == RegistryResolutionConstants.TARGET_TYPE_STRING:
-                    # @@ STEP: String references are valid and will be resolved later
-                    # We can optionally check if the target model name exists in the registry
                     target_name = fk_ref.target_model
                     if not _kuzu_registry.get_model_by_name(target_name):
-                        # @@ STEP: Only warn, don't error - the model might be defined later
-                        logger.warning(f"Field {field_name}: target model '{target_name}' not found in registry yet")
+                        errors.append(
+                            f"Field {field_name}: target model '{target_name}' is not registered"
+                        )
 
                 elif target_type == RegistryResolutionConstants.TARGET_TYPE_CLASS:
                     # @@ STEP: Direct class reference - validate immediately
@@ -2344,8 +2140,7 @@ class KuzuBaseModel(BaseModel):
                         )
 
                 elif target_type == RegistryResolutionConstants.TARGET_TYPE_CALLABLE:
-                    # @@ STEP: Callable references will be resolved later - skip validation for now
-                    pass
+                    errors.append(f"Field {field_name}: callable foreign key target is unresolved")
 
                 else:
                     errors.append(f"Field {field_name}: unknown target type '{target_type}'")
@@ -2482,9 +2277,8 @@ class KuzuNodeBase(KuzuBaseModel):
         """
         Automatically validate foreign key references for this node instance.
 
-        This validator runs after field validation and uses the registry's caching
-        system to efficiently validate foreign key references without causing
-        circular dependencies or double-validation.
+        This validator runs after field validation and uses registry metadata to
+        validate foreign key references.
 
         Returns:
             Self if validation passes
@@ -2492,38 +2286,17 @@ class KuzuNodeBase(KuzuBaseModel):
         Raises:
             ValueError: If foreign key validation fails with critical errors
         """
-        # @@ STEP: Get node name for validation
-        try:
-            node_name = self.get_node_name()
-        except ValueError:
-            # @@ STEP: Skip validation if node is not properly decorated
-            logger.debug(f"Skipping foreign key validation for {self.__class__.__name__} - not properly decorated")
-            return self
+        node_name = self.get_node_name()
 
-        # @@ STEP: Perform cached foreign key validation using registry
         validation_errors = _kuzu_registry._validate_foreign_keys_for_node(node_name, self.__class__)
 
-        # @@ STEP: Handle validation errors
         if validation_errors:
-            # @@ STEP: Log validation errors for debugging
-            logger.warning(f"Foreign key validation errors for {node_name}: {validation_errors}")
-
-            # @@ STEP: Only raise for critical structural errors, allow runtime errors to pass
-            critical_errors = [
-                error for error in validation_errors
-                if any(keyword in error.lower() for keyword in [
-                    "not found", "missing", "invalid"
-                ]) and not any(skip_keyword in error.lower() for skip_keyword in [
-                    "warning", "failed", "error"
-                ])
-            ]
-
-            if critical_errors:
-                error_msg = ErrorMessages.FOREIGN_KEY_VALIDATION_FAILED.format(
+            raise ValueError(
+                ErrorMessages.FOREIGN_KEY_VALIDATION_FAILED.format(
                     model_name=node_name,
-                    errors="; ".join(critical_errors)
+                    errors="; ".join(validation_errors),
                 )
-                raise ValueError(error_msg)
+            )
 
         return self
 
@@ -2539,75 +2312,22 @@ NodeReference = Union[KuzuNodeBase, uuid.UUID, int, float, bytes, datetime.datet
 
 
 class RelationshipNodeTypeQuery:
-    """
-    Intermediate object for fluent relationship node type queries.
-
-    Provides high-performance querying of relationship node type mappings with
-    microsecond-level optimization through pre-computed lookup tables.
-
-    Foundation:
-    Given relationship R with pairs P = {(f₁, t₁), (f₂, t₂), ..., (fₙ, tₙ)}:
-    - from_nodes_types(S).to_nodes_types = {t | ∃f ∈ S, (f,t) ∈ P}
-    - to_nodes_types(S).from_nodes_types = {f | ∃t ∈ S, (f,t) ∈ P}
-
-    Performance: O(1) lookup per node type, O(|S|) for sets of node types.
-    """
+    """Expose ATP relationship node-type results through the ORM API."""
 
     __slots__ = ("_result", "_query_type")
 
     def __init__(self, relationship_class: Type[Any], query_type: str, node_types: Tuple[Type[Any], ...]) -> None:
-        """
-        Ultra-fast initialization with immediate result computation.
-
-        No deferred computation - results are available instantly.
-
-        Args:
-            relationship_class: The relationship class being queried
-            query_type: Either "from" or "to" indicating query direction
-            node_types: Tuple of node types to query for
-
-        Raises:
-            ValueError: If relationship class is abstract or has no pairs
-            TypeError: If node types are invalid
-        """
         self._query_type = query_type
+        from .kuzu_relationship_read import relationship_endpoint_types
 
-        # Get pre-built cache with zero validation overhead
-        cache = relationship_class._direct_cache
+        endpoint_types = relationship_endpoint_types(relationship_class)
+        target_names = resolve_kuzu_relationship_node_names(
+            _relationship_node_label_pairs(relationship_class),
+            query_type,
+            [_node_type_label(node_type) for node_type in node_types],
+        )
+        self._result = frozenset(_relationship_node_type(endpoint_types, name) for name in target_names)
 
-        # Single optimized path for result computation
-        if len(node_types) == 1:
-            # Single node path - fastest possible
-            cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE
-            self._result = cache[cache_key].get(node_types[0], frozenset())
-        else:
-            # Multi-node path with fast set-union computation (pure Python; no numpy)
-            key = frozenset(node_types)
-            cache_key = RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM else RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP
-
-            # @@ STEP: Try cache first for performance
-            cached_result = cache[cache_key].get(key)
-            if cached_result is not None:
-                self._result = cached_result
-            else:
-                # Compute fast union directly from single-node maps
-                if query_type == RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM:
-                    single = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE]
-                else:
-                    single = cache[RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE]
-
-                result_set = set()
-                for nt in node_types:
-                    s = single.get(nt)
-                    if s:
-                        # s is a frozenset of target node types
-                        result_set.update(s)
-                self._result = frozenset(result_set)
-
-                # @@ STEP: Cache the computed result for future queries
-                cache[cache_key][key] = self._result
-
-    # @@ STEP: Properties enforce correct-direction access with zero-logic fast-path
     @property
     def to_nodes_types(self) -> frozenset:
         """Return reachable TO node types for a FROM query; error if wrong direction."""
@@ -2621,6 +2341,38 @@ class RelationshipNodeTypeQuery:
         if self._query_type != RelationshipNodeTypeQueryConstants.QUERY_TYPE_TO:
             raise ValueError("from_nodes_types can only be called on to_nodes_types() queries")
         return self._result
+
+
+def _node_type_label(node_type: Type[Any]) -> str:
+    label = getattr(node_type, "__kuzu_node_name__", None)
+    if not isinstance(label, str) or not label:
+        raise TypeError(
+            RelationshipNodeTypeQueryConstants.INVALID_NODE_TYPE.format(
+                node_type,
+                type(node_type).__name__,
+            )
+        )
+    return label
+
+
+def _relationship_node_type(endpoint_types: dict[str, Type[Any]], label: str) -> Type[Any]:
+    node_type = endpoint_types.get(label)
+    if node_type is None:
+        raise ValueError(f"Node type '{label}' not found in relationship endpoints")
+    return node_type
+
+
+def _relationship_node_label_pairs(relationship_class: Type[Any]) -> list[dict[str, str]]:
+    pairs = getattr(relationship_class, "__kuzu_relationship_pairs__", [])
+    if not pairs:
+        raise ValueError(f"No relationship pairs found for {relationship_class.__name__}")
+    return [
+        {
+            "from_label": pair.get_from_name(),
+            "to_label": pair.get_to_name(),
+        }
+        for pair in pairs
+    ]
 
 
 @kuzu_relationship(
@@ -2649,22 +2401,15 @@ class KuzuRelationshipBase(KuzuBaseModel):
 
     def __hash__(self) -> int:
         """Make relationship instances hashable using from/to node combination plus properties."""
-        # Use from/to node primary keys plus all property values for hashing
-        if self._from_node_pk is not None and self._to_node_pk is not None:
-            # Include key property values in hash to distinguish relationships with same nodes but different properties
-            try:
-                property_values = []
-                for field_name in self.__class__.model_fields:
-                    if hasattr(self, field_name):
-                        value = getattr(self, field_name, None)
-                        if value is not None and isinstance(value, (str, int, float, bool)):
-                            property_values.append((field_name, value))
-
-                return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk, tuple(property_values)))
-            except Exception as e:
-                raise RuntimeError(f"Failed to compute relationship hash: {type(e).__name__}: {e}") from e
-        # Fallback to object identity if nodes not set
-        return hash(id(self))
+        if self._from_node_pk is None or self._to_node_pk is None:
+            raise ValueError(f"Cannot compute hash for {self.__class__.__name__}: endpoint primary key is missing")
+        property_values = []
+        for field_name in self.__class__.model_fields:
+            if hasattr(self, field_name):
+                value = getattr(self, field_name, None)
+                if value is not None and isinstance(value, (str, int, float, bool)):
+                    property_values.append((field_name, value))
+        return hash((self.__class__.__name__, self._from_node_pk, self._to_node_pk, tuple(property_values)))
 
     def __eq__(self, other: object) -> bool:
         """Define equality based on from/to node combination plus properties."""
@@ -2688,8 +2433,7 @@ class KuzuRelationshipBase(KuzuBaseModel):
 
             return True
 
-        # Fallback to object identity
-        return id(self) == id(other)
+        return self is other
 
     @property
     def from_node_pk(self) -> Optional[Any]:
@@ -2811,13 +2555,9 @@ class KuzuRelationshipBase(KuzuBaseModel):
         if isinstance(value, uuid.UUID):
             return value
 
-        # Handle decimal types
-        try:
-            from decimal import Decimal
-            if isinstance(value, Decimal):
-                return value
-        except ImportError:
-            pass
+        from decimal import Decimal
+        if isinstance(value, Decimal):
+            return value
 
         # If we get here, the type is not supported
         raise ValueError(f"Primary key value type '{python_type.__name__}' is not supported by Kuzu. "
@@ -2903,159 +2643,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
         session.commit()
 
     @classmethod
-    def _build_node_type_cache(cls) -> None:
-        """
-        ULTRA-FAST cache building with vectorized NumPy operations and Numba JIT compilation.
-
-        This method provides 100-1000x performance improvements over the original implementation
-        by eliminating ALL Python loops and using vectorized operations throughout.
-
-        Foundation:
-        - Uses ultra-optimized NumPy + Numba JIT implementation with parallel processing
-        - Computes unions for all 2^n subsets where n is the number of node types
-        - Time complexity: O(n × 2^n) with massive constant factor improvements via vectorization
-        - Space complexity: O(2^n × average_union_size) with optimal memory layout
-
-        Performance Optimizations:
-        - Numba JIT compilation to native machine code
-        - Parallel processing across CPU cores
-        - Vectorized NumPy boolean operations (SIMD optimized)
-        - Zero-copy data structures where possible
-        - Cache-conscious memory layout
-
-        Raises:
-            ValueError: If relationship has no pairs or is abstract
-        """
-        # @@ STEP: Compliant validation using getattr() instead of dictionary access
-        is_abstract = getattr(cls, '__kuzu_is_abstract__', False)
-        if is_abstract:
-            raise ValueError(f"Cannot build cache for abstract relationship {cls.__name__}")
-
-        # @@ STEP: Compliant pairs access using getattr() instead of dictionary access
-        pairs = getattr(cls, '__kuzu_relationship_pairs__', [])
-        if not pairs:
-            raise ValueError(f"No relationship pairs found for {cls.__name__}")
-
-        # @@ STEP: Ultra-fast node resolution with caching to eliminate repeated registry lookups
-        resolved_pairs = []
-        node_resolution_cache = {}
-
-        for pair in pairs:
-            # @@ STEP: Use cached resolution to avoid repeated registry lookups
-            from_node_key = id(pair.from_node) if not isinstance(pair.from_node, str) else pair.from_node
-            to_node_key = id(pair.to_node) if not isinstance(pair.to_node, str) else pair.to_node
-
-            if from_node_key not in node_resolution_cache:
-                node_resolution_cache[from_node_key] = cls._resolve_node_type(pair.from_node)
-            if to_node_key not in node_resolution_cache:
-                node_resolution_cache[to_node_key] = cls._resolve_node_type(pair.to_node)
-
-            resolved_pairs.append((
-                node_resolution_cache[from_node_key],
-                node_resolution_cache[to_node_key]
-            ))
-
-        # @@ STEP: Extract unique nodes using fastest possible method
-        all_from_nodes = set()
-        all_to_nodes = set()
-        for from_node, to_node in resolved_pairs:
-            all_from_nodes.add(from_node)
-            all_to_nodes.add(to_node)
-
-        # @@ STEP: Build caches using pure-Python set unions (no NumPy)
-        from_to_map, to_from_map, from_to_single, to_from_single = cls.cache_bitset_builder_simple(
-            resolved_pairs, all_from_nodes, all_to_nodes)
-
-        # @@ STEP: Store cache with minimal dictionary nesting including adjacency matrices
-        cache_dict = {
-            RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP: from_to_map,
-            RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP: to_from_map,
-            RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_SINGLE: from_to_single,
-            RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_SINGLE: to_from_single,
-        }
-        cls._node_type_cache[cls.__name__] = cache_dict
-
-        # @@ STEP: Store direct cache reference to eliminate dictionary lookup overhead
-        cls._direct_cache = cache_dict
-
-    @classmethod
-    def cache_bitset_builder_simple(cls, resolved_pairs, all_from_nodes, all_to_nodes):
-        """
-        Build mapping caches using pure-Python sets.
-
-        Returns:
-            Tuple (from_to_map, to_from_map, from_to_single, to_from_single)
-        """
-        if not resolved_pairs or not all_from_nodes or not all_to_nodes:
-            return {}, {}, {}, {}
-
-        # Single-node maps
-        from_to_single: Dict[Type[Any], frozenset] = {}
-        to_from_single: Dict[Type[Any], frozenset] = {}
-
-        # Build adjacency sets
-        tmp_from_to: Dict[Type[Any], set] = {}
-        tmp_to_from: Dict[Type[Any], set] = {}
-        for f, t in resolved_pairs:
-            tmp_from_to.setdefault(f, set()).add(t)
-            tmp_to_from.setdefault(t, set()).add(f)
-
-        # Freeze single-node maps
-        for f, s in tmp_from_to.items():
-            from_to_single[f] = frozenset(s)
-        for t, s in tmp_to_from.items():
-            to_from_single[t] = frozenset(s)
-
-        # Multi-node union caches (start with singletons; larger sets cached on-demand)
-        from_to_map: Dict[frozenset, frozenset] = {}
-        to_from_map: Dict[frozenset, frozenset] = {}
-        for f, s in from_to_single.items():
-            from_to_map[frozenset({f})] = s
-        for t, s in to_from_single.items():
-            to_from_map[frozenset({t})] = s
-
-        return from_to_map, to_from_map, from_to_single, to_from_single
-
-    @classmethod
-    def _resolve_node_type(cls, node_ref: Union[Type[Any], str]) -> Type[Any]:
-        """
-        Resolve a node reference (string or class) to the actual node class.
-
-        Args:
-            node_ref: Either a node class or string reference to a node
-
-        Returns:
-            The resolved node class
-
-        Raises:
-            ValueError: If node reference cannot be resolved
-        """
-        if isinstance(node_ref, str):
-            resolved_node = get_node_by_name(node_ref)
-            if isinstance(resolved_node, type):
-                return resolved_node
-            raise ValueError(f"Node type '{node_ref}' not found in registry")
-        elif isinstance(node_ref, type):
-            return node_ref
-        else:
-            raise TypeError(
-                RelationshipNodeTypeQueryConstants.INVALID_NODE_TYPE.format(
-                    node_ref, type(node_ref).__name__
-                )
-            )
-
-    @classmethod
-    def _invalidate_cache(cls) -> None:
-        """
-        Invalidate the node type cache for this relationship class.
-
-        Should be called when relationship pairs are modified or registry changes.
-        """
-        cache_key = cls.__name__
-        if cache_key in cls._node_type_cache:
-            del cls._node_type_cache[cache_key]
-
-    @classmethod
     def from_nodes_types(cls, *node_types: Type[Any]) -> RelationshipNodeTypeQuery:
         """
         Create a query for all to_node types reachable from the specified from_node types.
@@ -3073,7 +2660,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
             ValueError: If relationship is abstract or has no pairs
             TypeError: If any node_type is not a class
         """
-        # @@ STEP: Validate abstract relationship early to avoid cache access
         if getattr(cls, "__kuzu_is_abstract__", False):
             raise ValueError(
                 RelationshipNodeTypeQueryConstants.ABSTRACT_RELATIONSHIP_QUERY.format(cls.__name__)
@@ -3084,9 +2670,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
                 raise TypeError(
                     RelationshipNodeTypeQueryConstants.INVALID_NODE_TYPE.format(nt, type(nt).__name__)
                 )
-        # @@ STEP: Ensure cache is built once (idempotent)
-        if getattr(cls, "_direct_cache", None) is None:
-            cls._build_node_type_cache()
         return RelationshipNodeTypeQuery(
             cls,
             RelationshipNodeTypeQueryConstants.QUERY_TYPE_FROM,
@@ -3111,7 +2694,6 @@ class KuzuRelationshipBase(KuzuBaseModel):
             ValueError: If relationship is abstract or has no pairs
             TypeError: If any node_type is not a class
         """
-        # @@ STEP: Validate abstract relationship early to avoid cache access
         if getattr(cls, "__kuzu_is_abstract__", False):
             raise ValueError(
                 RelationshipNodeTypeQueryConstants.ABSTRACT_RELATIONSHIP_QUERY.format(cls.__name__)
@@ -3122,22 +2704,11 @@ class KuzuRelationshipBase(KuzuBaseModel):
                 raise TypeError(
                     RelationshipNodeTypeQueryConstants.INVALID_NODE_TYPE.format(nt, type(nt).__name__)
                 )
-        # @@ STEP: Ensure cache is built once (idempotent)
-        if getattr(cls, "_direct_cache", None) is None:
-            cls._build_node_type_cache()
         return RelationshipNodeTypeQuery(
             cls,
             RelationshipNodeTypeQueryConstants.QUERY_TYPE_TO,
             node_types
         )
-
-# @@ STEP: Class-level cache for node type mappings (performance-critical)
-# || S.S: Using module-level variable to avoid Pydantic private attribute conflicts
-_relationship_node_type_cache: Dict[str, Dict[str, Any]] = {}
-
-# @@ STEP: Attach cache to KuzuRelationshipBase class
-KuzuRelationshipBase._node_type_cache = _relationship_node_type_cache
-
 
 # -----------------------------------------------------------------------------
 # Field helpers
@@ -3207,7 +2778,7 @@ def generate_node_ddl(cls: Type[Any]) -> str:
 
         # @@ STEP: Generate Kuzu-valid column definition
         # || S.1: Only PRIMARY KEY and DEFAULT are supported in NODE tables
-        col_def = meta.to_ddl_column_definition(field_name, is_node_table=True)
+        col_def = meta.to_ddl_column_definition(field_name)
         columns_minimal.append(col_def)
 
         # Track PK fields for composite handling
@@ -3269,19 +2840,10 @@ def generate_relationship_ddl(cls: Type[T]) -> str:
       - Table-level constraints (reported in comments)
       - Compound indexes emitted after CREATE
     """
-    # @@ STEP 1: Validate relationship decorator
-    try:
-        is_relationship = cls.__is_kuzu_relationship__ # type: ignore
-    except AttributeError:
-        is_relationship = False
-
-    if not is_relationship:
-        try:
-            _ = cls.__kuzu_relationship_name__ # type: ignore
-        except AttributeError:
-            raise ValueError(f"Class {cls.__name__} not decorated with @kuzu_relationship") from None
-
-    rel_name = cls.__kuzu_relationship_name__ # type: ignore
+    is_relationship = bool(getattr(cls, "__is_kuzu_relationship__", False))
+    rel_name = getattr(cls, "__kuzu_relationship_name__", None)
+    if not is_relationship or not isinstance(rel_name, str) or not rel_name:
+        raise ValueError(f"Class {cls.__name__} not decorated with @kuzu_relationship")
 
     # @@ STEP 2: Get relationship pairs
     rel_pairs = cls.__kuzu_relationship_pairs__ # type: ignore
@@ -3427,16 +2989,12 @@ def get_ddl_for_relationship(rel_cls: Type[Any]) -> str:
     :param rel_cls: Relationship class.
     :return: DDL statement.
     """
-    # @@ STEP: Validate relationship class has required attribute
-    try:
-        rel_name = rel_cls.__kuzu_rel_name__
-        _ = rel_name  # Mark as intentionally unused - only used for validation
-    except AttributeError:
+    rel_name = getattr(rel_cls, "__kuzu_rel_name__", None)
+    if not isinstance(rel_name, str) or not rel_name:
         raise ValueError(
             ValidationMessageConstants.MISSING_KUZU_REL_NAME.format(rel_cls.__name__)
         )
 
-    # Multi-pair or new single-pair format
     return generate_relationship_ddl(rel_cls)
 
 def get_all_ddl() -> str:
@@ -3502,27 +3060,12 @@ def clear_registry():
     # @@ STEP 2: Reset resolution phase before clearing main dictionaries
     _kuzu_registry._resolution_phase = RegistryResolutionConstants.PHASE_REGISTRATION
 
-    # @@ STEP 2.1: Clear all relationship node type caches
-    _relationship_node_type_cache.clear()
-
-    # @@ STEP 2.2: Clear all query result caches from relationship classes
-    for rel_cls in _kuzu_registry.relationships.values():
-        query_cache = getattr(rel_cls, '_query_result_cache', None)
-        if query_cache is not None:
-            query_cache.clear()
-
     # @@ STEP 3: Clear main model registrations AFTER breaking circular references
     # || S.S.2: Now safe to clear complex Pydantic model classes without memory corruption
     _kuzu_registry.nodes.clear()
+    _kuzu_registry._node_aliases.clear()
     _kuzu_registry.relationships.clear()
     _kuzu_registry.models.clear()
-
-    # @@ STEP 3.1: Clear hot path caches that may hold onto FieldInfo identities
-    # || IMPORTANT: C-extension allocators can reuse memory addresses, causing id(FieldInfo)
-    # || collisions across tests/classes. We must clear the cache to avoid cross-talk.
-    _kuzu_registry._field_metadata_cache.clear()
-    clear_all_enum_conversion_plans()
-    clear_all_uuid_normalization_plans()
 
     # @@ STEP 4: No forced garbage collection - let Python handle cleanup naturally
     # || S.S.3: Forced gc.collect() on complex objects with circular refs causes segfaults
@@ -3530,33 +3073,7 @@ def clear_registry():
 
 
 def get_node_by_name(name: str) -> Optional[Type[Any]]:
-    node = _kuzu_registry.nodes.get(name)
-    if node is not None:
-        return node
-
-    placeholder_name = f"_{name}Placeholder"
-
-    for candidate in _kuzu_registry.nodes.values():
-        candidate_name = getattr(candidate, "__name__", None)
-        if candidate_name == name or candidate_name == placeholder_name:
-            return candidate
-
-    for module in list(sys.modules.values()):
-        mod_dict = getattr(module, "__dict__", None)
-        if not isinstance(mod_dict, dict):
-            continue
-        for obj in mod_dict.values():
-            if isinstance(obj, type) and getattr(obj, "__is_kuzu_node__", False):
-                node_name = getattr(obj, "__kuzu_node_name__", None)
-                class_name = getattr(obj, "__name__", None)
-                if node_name == name:
-                    _kuzu_registry.register_node(name, obj)
-                    return obj
-                if class_name == name or class_name == placeholder_name:
-                    if isinstance(node_name, str) and node_name:
-                        _kuzu_registry.register_node(node_name, obj)
-                    return obj
-    return None
+    return _kuzu_registry.get_node(name)
 
 
 def get_relationship_by_name(name: str) -> Optional[Type[Any]]:

@@ -21,6 +21,7 @@ from kuzualchemy.kuzu_orm import (
     RelationshipPair,
     RelationshipMultiplicity,
     KuzuDataType,
+    _kuzu_registry,
 )
 from kuzualchemy.kuzu_query_builder import CypherQueryBuilder, QueryState
 
@@ -82,6 +83,12 @@ class Match(KuzuBaseModel):
 class Case(KuzuBaseModel):
     """Case node for canonical string-label resolution tests."""
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+
+
+@pytest.fixture(autouse=True)
+def register_module_nodes():
+    for node_type in (User, City, Post, UserGroup, Device, With, Match, Case):
+        _kuzu_registry.register_node(node_type.__kuzu_node_name__, node_type)
 
 
 # @@ STEP 2: Test single-pair relationships
@@ -249,11 +256,10 @@ class TestErrorCases:
             """Node without kuzu_node decorator."""
             pass
 
-        # Test that we can create the relationship pair and get the name
         pair = RelationshipPair(InvalidNode, User)
 
-        # This should work because InvalidNode has __name__ attribute
-        assert pair.get_from_name() == "InvalidNode"
+        with pytest.raises(ValueError, match="not a decorated node"):
+            pair.get_from_name()
         assert pair.get_to_name() == "User"
     
     def test_abstract_relationship_no_pairs_allowed(self):

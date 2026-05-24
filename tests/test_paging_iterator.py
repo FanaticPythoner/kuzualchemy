@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
-import re
-
 import pytest
 import tempfile
 import shutil
 import uuid
 from pathlib import Path
 
+import atp_pipeline.kuzu as atp_kuzu
 from kuzualchemy import KuzuSession
 from kuzualchemy.test_utilities import initialize_schema
 
@@ -143,25 +142,19 @@ def test_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
         # Force sequential path for this regression check.
         monkeypatch.setenv("ATP_READONLY_POOL_MAX_SIZE", "1")
 
-        executed_queries: list[str] = []
-        original_execute = sess._execute_for_query_object
+        executed_offsets: list[int] = []
+        original_read_pages = atp_kuzu.read_kuzu_pages
 
-        def _spy_execute(query: str, parameters=None):
-            executed_queries.append(query)
-            return original_execute(query, parameters)
+        def _spy_read_pages(handler, query: str, parameters, offsets: list[int], limit: int):
+            executed_offsets.extend(offsets)
+            return original_read_pages(handler, query, parameters, offsets, limit)
 
-        monkeypatch.setattr(sess, "_execute_for_query_object", _spy_execute)
+        monkeypatch.setattr(atp_kuzu, "read_kuzu_pages", _spy_read_pages)
 
         items = list(sess.query(TestUser).order_by("id").iter(page_size=2, prefetch_pages=1))
         assert [u.id for u in items] == [1, 2, 3, 4]
 
-        skip_values = [
-            int(match.group(1))
-            for q in executed_queries
-            for match in [re.search(r"\bSKIP\s+(\d+)\b", q)]
-            if match is not None
-        ]
-        assert skip_values == [0, 2]
+        assert executed_offsets == [0, 2]
     finally:
         _cleanup_session(sess, db_path)
 
@@ -247,4 +240,3 @@ def test_iter_memory_bounded_for_large_dataset(test_models):
         assert added_peak < 20 * 1024 * 1024  # < 20MB
     finally:
         _cleanup_session(sess, db_path)
-

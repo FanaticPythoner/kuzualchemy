@@ -72,44 +72,35 @@ class TestPerformanceOptimizations:
         # Clear registry after tests
         ka.clear_registry()
 
-    def test_connection_reuse_threshold_boundary(self):
-        """Test connection reuse at exact threshold boundaries."""
-        # Test exactly at threshold
-        threshold = PerformanceConstants.CONNECTION_REUSE_THRESHOLD
-        
-        # No internal connection reuse state to reset under ATP-managed connections
+    def test_atp_managed_connection_has_no_reuse_threshold(self):
+        """Test repeated queries without ORM-owned connection reuse state."""
+        assert not hasattr(PerformanceConstants, "CONNECTION_REUSE_THRESHOLD")
+        assert not hasattr(self.session, "_connection_reuse_count")
 
-        # Execute exactly threshold number of operations
-        for i in range(threshold):
+        for _ in range(3):
             result = self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
             # Justification: Each query should return exactly one row with count=0
             # since no nodes have been inserted yet
             assert len(result) == 1
             assert result[0]["count"] == 0
 
-        # One more operation should continue to work identically under ATP
         result = self.session.execute("MATCH (n:ATNode) RETURN count(n) as count")
-        # Justification: After reaching threshold, connection should reset to 1
-        # but query result should still be the same
         assert len(result) == 1
         assert result[0]["count"] == 0
-        # No internal counters exist; only the results matter
 
     def test_identity_map_key_generation_edge_cases(self):
         """Test identity map key generation with edge case values."""
         # Test with various primary key types that could cause key collisions
         test_cases = [
-            (1, "1"),  # int vs string that looks like int
-            ("test", "test"),  # normal string
-            ("test:with:colons", "test:with:colons"),  # string with colons (key separator)
-            (0, "0"),  # zero values
-            (-1, "-1"),  # negative values
+            1,
+            0,
+            -1,
         ]
         
-        for pk_value, expected_str in test_cases:
-            key = self.session._generate_identity_key(self.ATNode, pk_value)
-            # Justification: Key should be exactly "ClassName:pk_value"
-            expected_key = f"ATNode:{expected_str}"
+        for pk_value in test_cases:
+            node = self.ATNode(id=pk_value, name="key", value=0)
+            key = self.session._identity_key(node)
+            expected_key = f"{self.ATNode.__module__}.{self.ATNode.__qualname__}:{(pk_value,)!r}"
             assert key == expected_key
 
     def test_smart_autoflush_with_no_pending_operations(self):
@@ -164,30 +155,33 @@ class TestPerformanceOptimizations:
         assert len(result) == 1
         assert result[0]["count"] == 1  # Node should be inserted after flush
 
-    def test_exception_handling_in_get_node_type_name_value_error(self):
-        """Test specific ValueError handling in _get_node_type_name method."""
-        # Create a node instance to test edge cases
-        broken_node = self.BrokenNode(id=1, name="test")
-        
-        # This should handle ValueError gracefully and continue with other node types
-        with pytest.raises(TypeError, match="Primary key value .* does not exist in any registered node type"):
-            self.session._get_node_type_name("nonexistent_pk_value")
+    def test_primary_key_label_lookup_returns_empty_for_missing_value(self):
+        """Test ATP-backed primary-key label lookup miss behavior."""
+        labels = self.session._conn.find_node_labels_for_primary_key(
+            [
+                (self.ATNode.__kuzu_node_name__, "id"),
+                (self.BrokenNode.__kuzu_node_name__, "id"),
+            ],
+            999,
+        )
+        assert labels == []
 
-    def test_exception_handling_in_get_node_type_name_database_error(self):
-        """Test database error handling in _get_node_type_name method."""
-        # Mock connection to simulate database errors
-        original_execute = self.session._conn.execute
-        
-        def mock_execute_with_error(query, params=None):
-            if "MATCH" in query and "count(n)" in query:
+    def test_primary_key_label_lookup_propagates_database_error(self):
+        """Test ATP-backed primary-key label lookup error propagation."""
+        class RaisingHandler:
+            def submit_work(self, work, *, expect_rows: bool = False, priority=None):
                 raise RuntimeError("Database connection failed")
-            return original_execute(query, params)
-        
-        self.session._conn.execute = mock_execute_with_error
-        
-        # This should handle RuntimeError gracefully and continue
-        with pytest.raises(TypeError, match="Primary key value .* does not exist in any registered node type"):
-            self.session._get_node_type_name("test_pk_value")
+
+        original_handler = self.session._conn._handler
+        self.session._conn._handler = RaisingHandler()
+        try:
+            with pytest.raises(RuntimeError, match="Database connection failed"):
+                self.session._conn.find_node_labels_for_primary_key(
+                    [(self.ATNode.__kuzu_node_name__, "id")],
+                    1,
+                )
+        finally:
+            self.session._conn._handler = original_handler
 
     def test_connection_reuse_with_stale_connection(self):
         """Test connection reuse recovery when connection becomes stale."""
@@ -219,7 +213,7 @@ class TestPerformanceOptimizations:
         assert merged.value == 200
         
         # Verify identity map key was generated correctly
-        expected_key = "ATNode:1"
+        expected_key = self.session._identity_key(node)
         assert expected_key in self.session._identity_map
         assert self.session._identity_map[expected_key] is merged
 
@@ -399,10 +393,10 @@ class TestPerformanceOptimizations:
             self.session.add(node)
 
             # Generate identity keys (should not create excessive objects)
-            key = self.session._generate_identity_key(self.ATNode, i)
+            key = self.session._identity_key(node)
             # Justification: Key should be a simple string
             assert isinstance(key, str)
-            assert key == f"ATNode:{i}"
+            assert key == f"{self.ATNode.__module__}.{self.ATNode.__qualname__}:{(i,)!r}"
 
         self.session.commit()
 
@@ -415,20 +409,13 @@ class TestPerformanceOptimizations:
         object_growth = final_objects - initial_objects
         assert object_growth < 1000, f"Excessive object creation: {object_growth} new objects"
 
-    def test_identity_map_initial_size_usage(self):
-        """Test that IDENTITY_MAP_INITIAL_SIZE constant is actually used."""
-        # @@ STEP: Verify that identity map was initialized with proper size
-        # || Verification: Pre-allocated dictionary should have been created
+    def test_identity_map_behavior_without_preallocation_constant(self):
+        """Test identity map behavior without ORM preallocation constants."""
         from kuzualchemy.constants import PerformanceConstants
 
-        # @@ STEP: The identity map should be initialized but empty
         assert len(self.session._identity_map) == 0
+        assert not hasattr(PerformanceConstants, "IDENTITY_MAP_INITIAL_SIZE")
 
-        # @@ STEP: Verify the constant is accessible and has expected value
-        assert PerformanceConstants.IDENTITY_MAP_INITIAL_SIZE == 256
-
-        # @@ STEP: Add items up to test pre-allocation effectiveness
-        # || This tests that the pre-allocation worked correctly
         nodes = []
         for i in range(10):  # Test with smaller number for performance
             node = self.ATNode(id=i, name=f"User {i}", value=20 + i)
@@ -437,33 +424,28 @@ class TestPerformanceOptimizations:
 
         self.session.flush()
 
-        # @@ STEP: Verify all nodes are in identity map with correct keys
         for i, node in enumerate(nodes):
-            identity_key = self.session._generate_identity_key(self.ATNode, i)
+            identity_key = self.session._identity_key(node)
             assert identity_key in self.session._identity_map
             assert self.session._identity_map[identity_key] == node
 
-    def test_autoflush_batch_size_usage(self):
-        """Test that AUTOFLUSH_BATCH_SIZE constant is wired into session config and pending counts are tracked."""
-        # @@ STEP: Verify the constant is accessible and used
+    def test_autoflush_tracks_pending_counts_without_batch_constant(self):
+        """Test autoflush pending counts without ORM batch-size constants."""
         from kuzualchemy.constants import PerformanceConstants
 
-        assert PerformanceConstants.AUTOFLUSH_BATCH_SIZE == 100
-        assert self.session._autoflush_batch_size == 100
+        assert not hasattr(PerformanceConstants, "AUTOFLUSH_BATCH_SIZE")
+        assert not hasattr(self.session, "_autoflush_batch_size")
 
-        # @@ STEP: Create operations below the batch threshold (legacy) and verify pending counts directly
         nodes = []
         for i in range(50):  # Below batch size
             node = self.ATNode(id=i, name=f"User {i}", value=20 + i)
             self.session.add(node)
             nodes.append(node)
 
-        # @@ STEP: Verify pending operations count is tracked without calling removed helper
         pending_count = len(self.session._new) + len(self.session._dirty) + len(self.session._deleted)
         assert pending_count == 50
         assert pending_count > 0  # Any pending operations will trigger autoflush on execute()
 
-        # @@ STEP: Add more to reach the legacy batch threshold and verify counts again
         for i in range(50, 100):  # Reach batch size
             node = self.ATNode(id=i, name=f"User {i}", value=20 + i)
             self.session.add(node)
@@ -473,32 +455,10 @@ class TestPerformanceOptimizations:
         assert pending_count == 100
         assert pending_count > 0
 
-    def test_metadata_cache_size_usage(self):
-        """Test that METADATA_CACHE_SIZE constant is actually used in metadata caching."""
-        # @@ STEP: Verify the constant is accessible and used
-        from kuzualchemy.constants import PerformanceConstants
-
-        assert PerformanceConstants.METADATA_CACHE_SIZE == 500
-        assert self.session._metadata_cache_size == 500
-
-        # @@ STEP: Test metadata caching functionality
-        # || Cache some metadata
-        test_metadata = ['id', 'name', 'value']
-        self.session._set_cached_metadata(self.ATNode, 'pk_fields', test_metadata)
-
-        # @@ STEP: Verify metadata is cached and retrievable
-        cached_metadata = self.session._get_cached_metadata(self.ATNode, 'pk_fields')
-        assert cached_metadata == test_metadata
-
-        # @@ STEP: Test LRU eviction by filling cache beyond capacity
-        # || Create metadata entries up to cache size
-        for i in range(10):  # Test with smaller number for performance
-            dummy_class_name = f"DummyClass{i}"
-            self.session._metadata_cache[f"{dummy_class_name}:pk_fields"] = [f"field_{i}"]
-
-        # @@ STEP: Verify cache size is managed
-        assert len(self.session._metadata_cache) <= self.session._metadata_cache_size
-
-        # @@ STEP: Test cache clearing
-        self.session._clear_metadata_cache()
-        assert len(self.session._metadata_cache) == 0
+    def test_session_metadata_cache_removed_from_orm_boundary(self):
+        """Test that DB metadata caching is not owned by KuzuSession."""
+        assert not hasattr(self.session, "_metadata_cache")
+        assert not hasattr(self.session, "_metadata_cache_size")
+        assert not hasattr(self.session, "_set_cached_metadata")
+        assert not hasattr(self.session, "_get_cached_metadata")
+        assert not hasattr(self.session, "_clear_metadata_cache")

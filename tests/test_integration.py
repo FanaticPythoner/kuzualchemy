@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import pytest
+
 from kuzualchemy import (
     kuzu_node,
     kuzu_relationship,
@@ -286,13 +288,12 @@ class TestEndToEndWorkflow:
         duplicate_user = self.IntegrationUser(id=1, name="Bob", email="bob@example.com")
         session.add(duplicate_user)
         
-        # @@ STEP: This should fail due to primary key constraint
-        try:
+        with pytest.raises(ValueError) as exc:
             session.commit()
-            assert False, "Should have raised an error for duplicate primary key"
-        except RuntimeError as e:
-            # Error should be propagated, not swallowed
-            assert "1" in str(e) or "primary" in str(e).lower() or "constraint" in str(e).lower()
+        assert any(
+            token in str(exc.value).lower()
+            for token in ("primary", "constraint", "duplicate", "conflict")
+        )
 
 
 class TestPerformanceScenarios:

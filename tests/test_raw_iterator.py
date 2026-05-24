@@ -6,9 +6,9 @@ from __future__ import annotations
 import tempfile
 import shutil
 import uuid
-import re
 from pathlib import Path
 
+import atp_pipeline.kuzu as atp_kuzu
 import pytest
 
 from kuzualchemy import KuzuSession
@@ -101,27 +101,21 @@ def test_raw_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
         sess.add(TestUser(id=4, name="Dora", email="dora@example.com", age=22))
         sess.commit()
 
-        executed_queries: list[str] = []
-        original_execute = sess.execute
+        executed_offsets: list[int] = []
+        original_read_pages = atp_kuzu.read_kuzu_pages
 
-        def _spy_execute(query: str, parameters=None, **kwargs):
-            executed_queries.append(query)
-            return original_execute(query, parameters, **kwargs)
+        def _spy_read_pages(handler, query: str, parameters, offsets: list[int], limit: int):
+            executed_offsets.extend(offsets)
+            return original_read_pages(handler, query, parameters, offsets, limit)
 
-        monkeypatch.setattr(sess, "execute", _spy_execute)
+        monkeypatch.setattr(atp_kuzu, "read_kuzu_pages", _spy_read_pages)
 
         cypher = f"MATCH (n:{label}) RETURN n.id AS id ORDER BY id"
         ids_iter = [row["id"] for row in sess.iterate(cypher, page_size=2, prefetch_pages=1)]
 
         assert ids_iter == [1, 2, 3, 4]
 
-        skip_values = [
-            int(match.group(1))
-            for q in executed_queries
-            for match in [re.search(r"\bSKIP\s+(\d+)\b", q)]
-            if match is not None
-        ]
-        assert skip_values == [0, 2]
+        assert executed_offsets == [0, 2]
     finally:
         _cleanup_session(sess, db_path)
 
@@ -156,4 +150,3 @@ def test_execute_as_iterator_default_pagesize_works(test_models, sample_users, s
             _ = list(sess.execute(cypher, as_iterator=True, page_size=0))
     finally:
         _cleanup_session(sess, db_path)
-

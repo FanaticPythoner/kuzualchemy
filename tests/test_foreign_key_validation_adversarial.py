@@ -376,8 +376,8 @@ class TestForeignKeyValidation:
         assert instance.id == 1
         assert instance.target_id == 100
 
-    def test_validation_error_handling_graceful_degradation(self):
-        """Test graceful error handling when validation encounters unexpected errors."""
+    def test_validation_error_propagates(self):
+        """Test validation exception propagation."""
         @kuzu_node("ErrorTarget")
         class ErrorTarget(KuzuNodeBase):
             id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
@@ -406,13 +406,9 @@ class TestForeignKeyValidation:
         ErrorReferrer.validate_foreign_keys = classmethod(lambda cls: broken_validate())
 
         try:
-            # @@ STEP: This should handle the error gracefully and log a warning
-            instance = ErrorReferrer(id=1, target_id=100)
-            # @@ STEP: Instance should still be created despite validation error
-            assert instance.id == 1
-            assert instance.target_id == 100
+            with pytest.raises(RuntimeError, match="Simulated validation error"):
+                ErrorReferrer(id=1, target_id=100)
         finally:
-            # @@ STEP: Restore original validation method
             ErrorReferrer.validate_foreign_keys = original_validate
 
     def test_cache_size_management_with_many_nodes(self):

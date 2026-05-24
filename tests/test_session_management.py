@@ -57,10 +57,14 @@ class TestSessionCreationAndInitialization:
     def test_session_initialization_state(self, test_db_path):
         """Test session initial state."""
         session = KuzuSession(db_path=test_db_path)
-        assert len(session._new) == 0
-        assert len(session._dirty) == 0
-        assert len(session._deleted) == 0
-        assert session._flushing is False
+        assert session._new == []
+        assert session._dirty == []
+        assert session._deleted == []
+        assert session._new_object_ids == set()
+        assert session._dirty_object_ids == set()
+        assert session._deleted_object_ids == set()
+        assert session._identity_map == {}
+        assert session._identity_keys_by_object_id == {}
         session.close()
 
 
@@ -347,10 +351,12 @@ class TestConcurrentAccess:
 
     def test_concurrent_sessions(self, test_db_path):
         """Test repeated session construction through the ATP writer boundary."""
+        setup_session = KuzuSession(db_path=test_db_path)
+        initialize_schema(setup_session)
+        setup_session.close()
 
         def create_user(thread_id: int, db_path: Path):
             session = KuzuSession(db_path=db_path)
-            initialize_schema(session)
 
             user = self.User(id=5000 + thread_id, name=f"User{thread_id}", thread_id=thread_id)
             session.add(user)
@@ -422,7 +428,7 @@ class TestErrorHandlingAndRecovery:
         user2 = self.User(id=6001, name="Bob")
         session.add(user2)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError, match="duplicate primary key"):
             session.commit()
 
         # Session should be in a recoverable state

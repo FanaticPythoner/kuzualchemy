@@ -1,36 +1,7 @@
 from __future__ import annotations
 from typing import Any, Type
-from atp_pipeline import DbRelationshipPair, DbRelationshipSubset, DbWorkKind, DbWorkSpec
+from atp_pipeline import normalize_relationship_db_direction
 from .kuzu_session_rows import primary_key_fields
-
-
-def relationship_read_work(
-    *,
-    relationship: str,
-    alias: str,
-    direction: str,
-    pairs: list[dict[str, str]],
-    pairs_subset: list[int],
-) -> DbWorkSpec:
-    pair_specs = [
-        DbRelationshipPair(
-            from_label=pair["from_label"],
-            to_label=pair["to_label"],
-            from_key_field=pair["from_key_field"],
-            to_key_field=pair["to_key_field"],
-        )
-        for pair in pairs
-    ]
-    return DbWorkSpec(
-        DbWorkKind.RELATIONSHIP_READ,
-        relationship_subset=DbRelationshipSubset(
-            relationship=relationship,
-            alias=alias,
-            direction=direction,
-            pairs=pair_specs,
-            pairs_subset=list(pairs_subset),
-        ),
-    )
 
 
 def relationship_read_name(relationship_class: Type[Any]) -> str:
@@ -43,14 +14,12 @@ def relationship_read_name(relationship_class: Type[Any]) -> str:
 def relationship_read_direction(relationship_class: Type[Any]) -> str:
     raw = getattr(relationship_class, "__kuzu_direction__", None)
     value = getattr(raw, "value", None) or getattr(raw, "name", None) or raw or "forward"
-    text = str(value).lower()
-    if text in {"forward", "outgoing"}:
-        return "forward"
-    if text in {"backward", "incoming"}:
-        return "backward"
-    if text == "both":
-        return "both"
-    raise ValueError(f"{relationship_class.__name__} direction is unsupported: {value}")
+    try:
+        return normalize_relationship_db_direction(str(value))
+    except ValueError as exc:
+        raise ValueError(
+            f"{relationship_class.__name__} direction is unsupported: {value}"
+        ) from exc
 
 
 def relationship_read_pairs(relationship_class: Type[Any]) -> list[dict[str, str]]:
@@ -71,11 +40,41 @@ def relationship_read_pairs(relationship_class: Type[Any]) -> list[dict[str, str
             {
                 "from_label": from_label,
                 "to_label": to_label,
-                "from_key_field": primary_key_fields(from_cls)[0],
-                "to_key_field": primary_key_fields(to_cls)[0],
+                "from_key_field": primary_key_fields(_pair_node_class(from_cls, from_label))[0],
+                "to_key_field": primary_key_fields(_pair_node_class(to_cls, to_label))[0],
             }
         )
     return rows
+
+def relationship_endpoint_types(relationship_class: Type[Any]) -> dict[str, Type[Any]]:
+    pairs = getattr(relationship_class, "__kuzu_relationship_pairs__", None)
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError(f"{relationship_class.__name__} relationship pairs are missing")
+    endpoint_types: dict[str, Type[Any]] = {}
+    for pair in pairs:
+        for attr, label in (
+            ("from_node", pair.get_from_name()),
+            ("to_node", pair.get_to_name()),
+        ):
+            if not isinstance(label, str) or not label:
+                raise ValueError(f"{relationship_class.__name__} relationship pair has no label")
+            model_class = _pair_node_class(getattr(pair, attr, None), label)
+            existing = endpoint_types.get(label)
+            if existing is not None and existing is not model_class:
+                raise TypeError(f"relationship endpoint label maps to multiple classes: {label}")
+            endpoint_types[label] = model_class
+    return endpoint_types
+
+
+def _pair_node_class(raw_node: Any, label: str) -> Type[Any]:
+    if isinstance(raw_node, type):
+        return raw_node
+    from .kuzu_orm import get_node_by_name
+
+    node_class = get_node_by_name(label)
+    if node_class is None:
+        raise TypeError(f"relationship endpoint label is not registered: {label}")
+    return node_class
 
 
 def can_use_native_relationship_read(state: Any) -> bool:
@@ -100,14 +99,14 @@ def can_use_native_relationship_read(state: Any) -> bool:
     )
 
 
-def materialize_endpoint_node(value: Any) -> Any:
+def materialize_endpoint_node(value: Any, endpoint_types: dict[str, Type[Any]]) -> Any:
     if not isinstance(value, dict):
         return value
     label = value.get("_label")
     if not isinstance(label, str) or not label:
         raise TypeError("relationship endpoint payload missing _label")
-    from .kuzu_orm import KuzuNodeBase, get_node_by_name
-    model_class = get_node_by_name(label)
+    from .kuzu_orm import KuzuNodeBase
+    model_class = endpoint_types.get(label)
     if model_class is None:
         raise TypeError(f"relationship endpoint label is not registered: {label}")
     fields = getattr(model_class, "model_fields", None)

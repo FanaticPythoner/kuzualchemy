@@ -590,8 +590,8 @@ class TestValidation:
         assert results.__class__.__name__ == "list"
 
         # Validate that the generated Cypher has correct structure
-        assert "MATCH (n:ProdUser)" in cypher
-        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:ProdCompany)" in cypher
+        assert "MATCH (n:`ProdUser`)" in cypher
+        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:`ProdCompany`)" in cypher
         assert "WHERE n.is_active" in cypher
         assert "prodcompany_joined.is_active" in cypher
         assert "RETURN prodcompany_joined" in cypher
@@ -887,8 +887,8 @@ class TestValidation:
         traversal_results = traversal_query.all()
 
         # Validate traversal Cypher structure is now correct
-        assert "MATCH (n:ProdUser)" in traversal_cypher
-        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:ProdCompany)" in traversal_cypher
+        assert "MATCH (n:`ProdUser`)" in traversal_cypher
+        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:`ProdCompany`)" in traversal_cypher
         assert "WHERE n.is_active" in traversal_cypher
         assert "prodcompany_joined.is_active" in traversal_cypher
         assert "RETURN prodcompany_joined" in traversal_cypher
@@ -1120,8 +1120,8 @@ class TestValidation:
         results2 = query2.all()
 
         # Validate traversal features are now working correctly
-        assert "MATCH (n:ProdUser)" in cypher2
-        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:ProdCompany)" in cypher2
+        assert "MATCH (n:`ProdUser`)" in cypher2
+        assert "MATCH (n)-[:PROD_WORKS_FOR]->(prodcompany_joined:`ProdCompany`)" in cypher2
         assert "WHERE n.is_active" in cypher2
         assert "prodcompany_joined.is_active" in cypher2
         assert "RETURN prodcompany_joined" in cypher2

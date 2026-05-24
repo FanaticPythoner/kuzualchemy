@@ -1,10 +1,15 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Generic, Iterator, Type, TypeVar
-from .constants import ValidationMessageConstants
+from atp_pipeline import normalize_join_type, normalize_relationship_direction
+from .constants import RelationshipDirection, ValidationMessageConstants
 from .kuzu_query_builder import CypherQueryBuilder, JoinClause, QueryState
 from .kuzu_query_expressions import AggregateFunction, FilterExpression, JoinType, OrderDirection
 from .kuzu_query_fields import ModelFieldAccessor, QueryField
-from .kuzu_relationship_read import can_use_native_relationship_read, materialize_endpoint_node
+from .kuzu_relationship_read import (
+    can_use_native_relationship_read,
+    materialize_endpoint_node,
+    relationship_endpoint_types,
+)
 if TYPE_CHECKING:
     from .kuzu_session import KuzuSession
 ModelType = TypeVar("ModelType")
@@ -83,8 +88,7 @@ class Query(Generic[ModelType]):
         min_hops: int = 1,
         max_hops: int = 1,
     ) -> Query[ModelType]:
-        if isinstance(join_type, str):
-            join_type = JoinType(join_type.lower())
+        join_type = _normalize_join_type(join_type)
         is_rel = isinstance(target_model_or_rel, type) and "__kuzu_rel_name__" in target_model_or_rel.__dict__
         relationship_class = target_model_or_rel if is_rel else condition_or_model
         target_model = condition_or_model if is_rel and isinstance(condition_or_model, type) else target_model_or_rel
@@ -101,7 +105,7 @@ class Query(Generic[ModelType]):
             target_alias=target_alias,
             rel_alias=rel_alias,
             conditions=list(conditions or []),
-            direction=direction,
+            direction=_normalize_relationship_direction(direction),
             pattern=pattern,
             properties=dict(properties or {}),
             min_hops=min_hops,
@@ -111,25 +115,82 @@ class Query(Generic[ModelType]):
     def outerjoin(self, target_model_or_rel: Type[Any], *args: Any, **kwargs: Any) -> Query[ModelType]:
         kwargs["join_type"] = JoinType.OPTIONAL
         return self.join(target_model_or_rel, *args, **kwargs)
-    def traverse(self, relationship_class: Type[Any], direction: Any = None) -> Query[ModelType]:
+    def traverse(
+        self,
+        relationship_class: Type[Any],
+        target_model: Type[Any] | None = None,
+        *,
+        direction: Any = None,
+        conditions: list[FilterExpression] | None = None,
+        rel_alias: str | None = None,
+        target_alias: str | None = None,
+        min_hops: int = 1,
+        max_hops: int = 1,
+    ) -> Query[ModelType]:
         pairs = getattr(relationship_class, "__kuzu_relationship_pairs__", [])
         if not pairs:
             raise ValueError(f"{relationship_class.__name__} has no relationship pairs")
-        target_name = pairs[0].get_to_name()
-        from .kuzu_orm import get_node_by_name
-        target_model = get_node_by_name(target_name)
+        normalized_direction = _normalize_relationship_direction(direction)
+        if target_model is None:
+            target_name = (
+                pairs[0].get_from_name()
+                if normalized_direction == RelationshipDirection.INCOMING
+                else pairs[0].get_to_name()
+            )
+            from .kuzu_orm import get_node_by_name
+
+            target_model = get_node_by_name(target_name)
         if target_model is None:
             raise ValueError(f"Traversal target is not registered: {target_name}")
-        return self.join(relationship_class, target_model, direction=direction)._copy_with_state(
+        return self.join(
+            relationship_class,
+            target_model,
+            direction=normalized_direction,
+            conditions=conditions,
+            rel_alias=rel_alias,
+            target_alias=target_alias,
+            min_hops=min_hops,
+            max_hops=max_hops,
+        )._copy_with_state(
             return_model_class=target_model,
-            return_alias=f"{target_model.__name__.lower()}_joined",
+            return_alias=target_alias or f"{target_model.__name__.lower()}_joined",
         )
-    def outgoing(self, relationship_class: Type[Any]) -> Query[ModelType]:
-        return self.traverse(relationship_class)
-    def incoming(self, relationship_class: Type[Any]) -> Query[ModelType]:
-        return self.traverse(relationship_class)
-    def related(self, relationship_class: Type[Any]) -> Query[ModelType]:
-        return self.traverse(relationship_class)
+    def outgoing(
+        self,
+        relationship_class: Type[Any],
+        target_model: Type[Any] | None = None,
+        **kwargs: Any,
+    ) -> Query[ModelType]:
+        return self.traverse(
+            relationship_class,
+            target_model,
+            direction=RelationshipDirection.OUTGOING,
+            **kwargs,
+        )
+    def incoming(
+        self,
+        relationship_class: Type[Any],
+        target_model: Type[Any] | None = None,
+        **kwargs: Any,
+    ) -> Query[ModelType]:
+        return self.traverse(
+            relationship_class,
+            target_model,
+            direction=RelationshipDirection.INCOMING,
+            **kwargs,
+        )
+    def related(
+        self,
+        relationship_class: Type[Any],
+        target_model: Type[Any] | None = None,
+        **kwargs: Any,
+    ) -> Query[ModelType]:
+        return self.traverse(
+            relationship_class,
+            target_model,
+            direction=RelationshipDirection.BOTH,
+            **kwargs,
+        )
     def group_by(self, *fields: str) -> Query[ModelType]:
         return self._copy_with_state(group_by=list(fields))
     def having(self, expression: FilterExpression) -> Query[ModelType]:
@@ -173,8 +234,32 @@ class Query(Generic[ModelType]):
         query, params = self.to_cypher()
         return self._materialize(self._session._execute_for_query_object(query, params))
     def iter(self, page_size: int | None = None, prefetch_pages: int = 1) -> Iterator[Any]:
-        return iter(self._execute())
-    def all(self) -> list[Any]:
+        if page_size is None:
+            return iter(self._execute())
+        if type(page_size) is not int or page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
+        if self._session is None:
+            raise RuntimeError("query execution requires a session")
+        query, params = self.to_cypher()
+        endpoint_types = self._relationship_endpoint_types()
+        return (
+            self._materialize_row(row, endpoint_types)
+            for row in self._session._iterate_for_query_object(
+                query,
+                params,
+                page_size,
+                prefetch_pages,
+            )
+        )
+    def all(
+        self,
+        *,
+        as_iterator: bool = False,
+        page_size: int | None = None,
+        prefetch_pages: int = 1,
+    ) -> list[Any] | Iterator[Any]:
+        if as_iterator:
+            return self.iter(page_size=10 if page_size is None else page_size, prefetch_pages=prefetch_pages)
         return list(self.iter())
     def first(self) -> Any | None:
         return (rows[0] if (rows := self.limit(1).all()) else None)
@@ -189,31 +274,85 @@ class Query(Generic[ModelType]):
             raise ValueError(f"Expected one or no results, got {len(rows)}")
         return rows[0] if rows else None
     def exists(self) -> bool: return self.limit(1).first() is not None
-    def count_results(self) -> int: return len(self.all())
+    def count_results(self) -> int:
+        rows = self.count("*", alias="count").all()
+        if not rows:
+            return 0
+        value = rows[0].get("count")
+        if not isinstance(value, int):
+            raise TypeError("count result must be an integer")
+        return value
     def _materialize(self, rows: list[dict[str, Any]]) -> list[Any]:
-        if self._state.return_raw or self._state.select_fields or self._state.aggregations:
-            return rows
+        endpoint_types = self._relationship_endpoint_types()
+        return [self._materialize_row(row, endpoint_types) for row in rows]
+    def _materialize_row(
+        self,
+        row: dict[str, Any],
+        endpoint_types: dict[str, Type[Any]] | None = None,
+    ) -> Any:
+        if self._state.return_raw or self._state.aggregations:
+            return row
+        if self._state.select_fields:
+            return self._materialize_select_row(row)
+        return self._materialize_page(row, endpoint_types)
+    def _materialize_select_row(self, row: dict[str, Any]) -> Any:
         model_class = self._state.return_model_class or self._state.model_class
         alias = self._state.return_alias or self._state.alias
-        values: list[Any] = []
-        for row in rows:
-            payload = row.get(alias)
-            if payload is None and len(row) == 1:
-                payload = next(iter(row.values()))
-            if not isinstance(payload, dict):
-                raise TypeError("ORM materialization requires a dictionary payload")
-            if hasattr(model_class, "__kuzu_rel_name__"):
-                payload = dict(payload)
-                payload["from_node"] = materialize_endpoint_node(row.get("from_node"))
-                payload["to_node"] = materialize_endpoint_node(row.get("to_node"))
-            values.append(model_class(**_model_payload(model_class, payload)))
-        return values
+        payload: dict[str, Any] = {}
+        for field in self._state.select_fields or []:
+            output_name = field.rsplit(".", 1)[-1]
+            for key in (field, output_name, f"{alias}.{output_name}"):
+                if key in row:
+                    payload[output_name] = row[key]
+                    break
+        construct = getattr(model_class, "model_construct", None)
+        if construct is None:
+            return model_class(**payload)
+        return construct(**payload)
+    def _materialize_page(
+        self,
+        row: dict[str, Any],
+        endpoint_types: dict[str, Type[Any]] | None = None,
+    ) -> Any:
+        model_class = self._state.return_model_class or self._state.model_class
+        alias = self._state.return_alias or self._state.alias
+        payload = row.get(alias)
+        if payload is None and len(row) == 1:
+            payload = next(iter(row.values()))
+        if not isinstance(payload, dict):
+            raise TypeError("ORM materialization requires a dictionary payload")
+        if hasattr(model_class, "__kuzu_rel_name__"):
+            if endpoint_types is None:
+                endpoint_types = relationship_endpoint_types(model_class)
+            payload = dict(payload)
+            payload["from_node"] = materialize_endpoint_node(row.get("from_node"), endpoint_types)
+            payload["to_node"] = materialize_endpoint_node(row.get("to_node"), endpoint_types)
+        return model_class(**_model_payload(model_class, payload))
+    def _relationship_endpoint_types(self) -> dict[str, Type[Any]] | None:
+        model_class = self._state.return_model_class or self._state.model_class
+        if hasattr(model_class, "__kuzu_rel_name__"):
+            return relationship_endpoint_types(model_class)
+        return None
     def __iter__(self) -> Iterator[Any]: return self.iter()
     def __repr__(self) -> str:
-        query, _ = self.to_cypher()
+        query = self.to_cypher()[0]
         return f"Query({self._state.model_class.__name__}, {query!r})"
 def _model_payload(model_class: Type[Any], payload: dict[str, Any]) -> dict[str, Any]:
     fields = getattr(model_class, "model_fields", None)
     if isinstance(fields, dict):
         return {key: value for key, value in payload.items() if key in fields}
     raise TypeError(f"{model_class.__name__} has no Pydantic field map")
+
+def _normalize_join_type(join_type: JoinType | str) -> JoinType:
+    if isinstance(join_type, JoinType):
+        return join_type
+    if not isinstance(join_type, str):
+        raise TypeError("join_type must be a JoinType or string")
+    return JoinType(normalize_join_type(join_type))
+
+def _normalize_relationship_direction(direction: Any) -> Any:
+    if direction is None:
+        return None
+    if not isinstance(direction, str):
+        return direction
+    return normalize_relationship_direction(direction)

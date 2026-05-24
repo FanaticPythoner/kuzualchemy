@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from atp_pipeline import split_cypher_statements
+
 from .kuzu_connection import KuzuConnection
 from .kuzu_orm import get_all_ddl
 from .kuzu_session import KuzuSession
@@ -20,7 +22,7 @@ class DDLExecutor:
 
 
 def split_ddl(ddl: str) -> list[str]:
-    return [statement.strip() for statement in ddl.split(";") if statement.strip()]
+    return split_cypher_statements(ddl)
 
 
 def connection_for_schema(target: KuzuConnection | KuzuSession) -> KuzuConnection:

@@ -1,62 +1,85 @@
 from __future__ import annotations
-from collections.abc import Mapping
+
 from pathlib import Path
 from typing import Any, Iterable
-from atp_pipeline import (
-    ATPHandler,
-    DatabaseType,
-    DbBulkAction,
-    DbBulkEntity,
-    DbBulkMergePolicy,
-    DbBulkRelationship,
-    DbStatement,
-    DbWorkKind,
-    DbWorkSpec,
-    OpPriority,
-)
+
+import atp_pipeline as atp
+from atp_pipeline import ATPHandler, DatabaseType, DbBulkAction, DbBulkMergePolicy
+
 from .constants import ErrorMessages
-from .kuzu_relationship_read import relationship_read_work
+
+
 class KuzuConnection:
-    """Submit Kuzu work through the native ATP handler."""
+    """Submit Kuzu work through ATP."""
+
     def __init__(self, db_path: str | Path) -> None:
         raw_path = str(db_path)
         self.db_path = raw_path if raw_path == ":memory:" else str(Path(raw_path).resolve())
         self._handler = ATPHandler(DatabaseType.KUZU, {"db_path": self.db_path})
         self._closed = False
+
     def _open_handler(self) -> ATPHandler:
         if getattr(self, "_closed", False):
             raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
         return self._handler
-    def execute(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        result = self._submit_work(
-            DbWorkSpec(DbWorkKind.QUERY_READ, statements=[_statement(query, parameters or {})]),
-            expect_rows=True,
-        )
-        return _first_table(result)
-    def execute_write(self, query: str, parameters: dict[str, Any] | None = None) -> None:
-        self._submit_work(
-            DbWorkSpec(DbWorkKind.SCHEMA_APPLY, statements=[_statement(query, parameters or {})]),
-            expect_rows=False,
-        )
-    def execute_many(self, queries: Iterable[tuple[str, dict[str, Any]]]) -> list[list[dict[str, Any]]]:
-        statements = [_statement(query, params) for query, params in queries]
-        if not statements:
+
+    def execute(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if atp.is_schema_or_admin_query(query) or atp.is_write_query(query):
+            self.execute_write(query, parameters)
             return []
-        result = self._submit_work(
-            DbWorkSpec(DbWorkKind.QUERY_READ, statements=statements),
-            expect_rows=True,
-        )
-        tables = _tables(result)
-        if len(tables) != len(statements):
-            raise RuntimeError("native DB result table count must match statement count")
-        return tables
+        return atp.execute_kuzu(self._open_handler(), query, parameters or {})
+
+    def execute_write(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        atp.execute_kuzu_write(self._open_handler(), query, parameters or {})
+
+    def execute_many(
+        self,
+        queries: Iterable[tuple[str, dict[str, Any]]],
+    ) -> list[list[dict[str, Any]]]:
+        return atp.execute_kuzu_many(self._open_handler(), queries, mode="read")
+
     def write_many(self, queries: Iterable[tuple[str, dict[str, Any]]]) -> None:
-        statements = [_statement(query, params) for query, params in queries]
-        if statements:
-            self._submit_work(
-                DbWorkSpec(DbWorkKind.SCHEMA_APPLY, statements=statements),
-                expect_rows=False,
-            )
+        atp.execute_kuzu_many(self._open_handler(), queries, mode="write")
+
+    def execute_write_many_returning(
+        self,
+        queries: Iterable[tuple[str, dict[str, Any]]],
+    ) -> list[list[dict[str, Any]]]:
+        return atp.execute_kuzu_write_many_returning(self._open_handler(), queries)
+
+    def iterate(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        page_size: int = 1000,
+        prefetch_pages: int = 1,
+    ):
+        return atp.iter_kuzu(
+            self._open_handler(),
+            query,
+            parameters or {},
+            page_size=page_size,
+            prefetch_pages=prefetch_pages,
+        )
+
+    def read_pages(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None,
+        offsets: list[int],
+        limit: int,
+    ) -> list[list[dict[str, Any]]]:
+        return atp.read_kuzu_pages(self._open_handler(), query, parameters or {}, offsets, limit)
+
     def read_relationships(
         self,
         *,
@@ -66,49 +89,45 @@ class KuzuConnection:
         pairs: list[dict[str, str]],
         pairs_subset: list[int],
     ) -> list[dict[str, Any]]:
-        result = self._submit_work(
-            relationship_read_work(
-                relationship=relationship,
-                alias=alias,
-                direction=direction,
-                pairs=pairs,
-                pairs_subset=pairs_subset,
-            ),
-            expect_rows=True,
+        return atp.read_kuzu_relationships(
+            self._open_handler(),
+            relationship=relationship,
+            alias=alias,
+            direction=direction,
+            pairs=pairs,
+            pairs_subset=pairs_subset,
         )
-        return _first_table(result)
+
     def schema_apply(self, statements: Iterable[str]) -> None:
-        payload = [_statement(statement, {}) for statement in statements if statement.strip()]
-        if payload:
-            self._submit_work(
-                DbWorkSpec(DbWorkKind.SCHEMA_APPLY, statements=payload),
-                expect_rows=False,
-            )
+        atp.execute_kuzu_many(
+            self._open_handler(),
+            [(statement, {}) for statement in statements if statement.strip()],
+            mode="schema",
+        )
+
+    def find_node_labels_for_primary_key(
+        self,
+        node_specs: Iterable[tuple[str, str]],
+        primary_key_value: Any,
+    ) -> list[str]:
+        return atp.find_kuzu_node_labels_for_primary_key(
+            self._open_handler(),
+            node_specs,
+            primary_key_value,
+        )
+
     def snapshot_integrity(self) -> dict[str, Any]:
-        work = DbWorkSpec(
-            DbWorkKind.SNAPSHOT_INTEGRITY,
-            statements=[
-                DbStatement("MATCH (n) RETURN COUNT(n) as count", {}),
-                DbStatement("MATCH ()-[r]->() RETURN COUNT(r) as count", {}),
-                DbStatement("CALL SHOW_TABLES() RETURN *", {}),
-            ],
-        )
-        result = self._submit_work(
-            work,
-            expect_rows=True,
-            priority=OpPriority.HIGH,
-        )
-        tables = result.get("cypher_results") if isinstance(result, dict) else None
-        if not isinstance(tables, list) or len(tables) != 3:
-            raise RuntimeError("snapshot integrity result must contain three tables")
-        node_rows, relationship_rows, table_rows = tables
-        return {
-            "node_count": _count_table(node_rows, "node_count"),
-            "relationship_count": _count_table(relationship_rows, "relationship_count"),
-            "table_count": len(table_rows),
-        }
+        return atp.kuzu_snapshot_integrity(self._open_handler())
+
     def checkpoint(self) -> None:
         self._open_handler().checkpoint_barrier()
+
+    def capability_report(self) -> Any:
+        return self._open_handler().get_capability_report()
+
+    def metrics_snapshot(self) -> str:
+        return self._open_handler().metrics_snapshot()
+
     def bulk_write_nodes(
         self,
         action: DbBulkAction,
@@ -117,19 +136,18 @@ class KuzuConnection:
         key_fields: list[str],
         merge_policies: dict[str, DbBulkMergePolicy | str] | None = None,
     ) -> None:
-        self.bulk_write_nodes_many([(action, label, rows, key_fields, merge_policies)])
-    def bulk_write_nodes_many(
-        self,
-        batches: Iterable[tuple[Any, ...]],
-    ) -> None:
-        works = [
-            _node_bulk_work(action, label, rows, key_fields, merge_policies)
-            for batch in batches
-            for action, label, rows, key_fields, merge_policies in [_node_batch_parts(batch)]
-            if rows
-        ]
-        if works:
-            self._submit_many_work(works, expect_rows=False)
+        atp.bulk_write_kuzu_nodes(
+            self._open_handler(),
+            action,
+            label,
+            rows,
+            key_fields,
+            merge_policies,
+        )
+
+    def bulk_write_nodes_many(self, batches: Iterable[tuple[Any, ...]]) -> None:
+        atp.bulk_write_kuzu_nodes_many(self._open_handler(), batches)
+
     def bulk_write_relationships(
         self,
         action: DbBulkAction,
@@ -140,164 +158,8 @@ class KuzuConnection:
         from_key_fields: list[str],
         to_key_fields: list[str],
     ) -> None:
-        self.bulk_write_relationships_many([
-            (action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
-        ])
-    def bulk_write_relationships_many(
-        self,
-        batches: Iterable[
-            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
-        ],
-    ) -> None:
-        works = [
-            _relationship_bulk_work(
-                action,
-                rel_type,
-                from_label,
-                to_label,
-                rows,
-                from_key_fields,
-                to_key_fields,
-            )
-            for action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields in batches
-            if rows
-        ]
-        if works:
-            self._submit_many_work(works, expect_rows=False)
-    def bulk_write_nodes_and_relationships_many(
-        self,
-        node_batches: Iterable[tuple[Any, ...]],
-        relationship_batches: Iterable[
-            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
-        ],
-    ) -> None:
-        works = [
-            _node_bulk_work(action, label, rows, key_fields, merge_policies)
-            for batch in node_batches
-            for action, label, rows, key_fields, merge_policies in [_node_batch_parts(batch)]
-            if rows
-        ]
-        works.extend(
-            _relationship_bulk_work(
-                action,
-                rel_type,
-                from_label,
-                to_label,
-                rows,
-                from_key_fields,
-                to_key_fields,
-            )
-            for action, rel_type, from_label, to_label, rows, from_key_fields, to_key_fields in relationship_batches
-            if rows
-        )
-        if works:
-            self._submit_many_work(works, expect_rows=False)
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._handler.flush(None)
-        self._handler.shutdown(None)
-        self._closed = True
-    def _submit_work(
-        self,
-        work: DbWorkSpec,
-        *,
-        expect_rows: bool,
-        priority: OpPriority = OpPriority.NORMAL,
-    ) -> Any:
-        return self._open_handler().submit_work(
-            work,
-            expect_rows=expect_rows,
-            priority=priority,
-        ).result(None)
-    def _submit_many_work(
-        self,
-        works: list[DbWorkSpec],
-        *,
-        expect_rows: bool,
-        priority: OpPriority = OpPriority.NORMAL,
-    ) -> list[Any]:
-        tickets = self._open_handler().submit_many_work(
-            works,
-            expect_rows=expect_rows,
-            priority=priority,
-        )
-        return [ticket.result(None) for ticket in tickets]
-def _statement(query: str, parameters: dict[str, Any]) -> DbStatement:
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("query must be a non-empty string")
-    if not isinstance(parameters, dict):
-        raise TypeError("parameters must be a dict")
-    return DbStatement(query, parameters)
-def _node_bulk_work(
-    action: DbBulkAction,
-    label: str,
-    rows: list[dict[str, Any]],
-    key_fields: list[str],
-    merge_policies: Mapping[str, DbBulkMergePolicy | str] | None = None,
-) -> DbWorkSpec:
-    return DbWorkSpec(
-        DbWorkKind.NODE_BULK_WRITE,
-        node_bulk=DbBulkEntity(
-            action,
-            label,
-            rows,
-            key_fields,
-            _node_merge_policy_map(merge_policies),
-        ),
-    )
-
-def _node_merge_policy_map(
-    merge_policies: Mapping[str, DbBulkMergePolicy | str] | None,
-) -> dict[str, str]:
-    if merge_policies is None:
-        return {}
-    if not isinstance(merge_policies, Mapping):
-        raise TypeError("node bulk merge_policies must be a mapping")
-    allowed = {policy.value for policy in DbBulkMergePolicy}
-    normalized: dict[str, str] = {}
-    for field, policy in merge_policies.items():
-        if not isinstance(field, str) or not field:
-            raise ValueError("node bulk merge policy field must be a non-empty string")
-        raw_policy = policy.value if isinstance(policy, DbBulkMergePolicy) else policy
-        if not isinstance(raw_policy, str):
-            raise TypeError("node bulk merge policy value must be a string")
-        normalized_policy = raw_policy.strip().upper()
-        if normalized_policy not in allowed:
-            raise ValueError(
-                f"node bulk merge policy must be one of {sorted(allowed)}, got {raw_policy!r}"
-            )
-        normalized[field] = normalized_policy
-    return normalized
-
-def _node_batch_parts(
-    batch: tuple[Any, ...],
-) -> tuple[
-    DbBulkAction,
-    str,
-    list[dict[str, Any]],
-    list[str],
-    dict[str, DbBulkMergePolicy | str],
-]:
-    if len(batch) == 4:
-        action, label, rows, key_fields = batch
-        return action, label, rows, key_fields, {}
-    if len(batch) == 5:
-        action, label, rows, key_fields, merge_policies = batch
-        return action, label, rows, key_fields, _node_merge_policy_map(merge_policies)
-    raise ValueError("node bulk batch must contain four or five fields")
-def _relationship_bulk_work(
-    action: DbBulkAction,
-    rel_type: str,
-    from_label: str,
-    to_label: str,
-    rows: list[dict[str, Any]],
-    from_key_fields: list[str],
-    to_key_fields: list[str],
-) -> DbWorkSpec:
-    return DbWorkSpec(
-        DbWorkKind.RELATIONSHIP_BULK_WRITE,
-        relationship_bulk=DbBulkRelationship(
+        atp.bulk_write_kuzu_relationships(
+            self._open_handler(),
             action,
             rel_type,
             from_label,
@@ -305,33 +167,44 @@ def _relationship_bulk_work(
             rows,
             from_key_fields,
             to_key_fields,
-        ),
-    )
-def _tables(result: Any) -> list[list[dict[str, Any]]]:
-    if not isinstance(result, dict):
-        raise RuntimeError("native DB result must be a dictionary")
-    tables = result.get("cypher_results")
-    if not isinstance(tables, list):
-        raise RuntimeError("native DB result missing cypher_results table list")
-    for table in tables:
-        if not isinstance(table, list):
-            raise RuntimeError("native DB result table must be a list")
-        for row in table:
-            if not isinstance(row, dict):
-                raise RuntimeError("native DB result row must be a dictionary")
-    return tables
-def _first_table(result: Any) -> list[dict[str, Any]]:
-    tables = _tables(result)
-    if not tables:
-        raise RuntimeError("native DB result missing first table")
-    return tables[0]
-def _count_table(rows: Any, name: str) -> int:
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"{name} missing count row")
-    first = rows[0]
-    if not isinstance(first, dict) or "count" not in first:
-        raise RuntimeError(f"{name} missing count field")
-    value = first["count"]
-    if not isinstance(value, int) or value < 0:
-        raise RuntimeError(f"{name} count must be a non-negative integer")
-    return value
+        )
+
+    def bulk_write_relationships_many(
+        self,
+        batches: Iterable[
+            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        atp.bulk_write_kuzu_relationships_many(self._open_handler(), batches)
+
+    def bulk_write_nodes_and_relationships_many(
+        self,
+        node_batches: Iterable[tuple[Any, ...]],
+        relationship_batches: Iterable[
+            tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ],
+    ) -> None:
+        atp.bulk_write_kuzu_nodes_and_relationships_many(
+            self._open_handler(),
+            node_batches,
+            relationship_batches,
+        )
+
+    def create_generated_nodes(
+        self,
+        specs: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return atp.create_kuzu_generated_nodes(self._open_handler(), specs)
+
+    def create_generated_relationships(
+        self,
+        specs: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return atp.create_kuzu_generated_relationships(self._open_handler(), specs)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._handler.flush(None)
+        self._handler.shutdown(None)
+        self._closed = True

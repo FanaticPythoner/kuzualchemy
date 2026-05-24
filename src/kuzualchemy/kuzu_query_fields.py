@@ -1165,17 +1165,12 @@ class ModelFieldAccessor:
     
     def __init__(self, model_class: Type[Any]):
         self.model_class = model_class
-        self._fields_cache: dict[str, QueryField] = {}
     
     def __getattr__(self, name: str) -> QueryField:
-        """Get or create QueryField for attribute access."""
+        """Return a QueryField for attribute access."""
         if name.startswith(QueryFieldConstants.PRIVATE_FIELD_PREFIX):
             raise AttributeError(ValidationMessageConstants.CANNOT_ACCESS_PRIVATE_FIELD.format(name))
-        
-        if name not in self._fields_cache:
-            self._fields_cache[name] = QueryField(name, self.model_class)
-        
-        return self._fields_cache[name]
+        return QueryField(name, self.model_class)
     
     def get_field(self, name: str) -> QueryField:
         """Explicitly get a field by name."""

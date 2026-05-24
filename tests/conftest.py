@@ -15,6 +15,7 @@ from typing import Generator, Any, Dict, List
 from unittest.mock import Mock, patch
 
 import pytest
+from atp_pipeline import dispose_kuzu_database
 
 from . import _env  # noqa: F401  # pylint: disable=unused-import
 
@@ -50,12 +51,12 @@ def global_registry_cleanup():
     from kuzualchemy import clear_registry
     clear_registry()  # Already includes gc.collect() internally
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def test_db_path() -> Generator[Path, None, None]:
     """Create a temporary database path for testing."""
     db_path = Path(tempfile.gettempdir()) / f"test_kuzu_{uuid.uuid4().hex[:8]}"
     yield db_path
-    # Cleanup
+    dispose_kuzu_database(str(db_path.resolve()))
     if db_path.exists():
         shutil.rmtree(db_path, ignore_errors=True)
 

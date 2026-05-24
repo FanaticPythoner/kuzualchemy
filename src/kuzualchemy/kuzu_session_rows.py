@@ -1,21 +1,21 @@
 from __future__ import annotations
-from functools import cache
 from typing import Any
-from .kuzu_orm import get_node_by_name
+from atp_pipeline import normalize_kuzu_model_row, resolve_kuzu_relationship_route
+from .constants import KuzuDefaultFunction
+from .kuzu_function_types import DefaultFunctionBase
+from .kuzu_orm import BulkInsertValueGeneratorRegistry
 
 RelationshipRoute = tuple[str, str, str, str, str]
 _RELATIONSHIP_ENDPOINT_FIELDS = frozenset({"from_node", "to_node"})
 RelationshipEndpointMetadata = tuple[str, str, str, str]
 EndpointRow = tuple[str, str, Any]
 
-@cache
 def _node_label(model_class: type[Any]) -> str:
     label = getattr(model_class, "__kuzu_node_name__", None)
     if not isinstance(label, str) or not label:
         raise ValueError(f"{model_class.__name__} is not a registered Kuzu node")
     return label
 
-@cache
 def _primary_key_fields(model_class: type[Any]) -> list[str]:
     getter = getattr(model_class, "get_primary_key_fields", None)
     if not callable(getter):
@@ -25,7 +25,6 @@ def _primary_key_fields(model_class: type[Any]) -> list[str]:
         raise ValueError(f"{model_class.__name__} primary key metadata is empty")
     return fields
 
-@cache
 def _node_merge_policies(model_class: type[Any]) -> dict[str, str]:
     getter = getattr(model_class, "get_all_kuzu_metadata", None)
     if not callable(getter):
@@ -37,7 +36,6 @@ def _node_merge_policies(model_class: type[Any]) -> dict[str, str]:
             policies[field] = str(policy)
     return policies
 
-@cache
 def _relationship_pair_metadata(rel_cls: type[Any]) -> tuple[RelationshipEndpointMetadata, ...]:
     pairs = getattr(rel_cls, "__kuzu_relationship_pairs__", [])
     if not pairs:
@@ -46,12 +44,8 @@ def _relationship_pair_metadata(rel_cls: type[Any]) -> tuple[RelationshipEndpoin
     for pair in pairs:
         from_label = pair.get_from_name()
         to_label = pair.get_to_name()
-        from_node_cls = get_node_by_name(from_label)
-        to_node_cls = get_node_by_name(to_label)
-        if from_node_cls is None:
-            raise ValueError(f"{rel_cls.__name__} endpoint label is not registered: {from_label}")
-        if to_node_cls is None:
-            raise ValueError(f"{rel_cls.__name__} endpoint label is not registered: {to_label}")
+        from_node_cls = _relationship_pair_node_class(pair, "from_node", from_label)
+        to_node_cls = _relationship_pair_node_class(pair, "to_node", to_label)
         metadata.append((
             from_label,
             to_label,
@@ -59,6 +53,17 @@ def _relationship_pair_metadata(rel_cls: type[Any]) -> tuple[RelationshipEndpoin
             _primary_key_fields(to_node_cls)[0],
         ))
     return tuple(metadata)
+
+def _relationship_pair_node_class(pair: Any, attr: str, label: str) -> type[Any]:
+    raw_node = getattr(pair, attr, None)
+    if isinstance(raw_node, type):
+        return raw_node
+    from .kuzu_orm import get_node_by_name
+
+    node_class = get_node_by_name(label)
+    if node_class is None:
+        raise TypeError(f"relationship endpoint label is not registered: {label}")
+    return node_class
 
 def _node_endpoint(value: Any) -> EndpointRow | None:
     if hasattr(type(value), "__kuzu_node_name__"):
@@ -74,39 +79,80 @@ def _relationship_endpoint_metadata(
 ) -> tuple[EndpointRow, EndpointRow]:
     from_endpoint = _node_endpoint(from_node)
     to_endpoint = _node_endpoint(to_node)
-    pairs = _relationship_pair_metadata(rel_cls)
-
-    if from_endpoint is not None and to_endpoint is not None:
-        candidates = [
-            pair for pair in pairs
-            if pair[0] == from_endpoint[0] and pair[1] == to_endpoint[0]
-        ]
-    elif from_endpoint is not None:
-        candidates = [pair for pair in pairs if pair[0] == from_endpoint[0]]
-    elif to_endpoint is not None:
-        candidates = [pair for pair in pairs if pair[1] == to_endpoint[0]]
-    else:
-        candidates = list(pairs)
-
-    if len(candidates) != 1:
-        raise ValueError(
-            f"{rel_cls.__name__} endpoint route is ambiguous: "
-            f"from={type(from_node).__name__}, to={type(to_node).__name__}, candidates={len(candidates)}"
-        )
-
-    from_label, to_label, from_key, to_key = candidates[0]
+    route = resolve_kuzu_relationship_route(
+        [
+            {
+                "from_label": from_label,
+                "to_label": to_label,
+                "from_key_field": from_key,
+                "to_key_field": to_key,
+            }
+            for from_label, to_label, from_key, to_key in _relationship_pair_metadata(rel_cls)
+        ],
+        _endpoint_map(from_endpoint),
+        _endpoint_map(to_endpoint),
+        rel_cls.__name__,
+    )
     return (
-        from_endpoint or (from_label, from_key, from_node),
-        to_endpoint or (to_label, to_key, to_node),
+        from_endpoint or (route["from_label"], route["from_key_field"], from_node),
+        to_endpoint or (route["to_label"], route["to_key_field"], to_node),
     )
 
+def _endpoint_map(endpoint: EndpointRow | None) -> dict[str, Any] | None:
+    if endpoint is None:
+        return None
+    return {"label": endpoint[0], "key_field": endpoint[1], "value": endpoint[2]}
+
 def _model_row(instance: Any, exclude: frozenset[str] = frozenset()) -> dict[str, Any]:
+    model_class = type(instance)
     data = getattr(instance, "__dict__", None)
     if not isinstance(data, dict):
-        return dict(instance.model_dump(mode="python", exclude=exclude))
+        return normalize_model_row(
+            model_class,
+            {
+                field: _materialize_default_function(value)
+                for field, value in instance.model_dump(mode="python", exclude=exclude).items()
+            },
+        )
     if not exclude:
-        return dict(data)
-    return {field: value for field, value in data.items() if field not in exclude}
+        return normalize_model_row(
+            model_class,
+            {
+                field: _materialize_default_function(value)
+                for field, value in data.items()
+            },
+        )
+    return normalize_model_row(
+        model_class,
+        {
+            field: _materialize_default_function(value)
+            for field, value in data.items()
+            if field not in exclude
+        },
+    )
+
+def normalize_model_row(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
+    return normalize_kuzu_model_row(row, model_field_specs(model_class))
+
+def model_field_specs(model_class: type[Any]) -> list[dict[str, Any]]:
+    getter = getattr(model_class, "get_all_kuzu_metadata", None)
+    if not callable(getter):
+        raise TypeError(f"{model_class.__name__} has no Kuzu field metadata")
+    return [
+        {
+            "field": field,
+            "kuzu_type": str(getattr(metadata, "kuzu_type", "")),
+            "primary_key": bool(getattr(metadata, "primary_key", False)),
+            "not_null": bool(getattr(metadata, "not_null", False)),
+            "auto_increment": bool(getattr(metadata, "auto_increment", False)),
+        }
+        for field, metadata in getter().items()
+    ]
+
+def _materialize_default_function(value: Any) -> Any:
+    if isinstance(value, (KuzuDefaultFunction, DefaultFunctionBase)):
+        return BulkInsertValueGeneratorRegistry.generate_value(value)
+    return value
 
 def _node_row(instance: Any) -> dict[str, Any]:
     return _model_row(instance)
@@ -178,6 +224,81 @@ def primary_key_fields(model_class: type[Any]) -> list[str]:
 
 def node_merge_policies(model_class: type[Any]) -> dict[str, str]:
     return dict(_node_merge_policies(model_class))
+
+def auto_generation_fields(instance: Any) -> list[str]:
+    getter = getattr(instance, "get_auto_increment_fields_needing_generation", None)
+    if not callable(getter):
+        return []
+    fields = getter()
+    if not isinstance(fields, list):
+        raise TypeError("auto-increment metadata must be a list")
+    return [field for field in fields if getattr(instance, field, None) is None]
+
+def validate_explicit_null_primary_keys(
+    instance: Any,
+    manual_values: dict[str, Any],
+) -> None:
+    if not manual_values:
+        return
+    primary_keys = set(_primary_key_fields(type(instance)))
+    null_keys = [
+        field
+        for field, value in manual_values.items()
+        if field in primary_keys and value is None
+    ]
+    if null_keys:
+        raise RuntimeError("violates non-null constraint of the primary key")
+
+def node_create_spec(instance: Any) -> dict[str, Any]:
+    generated = set(auto_generation_fields(instance))
+    props = {
+        field: value
+        for field, value in _node_row(instance).items()
+        if field not in generated
+    }
+    return {
+        "label": _node_label(type(instance)),
+        "props": props,
+        "generated_fields": list(generated),
+    }
+
+def relationship_create_spec(instance: Any) -> dict[str, Any]:
+    generated = set(auto_generation_fields(instance))
+    row = _relationship_row(instance)
+    route_fields = {
+        "from_label",
+        "to_label",
+        "from_pk_field",
+        "to_pk_field",
+        "from_pk",
+        "to_pk",
+    }
+    props = {
+        field: value
+        for field, value in row.items()
+        if field not in generated and field not in route_fields
+    }
+    return {
+        "rel_type": type(instance).__kuzu_rel_name__,
+        "from_label": row["from_label"],
+        "to_label": row["to_label"],
+        "from_key_field": row["from_pk_field"],
+        "to_key_field": row["to_pk_field"],
+        "from_pk": row["from_pk"],
+        "to_pk": row["to_pk"],
+        "props": props,
+        "generated_fields": list(generated),
+    }
+
+def apply_generated_values(
+    instance: Any,
+    payload: dict[str, Any],
+    fields: list[str],
+) -> None:
+    for field in fields:
+        if field not in payload:
+            raise RuntimeError(f"generated payload missing field {field}")
+        setattr(instance, field, payload[field])
 
 def _endpoint(value: Any, rel_cls: type[Any], side: str) -> tuple[str, str, Any]:
     endpoint = _node_endpoint(value)

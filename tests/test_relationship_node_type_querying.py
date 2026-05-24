@@ -275,8 +275,8 @@ class TestRelationshipNodeTypeQuerying:
         )
         assert str(exc_info.value) == expected_msg
 
-    def test_cache_performance_and_consistency(self):
-        """Test cache performance and consistency across multiple calls."""
+    def test_repeated_relationship_node_type_queries_are_value_consistent(self):
+        """Test repeated relationship node queries return stable values."""
         @kuzu_node("User")
         class User(KuzuBaseModel):
             id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
@@ -289,27 +289,16 @@ class TestRelationshipNodeTypeQuerying:
         class Authored(KuzuRelationshipBase):
             created_at: str = kuzu_field(kuzu_type=KuzuDataType.DATE)
 
-        # First call should build cache
         result1 = Authored.from_nodes_types(User).to_nodes_types
         expected = frozenset({Post})
         assert result1 == expected
 
-        # Second call should use cache and return identical result
         result2 = Authored.from_nodes_types(User).to_nodes_types
         assert result2 == expected
-        assert result1 is result2  # Should be the same frozenset object due to caching
 
-        # Test cache consistency across different query types
         result3 = Authored.to_nodes_types(Post).from_nodes_types
         expected_from = frozenset({User})
         assert result3 == expected_from
-
-        # Verify cache is working by checking internal state
-        cache_key = Authored.__name__
-        assert cache_key in Authored._node_type_cache
-        cache = Authored._node_type_cache[cache_key]
-        assert RelationshipNodeTypeQueryConstants.CACHE_KEY_FROM_TO_MAP in cache
-        assert RelationshipNodeTypeQueryConstants.CACHE_KEY_TO_FROM_MAP in cache
 
     def test_deeply_nested_inheritance_patterns(self):
         """Test complex inheritance patterns that could break the implementation."""
@@ -430,8 +419,8 @@ class TestRelationshipNodeTypeQuerying:
         expected = frozenset({User})
         assert result == expected, f"Expected {expected}, got {result}"
 
-    def test_cache_invalidation_on_registry_changes(self):
-        """Test that cache is properly invalidated when registry changes."""
+    def test_declared_class_pairs_survive_registry_clear(self):
+        """Test declared class pairs are independent of registry cache state."""
         @kuzu_node("User")
         class User(KuzuBaseModel):
             id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
@@ -444,20 +433,14 @@ class TestRelationshipNodeTypeQuerying:
         class Authored(KuzuRelationshipBase):
             created_at: str = kuzu_field(kuzu_type=KuzuDataType.DATE)
 
-        # Build cache
         result1 = Authored.from_nodes_types(User).to_nodes_types
         expected = frozenset({Post})
         assert result1 == expected
 
-        # Verify cache exists
-        cache_key = Authored.__name__
-        assert cache_key in Authored._node_type_cache
-
-        # Clear registry (should invalidate cache)
         clear_registry()
 
-        # Verify cache was cleared
-        assert len(Authored._node_type_cache) == 0
+        result2 = Authored.from_nodes_types(User).to_nodes_types
+        assert result2 == expected
 
     def test_relationship_query_object_properties(self):
         """Test properties and behavior of RelationshipNodeTypeQuery objects."""
@@ -534,6 +517,6 @@ class TestRelationshipNodeTypeQuerying:
         test_dict = {result: "test_value"}
         assert test_dict[result] == "test_value"
 
-        # Test that identical queries return the same frozenset object (performance)
+        # Test repeated value consistency without identity caching.
         result2 = Authored.from_nodes_types(User).to_nodes_types
-        assert result is result2, "Cache should return the same frozenset object"
+        assert result2 == result

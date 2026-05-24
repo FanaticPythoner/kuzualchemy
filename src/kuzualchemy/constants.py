@@ -14,10 +14,15 @@ used throughout the KuzuAlchemy codebase. No magic values are allowed elsewhere.
 
 from __future__ import annotations
 
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import Final, Any
 
 from .kuzu_function_types import TimeFunction, UUIDFunction, SequenceFunction
+
+
+class _StringEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.value
 
 
 # ============================================================================
@@ -88,7 +93,7 @@ class RelationshipMultiplicity(Enum):
 # DDL GENERATION CONSTANTS
 # ============================================================================
 
-class DDLConstants(StrEnum):
+class DDLConstants(_StringEnum):
     """DDL generation constants."""
 
     # @@ STEP 1: Define DDL keywords
@@ -222,19 +227,6 @@ class CypherConstants:
     PARAM_SEPARATOR: Final[str] = "_"
 
 # ============================================================================
-# QUERY RETURN ALIAS CONSTANTS
-# ============================================================================
-
-class QueryReturnAliasConstants:
-    """Constants for standardized aliases in query RETURN clauses."""
-
-    FROM_ENDPOINT: Final[str] = "__from_endpoint__"
-    TO_ENDPOINT: Final[str] = "__to_endpoint__"
-    FROM_ID: Final[str] = "__from_id__"
-    TO_ID: Final[str] = "__to_id__"
-
-
-# ============================================================================
 # MODEL METADATA CONSTANTS
 # ============================================================================
 
@@ -353,31 +345,9 @@ class ErrorMessages:
 class PerformanceConstants:
     """Performance tuning constants."""
 
-    # @@ STEP 1: Define cache settings
-    CACHE_SIZE: Final[int] = 1000
-    CACHE_TTL: Final[int] = 3600  # 1 hour in seconds
-    CACHE_MAX_AGE: Final[int] = 86400  # 24 hours in seconds
-
-    # @@ STEP 2: Define pool settings (fixed constants; no env)
-    CONNECTION_POOL_SIZE: Final[int] = 10
-    CONNECTION_POOL_MAX_OVERFLOW: Final[int] = 20
-    CONNECTION_POOL_TIMEOUT: Final[int] = 30
-
-    # @@ STEP 3: Define query optimization
-    QUERY_CACHE_SIZE: Final[int] = 500
-    QUERY_PLAN_CACHE_SIZE: Final[int] = 100
-    STATISTICS_CACHE_TTL: Final[int] = 300  # 5 minutes
-
-    # @@ STEP 4: Define batch processing
     BATCH_INSERT_SIZE: Final[int] = 1000
     BATCH_UPDATE_SIZE: Final[int] = 500
     BATCH_DELETE_SIZE: Final[int] = 500
-
-    # @@ STEP 5: Define session optimization settings (fixed constants; no env)
-    CONNECTION_REUSE_THRESHOLD: Final[int] = 5  # Reuse connection for N operations
-    AUTOFLUSH_BATCH_SIZE: Final[int] = 100  # Batch size before forcing flush
-    IDENTITY_MAP_INITIAL_SIZE: Final[int] = 256  # Initial identity map size
-    METADATA_CACHE_SIZE: Final[int] = 500  # Cache size for model metadata
 
 
 # ============================================================================
@@ -446,7 +416,7 @@ class DDLMessageConstants:
         "removed from emitted DDL"
     )
 
-class KuzuDataType(StrEnum):
+class KuzuDataType(_StringEnum):
     """Constants for Kuzu data types."""
 
     # @@ STEP 1: Define integer types
@@ -675,14 +645,7 @@ class RelationshipNodeTypeQueryConstants:
     QUERY_TYPE_FROM: Final[str] = "from"
     QUERY_TYPE_TO: Final[str] = "to"
 
-    # @@ STEP 2: Define cache keys
-    CACHE_KEY_FROM_TO_MAP: Final[str] = "from_to_map"
-    CACHE_KEY_TO_FROM_MAP: Final[str] = "to_from_map"
-    CACHE_KEY_FROM_TO_SINGLE: Final[str] = "from_to_single"
-    CACHE_KEY_TO_FROM_SINGLE: Final[str] = "to_from_single"
-
     # @@ STEP 2.1: Adjacency storage keys for vectorized multi-node queries
-    CACHE_KEY_ADJACENCY_DATA: Final[str] = "adjacency_data"
     ADJ_FROM_TO: Final[str] = "adj_from_to"
     ADJ_TO_FROM: Final[str] = "adj_to_from"
     FROM_LIST: Final[str] = "from_list"
@@ -696,18 +659,6 @@ class RelationshipNodeTypeQueryConstants:
     ABSTRACT_RELATIONSHIP_QUERY: Final[str] = (
         "Cannot query node types on abstract relationship class '{}'"
     )
-
-
-# ============================================================================
-# FOREIGN KEY VALIDATION CONSTANTS
-# ============================================================================
-
-class ForeignKeyValidationConstants:
-    """Constants for foreign key validation system."""
-
-    # @@ STEP 1: Define cache configuration
-    CACHE_MAX_SIZE: Final[int] = 1000
-    CACHE_KEY_SEPARATOR: Final[str] = ":"
 
 
 # ============================================================================
@@ -745,8 +696,6 @@ __all__ = [
     "SessionOperationConstants",
     "JoinPatternConstants",
     "ValidationMessageConstants",
-    "QueryReturnAliasConstants",
     "RelationshipNodeTypeQueryConstants",
-    "ForeignKeyValidationConstants",
     "RelationshipNodeTypeQueryErrorConstants",
 ]

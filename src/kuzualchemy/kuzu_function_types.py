@@ -63,7 +63,7 @@ class TimeFunction(DefaultFunctionBase):
     Functions of this type handle temporal operations like
     current_timestamp(), current_date(), now(), etc.
     """
-    pass
+    __slots__ = ()
 
 
 class UUIDFunction(DefaultFunctionBase):
@@ -72,7 +72,7 @@ class UUIDFunction(DefaultFunctionBase):
     
     Functions of this type generate unique identifiers.
     """
-    pass
+    __slots__ = ()
 
 
 class SequenceFunction(DefaultFunctionBase):

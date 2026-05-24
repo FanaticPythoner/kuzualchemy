@@ -4,10 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import types
 from typing import Any, Dict, Type, Union, get_args, get_origin
-from weakref import WeakKeyDictionary
 
-_ENUM_CACHE: Dict[Type[Enum], tuple[Dict[str, Enum], Dict[Any, Enum]]] = {}
-_MODEL_ENUM_PLAN_CACHE: "WeakKeyDictionary[type[Any], tuple[EnumFieldConversionPlan, ...]]" = WeakKeyDictionary()
 _MISSING = object()
 _NONE_TYPE = type(None)
 _UNION_ORIGINS = (Union, types.UnionType) if hasattr(types, "UnionType") else (Union,)
@@ -31,32 +28,12 @@ class EnumFieldConversionPlan:
 
 
 def get_enum_lookups(enum_type: Type[Enum]) -> tuple[Dict[str, Enum], Dict[Any, Enum]]:
-    if enum_type not in _ENUM_CACHE:
-        names: Dict[str, Enum] = {}
-        values: Dict[Any, Enum] = {}
-        for member in enum_type:
-            names[member.name] = member
-            values[member.value] = member
-        _ENUM_CACHE[enum_type] = (names, values)
-    return _ENUM_CACHE[enum_type]
-
-
-def create_enum_converter(enum_type: Type[Enum]):
-    def convert_element(elem: Any) -> Any:
-        member = _lookup_enum_value(enum_type, elem)
-        if member is not _MISSING:
-            return member
-        raise _build_enum_error(enum_type.__name__, (enum_type,), elem)
-
-    return convert_element
-
-
-def clear_model_enum_conversion_plan(model_class: type[Any]) -> None:
-    _MODEL_ENUM_PLAN_CACHE.pop(model_class, None)
-
-
-def clear_all_enum_conversion_plans() -> None:
-    _MODEL_ENUM_PLAN_CACHE.clear()
+    names: Dict[str, Enum] = {}
+    values: Dict[Any, Enum] = {}
+    for member in enum_type:
+        names[member.name] = member
+        values[member.value] = member
+    return names, values
 
 
 def _try_value_lookup(value_map: Dict[Any, Enum], raw_value: Any) -> Enum | object:
@@ -93,7 +70,7 @@ def _lookup_enum_value(enum_type: Type[Enum], raw_value: Any) -> Enum | object:
                     if member is not _MISSING:
                         return member
                 except (ValueError, OverflowError):
-                    pass
+                    return _MISSING
     return _MISSING
 
 
@@ -242,12 +219,7 @@ def _build_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFiel
 
 
 def _get_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFieldConversionPlan, ...]:
-    cached = _MODEL_ENUM_PLAN_CACHE.get(model_class)
-    if cached is not None:
-        return cached
-    plans = _build_model_enum_conversion_plans(model_class)
-    _MODEL_ENUM_PLAN_CACHE[model_class] = plans
-    return plans
+    return _build_model_enum_conversion_plans(model_class)
 
 
 def _convert_sequence_branch(field_name: str, branch: EnumConversionBranch, raw_value: Any) -> list[Any] | tuple[Any, ...] | object:

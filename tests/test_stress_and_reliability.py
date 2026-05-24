@@ -119,7 +119,6 @@ class TestHighConcurrentLoad:
                 # Serialize write operations due to Kuzu's single-writer limitation
                 with write_lock:
                     session = KuzuSession(db_path=test_db_path)
-                    initialize_schema(session, ddl=ddl)
                     user = StressTestUser(
                         id=next_id(),
                         name=f"User_{thread_id}_{success_count}",
@@ -357,7 +356,6 @@ class TestMemoryUsageUnderStress:
         for cycle in range(total_cycles):
             session = None
             session = KuzuSession(db_path=test_db_path)
-            initialize_schema(session, ddl=ddl)
 
             for i in range(per_cycle):
                 uid = next_id()

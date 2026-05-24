@@ -92,7 +92,7 @@ def test_massive_bulk_insert_all_types_and_arrays_fast():
         ))
 
     start = time.time()
-    session._bulk_insert(rows)
+    session.bulk_insert_immediate(rows)
     elapsed = time.time() - start
 
     # Validate count
@@ -143,7 +143,7 @@ def test_bulk_insert_unicode_and_large_strings():
         for i in range(N)
     ]
 
-    session._bulk_insert(rows)
+    session.bulk_insert_immediate(rows)
 
     # Validate subset and special characters intact
     out = list(session.execute("MATCH (n:UnicodeNode) WHERE n.id IN [1, 2500, 5000] RETURN n"))
@@ -169,7 +169,7 @@ def test_bulk_insert_default_functions_resolution():
     N = 2000
     rows = [DefaultsNode(id=i+1) for i in range(N)]  # omit created_at explicitly; id provided
 
-    session._bulk_insert(rows)
+    session.bulk_insert_immediate(rows)
 
     # All rows should be present
     res = session.execute("MATCH (n:DefaultsNode) RETURN count(n) AS c")
@@ -200,9 +200,9 @@ def test_bulk_insert_within_batch_duplicate_primary_keys_rolls_back():
     rows = [PKDupNode(id=i, name=f"r{i}") for i in range(1, 401)]
     rows += [PKDupNode(id=i, name=f"dup{i}") for i in range(1, 51)]  # 50 duplicates
 
-    with pytest.raises(RuntimeError) as exc:
-        session._bulk_insert(rows)
-    assert any(k in str(exc.value).lower() for k in ("primary", "duplicate", "constraint"))
+    with pytest.raises(ValueError) as exc:
+        session.bulk_insert_immediate(rows)
+    assert any(k in str(exc.value).lower() for k in ("primary", "duplicate", "constraint", "conflict"))
 
     # Table should still be empty
     res = session.execute("MATCH (n:PKDupNode) RETURN count(n) AS c")
@@ -224,7 +224,7 @@ def test_bulk_insert_duplicate_primary_keys_across_batches_rollback():
 
     # Batch 1: all unique
     batch1 = [PKNode(id=uuid.uuid4(), name=f"r{i}") for i in range(500)]
-    session._bulk_insert(batch1)
+    session.bulk_insert_immediate(batch1)
     res = session.execute("MATCH (n:PKNode) RETURN count(n) AS c1")
     before = res[0].get("c1", list(res[0].values())[0])
     assert before == 500
@@ -237,8 +237,8 @@ def test_bulk_insert_duplicate_primary_keys_across_batches_rollback():
         PKNode(id=did, name="dupe") for did in dup_ids
     ]
 
-    with pytest.raises(RuntimeError) as exc:
-        session._bulk_insert(batch2)
+    with pytest.raises(ValueError) as exc:
+        session.bulk_insert_immediate(batch2)
     # Error message should mention constraint/primary/duplicate in a broad sense
     assert any(k in str(exc.value).lower() for k in ("constraint", "primary", "duplicate"))
 
@@ -246,4 +246,3 @@ def test_bulk_insert_duplicate_primary_keys_across_batches_rollback():
     res2 = session.execute("MATCH (n:PKNode) RETURN count(n) AS c2")
     after = res2[0].get("c2", list(res2[0].values())[0])
     assert after == before
-

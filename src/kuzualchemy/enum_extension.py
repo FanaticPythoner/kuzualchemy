@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum, IntEnum, StrEnum
+from enum import Enum, IntEnum
 from typing import Any, Callable, Generic, Mapping, TypeVar, cast, overload
 
 from .constants import KuzuDataType
@@ -36,6 +36,11 @@ _UINT32_STORAGE_TYPE = cast(KuzuDataType, KuzuDataType.UINT32)
 _UINT64_STORAGE_TYPE = cast(KuzuDataType, KuzuDataType.UINT64)
 
 
+class _KuzuStringEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.value
+
+
 class KuzuEnumClassShimMeta(type):
     def __call__(cls: type[DecoratedEnumMemberType], value: object, /) -> DecoratedEnumMemberType:
         return cast(DecoratedEnumMemberType, super().__call__(value))
@@ -63,13 +68,13 @@ def _resolved_enum_factory(
     if storage_type is None:
         if base_enum is not None and issubclass(base_enum, IntEnum):
             return IntEnum
-        if base_enum is not None and issubclass(base_enum, StrEnum):
-            return StrEnum
+        if base_enum is not None and issubclass(base_enum, str):
+            return _KuzuStringEnum
         return Enum
     if storage_type in _INTEGER_STORAGE_TYPES:
         return IntEnum
-    if base_enum is not None and issubclass(base_enum, StrEnum):
-        return StrEnum
+    if base_enum is not None and issubclass(base_enum, str):
+        return _KuzuStringEnum
     return Enum
 
 
@@ -117,8 +122,8 @@ def _is_extension_enum_shell(
     enum_factory = _resolved_enum_factory(storage_type, base_enum)
     if enum_factory is IntEnum:
         return issubclass(enum_cls, IntEnum)
-    if enum_factory is StrEnum:
-        return issubclass(enum_cls, StrEnum)
+    if enum_factory is _KuzuStringEnum:
+        return issubclass(enum_cls, str)
     return True
 
 
