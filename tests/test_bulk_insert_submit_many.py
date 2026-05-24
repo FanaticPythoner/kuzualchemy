@@ -20,6 +20,11 @@ from kuzualchemy import (
 class BulkSubmitManyA(KuzuBaseModel):
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+    score: int = kuzu_field(
+        kuzu_type=KuzuDataType.INT64,
+        default=0,
+        atp_merge_policy="KEEP_MAX_NUMERIC",
+    )
 
 
 @kuzu_node("BulkSubmitManyB")
@@ -35,7 +40,9 @@ class BulkSubmitManyLinked(KuzuRelationshipBase):
 
 class _CaptureConnection:
     def __init__(self) -> None:
-        self.node_writes: list[tuple[str, list[dict[str, Any]], list[str]]] = []
+        self.node_writes: list[
+            tuple[str, list[dict[str, Any]], list[str], dict[str, object]]
+        ] = []
         self.relationship_writes: list[tuple[str, str, str, list[dict[str, Any]], list[str], list[str]]] = []
         self.relationship_reads: list[tuple[str, str, str, list[dict[str, str]], list[int]]] = []
         self.combined_write_count = 0
@@ -46,15 +53,18 @@ class _CaptureConnection:
         label: str,
         rows: list[dict[str, Any]],
         key_fields: list[str],
+        merge_policies: dict[str, object] | None = None,
     ) -> None:
-        self.node_writes.append((label, rows, key_fields))
+        self.node_writes.append((label, rows, key_fields, dict(merge_policies or {})))
 
     def bulk_write_nodes_many(
         self,
-        batches: list[tuple[object, str, list[dict[str, Any]], list[str]]],
+        batches: list[tuple[object, ...]],
     ) -> None:
-        for _action, label, rows, key_fields in batches:
-            self.node_writes.append((label, rows, key_fields))
+        for batch in batches:
+            _action, label, rows, key_fields = batch[:4]
+            merge_policies = batch[4] if len(batch) == 5 else {}
+            self.node_writes.append((label, rows, key_fields, dict(merge_policies or {})))
 
     def bulk_write_relationships(
         self,
@@ -91,7 +101,7 @@ class _CaptureConnection:
 
     def bulk_write_nodes_and_relationships_many(
         self,
-        node_batches: list[tuple[object, str, list[dict[str, Any]], list[str]]],
+        node_batches: list[tuple[object, ...]],
         relationship_batches: list[
             tuple[object, str, str, str, list[dict[str, Any]], list[str], list[str]]
         ],
@@ -150,6 +160,8 @@ def test_bulk_insert_submits_label_batches_by_model() -> None:
     b_rows = conn.node_writes[1][1]
     assert [row["id"] for row in a_rows] == [3, 1]
     assert [row["id"] for row in b_rows] == [2, 4]
+    assert conn.node_writes[0][3] == {"score": "KEEP_MAX_NUMERIC"}
+    assert conn.node_writes[1][3] == {}
     assert conn.combined_write_count == 1
 
 

@@ -669,6 +669,7 @@ class KuzuFieldMetadata:
     default_value: Optional[Union[Any, KuzuDefaultFunction]] = None
     default_factory: Optional[Callable[[], Any]] = None
     auto_increment: bool = False  # For SERIAL type auto-increment support
+    atp_merge_policy: Optional[str] = None
 
     # Relationship-only markers (not emitted; used for custom schemas)
     is_from_ref: bool = False
@@ -736,6 +737,22 @@ class KuzuFieldMetadata:
         return DefaultValueHandlerRegistry.render(value)
 
 
+_ATP_BULK_MERGE_POLICIES = frozenset({"KEEP_MIN", "KEEP_MAX", "KEEP_MAX_NUMERIC"})
+
+
+def _normalize_atp_merge_policy(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("atp_merge_policy must be a string")
+    normalized = value.strip().upper()
+    if normalized not in _ATP_BULK_MERGE_POLICIES:
+        raise ValueError(
+            f"atp_merge_policy must be one of {sorted(_ATP_BULK_MERGE_POLICIES)}, got {value!r}"
+        )
+    return normalized
+
+
 def kuzu_field(
     default: Any = ...,
     *,
@@ -753,6 +770,7 @@ def kuzu_field(
     title: Optional[str] = None,
     description: Optional[str] = None,
     json_schema_extra: Optional[Dict[str, Any]] = None,
+    atp_merge_policy: Optional[str] = None,
     is_from_ref: bool = False,
     is_to_ref: bool = False,
 ) -> Any:
@@ -858,6 +876,7 @@ def kuzu_field(
         default_value=field_default_value,
         default_factory=default_factory,
         auto_increment=auto_increment,
+        atp_merge_policy=_normalize_atp_merge_policy(atp_merge_policy),
         is_from_ref=is_from_ref,
         is_to_ref=is_to_ref,
     )
@@ -970,6 +989,7 @@ def kuzu_field_edit(field_name: str, annotation: Any = _KUZU_FIELD_DIRECTIVE_UNS
         "check_constraint",
         "auto_increment",
         "element_type",
+        "atp_merge_policy",
         "is_from_ref",
         "is_to_ref",
     }
@@ -1126,6 +1146,10 @@ def _build_edited_kuzu_field(field_name: str, field_info: FieldInfo, directive: 
         title=directive.field_updates.get("title", field_info.title),
         description=directive.field_updates.get("description", field_info.description),
         json_schema_extra=directive.field_updates.get("json_schema_extra", _base_kuzu_field_json_schema_extra(field_info)),
+        atp_merge_policy=directive.metadata_updates.get(
+            "atp_merge_policy",
+            metadata.atp_merge_policy,
+        ),
         is_from_ref=directive.metadata_updates.get("is_from_ref", metadata.is_from_ref),
         is_to_ref=directive.metadata_updates.get("is_to_ref", metadata.is_to_ref),
     )

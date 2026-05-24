@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 from atp_pipeline import (
@@ -6,6 +7,7 @@ from atp_pipeline import (
     DatabaseType,
     DbBulkAction,
     DbBulkEntity,
+    DbBulkMergePolicy,
     DbBulkRelationship,
     DbStatement,
     DbWorkKind,
@@ -113,13 +115,19 @@ class KuzuConnection:
         label: str,
         rows: list[dict[str, Any]],
         key_fields: list[str],
+        merge_policies: dict[str, DbBulkMergePolicy | str] | None = None,
     ) -> None:
-        self.bulk_write_nodes_many([(action, label, rows, key_fields)])
+        self.bulk_write_nodes_many([(action, label, rows, key_fields, merge_policies)])
     def bulk_write_nodes_many(
         self,
-        batches: Iterable[tuple[DbBulkAction, str, list[dict[str, Any]], list[str]]],
+        batches: Iterable[tuple[Any, ...]],
     ) -> None:
-        works = [_node_bulk_work(action, label, rows, key_fields) for action, label, rows, key_fields in batches if rows]
+        works = [
+            _node_bulk_work(action, label, rows, key_fields, merge_policies)
+            for batch in batches
+            for action, label, rows, key_fields, merge_policies in [_node_batch_parts(batch)]
+            if rows
+        ]
         if works:
             self._submit_many_work(works, expect_rows=False)
     def bulk_write_relationships(
@@ -158,14 +166,15 @@ class KuzuConnection:
             self._submit_many_work(works, expect_rows=False)
     def bulk_write_nodes_and_relationships_many(
         self,
-        node_batches: Iterable[tuple[DbBulkAction, str, list[dict[str, Any]], list[str]]],
+        node_batches: Iterable[tuple[Any, ...]],
         relationship_batches: Iterable[
             tuple[DbBulkAction, str, str, str, list[dict[str, Any]], list[str], list[str]]
         ],
     ) -> None:
         works = [
-            _node_bulk_work(action, label, rows, key_fields)
-            for action, label, rows, key_fields in node_batches
+            _node_bulk_work(action, label, rows, key_fields, merge_policies)
+            for batch in node_batches
+            for action, label, rows, key_fields, merge_policies in [_node_batch_parts(batch)]
             if rows
         ]
         works.extend(
@@ -225,11 +234,58 @@ def _node_bulk_work(
     label: str,
     rows: list[dict[str, Any]],
     key_fields: list[str],
+    merge_policies: Mapping[str, DbBulkMergePolicy | str] | None = None,
 ) -> DbWorkSpec:
     return DbWorkSpec(
         DbWorkKind.NODE_BULK_WRITE,
-        node_bulk=DbBulkEntity(action, label, rows, key_fields),
+        node_bulk=DbBulkEntity(
+            action,
+            label,
+            rows,
+            key_fields,
+            _node_merge_policy_map(merge_policies),
+        ),
     )
+
+def _node_merge_policy_map(
+    merge_policies: Mapping[str, DbBulkMergePolicy | str] | None,
+) -> dict[str, str]:
+    if merge_policies is None:
+        return {}
+    if not isinstance(merge_policies, Mapping):
+        raise TypeError("node bulk merge_policies must be a mapping")
+    allowed = {policy.value for policy in DbBulkMergePolicy}
+    normalized: dict[str, str] = {}
+    for field, policy in merge_policies.items():
+        if not isinstance(field, str) or not field:
+            raise ValueError("node bulk merge policy field must be a non-empty string")
+        raw_policy = policy.value if isinstance(policy, DbBulkMergePolicy) else policy
+        if not isinstance(raw_policy, str):
+            raise TypeError("node bulk merge policy value must be a string")
+        normalized_policy = raw_policy.strip().upper()
+        if normalized_policy not in allowed:
+            raise ValueError(
+                f"node bulk merge policy must be one of {sorted(allowed)}, got {raw_policy!r}"
+            )
+        normalized[field] = normalized_policy
+    return normalized
+
+def _node_batch_parts(
+    batch: tuple[Any, ...],
+) -> tuple[
+    DbBulkAction,
+    str,
+    list[dict[str, Any]],
+    list[str],
+    dict[str, DbBulkMergePolicy | str],
+]:
+    if len(batch) == 4:
+        action, label, rows, key_fields = batch
+        return action, label, rows, key_fields, {}
+    if len(batch) == 5:
+        action, label, rows, key_fields, merge_policies = batch
+        return action, label, rows, key_fields, _node_merge_policy_map(merge_policies)
+    raise ValueError("node bulk batch must contain four or five fields")
 def _relationship_bulk_work(
     action: DbBulkAction,
     rel_type: str,

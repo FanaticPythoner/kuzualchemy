@@ -5,9 +5,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from kuzualchemy import (
     KuzuBaseModel,
     KuzuDataType,
+    KuzuNodeBase,
     KuzuRelationshipBase,
     KuzuSession,
     get_ddl_for_node,
@@ -16,6 +19,7 @@ from kuzualchemy import (
     kuzu_node,
     kuzu_relationship,
 )
+from kuzualchemy.kuzu_session_rows import _node_row, _relationship_row, node_merge_policies
 from kuzualchemy.test_utilities import initialize_schema
 
 
@@ -23,7 +27,12 @@ from kuzualchemy.test_utilities import initialize_schema
 class BoundaryAuthor(KuzuBaseModel):
     id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
     name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
-    score: int = kuzu_field(kuzu_type=KuzuDataType.INT64, default=0)
+    score: int = kuzu_field(
+        kuzu_type=KuzuDataType.INT64,
+        default=0,
+        atp_merge_policy="KEEP_MAX_NUMERIC",
+    )
+    nickname: str | None = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None, not_null=False)
 
 
 @kuzu_node("BoundaryPost")
@@ -36,6 +45,37 @@ class BoundaryPost(KuzuBaseModel):
 class BoundaryAuthored(KuzuRelationshipBase):
     rank: int = kuzu_field(kuzu_type=KuzuDataType.INT64, default=0)
     marker: str | None = kuzu_field(kuzu_type=KuzuDataType.STRING, default=None, not_null=False)
+
+
+@kuzu_relationship(
+    "BoundaryLinked",
+    pairs=[(BoundaryAuthor, BoundaryPost), (BoundaryPost, BoundaryAuthor)],
+)
+class BoundaryLinked(KuzuRelationshipBase):
+    weight: int = kuzu_field(kuzu_type=KuzuDataType.INT64, default=0)
+
+
+@kuzu_node("BoundaryEndpointAuthor")
+class BoundaryEndpointAuthor(KuzuNodeBase):
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    name: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+
+
+@kuzu_node("BoundaryEndpointPost")
+class BoundaryEndpointPost(KuzuNodeBase):
+    id: int = kuzu_field(kuzu_type=KuzuDataType.INT64, primary_key=True)
+    title: str = kuzu_field(kuzu_type=KuzuDataType.STRING)
+
+
+@kuzu_relationship(
+    "BoundaryEndpointLinked",
+    pairs=[
+        (BoundaryEndpointAuthor, BoundaryEndpointPost),
+        (BoundaryEndpointPost, BoundaryEndpointAuthor),
+    ],
+)
+class BoundaryEndpointLinked(KuzuRelationshipBase):
+    weight: int = kuzu_field(kuzu_type=KuzuDataType.INT64, default=0)
 
 
 def _session(tmp_path: Path) -> KuzuSession:
@@ -79,6 +119,91 @@ def test_atp_db_work_updates_and_deletes_nodes(tmp_path: Path) -> None:
         assert rows == [{"id": 1, "name": "alpha-new", "score": 11}]
     finally:
         session.close()
+
+
+def test_atp_db_work_node_create_is_idempotent_without_null_overwrite(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    try:
+        session.bulk_insert_immediate(
+            [
+                BoundaryAuthor(id=1, name="alpha", score=1, nickname="live"),
+                BoundaryAuthor(id=1, name="alpha", score=1, nickname=None),
+            ]
+        )
+        session.bulk_insert_immediate(
+            [
+                BoundaryAuthor(id=1, name="alpha", score=1, nickname=None),
+            ]
+        )
+
+        rows = session.execute(
+            "MATCH (a:BoundaryAuthor) RETURN a.id AS id, a.name AS name, "
+            "a.score AS score, a.nickname AS nickname ORDER BY id"
+        )
+
+        assert rows == [{"id": 1, "name": "alpha", "score": 1, "nickname": "live"}]
+    finally:
+        session.close()
+
+
+def test_bulk_row_serialization_matches_pydantic_contract() -> None:
+    author = BoundaryAuthor(id=1, name="alpha", score=1)
+    post = BoundaryPost(id=10, title="first")
+    rel = BoundaryAuthored.create_between(
+        author.id,
+        post.id,
+        rank=3,
+        marker=None,
+    )
+    expected_relationship = rel.model_dump(
+        mode="python",
+        exclude={"from_node", "to_node"},
+    )
+    expected_relationship.update(
+        {
+            "from_label": "BoundaryAuthor",
+            "to_label": "BoundaryPost",
+            "from_pk_field": "id",
+            "to_pk_field": "id",
+            "from_pk": author.id,
+            "to_pk": post.id,
+        }
+    )
+
+    assert _node_row(author) == author.model_dump(mode="python")
+    assert node_merge_policies(BoundaryAuthor) == {"score": "KEEP_MAX_NUMERIC"}
+    assert _relationship_row(rel) == expected_relationship
+
+
+def test_atp_merge_policy_validation_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="atp_merge_policy must be one of"):
+        kuzu_field(kuzu_type=KuzuDataType.INT64, atp_merge_policy="KEEP_LAST")
+
+    with pytest.raises(TypeError, match="atp_merge_policy must be a string"):
+        kuzu_field(kuzu_type=KuzuDataType.INT64, atp_merge_policy=object())  # type: ignore[arg-type]
+
+
+def test_bulk_row_serialization_resolves_multi_pair_object_endpoints() -> None:
+    author = BoundaryEndpointAuthor(id=1, name="alpha")
+    post = BoundaryEndpointPost(id=10, title="first")
+    rel = BoundaryEndpointLinked.create_between(author, post, weight=7)
+
+    assert _relationship_row(rel) == {
+        "weight": 7,
+        "from_label": "BoundaryEndpointAuthor",
+        "to_label": "BoundaryEndpointPost",
+        "from_pk_field": "id",
+        "to_pk_field": "id",
+        "from_pk": author.id,
+        "to_pk": post.id,
+    }
+
+
+def test_bulk_row_serialization_rejects_ambiguous_multi_pair_raw_endpoints() -> None:
+    rel = BoundaryLinked.create_between(1, 10, weight=7)
+
+    with pytest.raises(ValueError, match="BoundaryLinked endpoint route is ambiguous"):
+        _relationship_row(rel)
 
 
 def test_atp_db_work_updates_relationships(tmp_path: Path) -> None:

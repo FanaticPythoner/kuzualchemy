@@ -16,6 +16,7 @@ from .kuzu_session_rows import (
     _relationship_route,
     _relationship_row,
     _relationship_update_row,
+    node_merge_policies,
 )
 ModelType = TypeVar("ModelType")
 class KuzuSession:
@@ -140,17 +141,35 @@ class KuzuSession:
             relationship_instances,
         )
     def bulk_update_nodes(self, model_class: Type[Any], rows: list[dict[str, Any]]) -> None:
-        self._conn.bulk_write_nodes(DbBulkAction.UPDATE, _node_label(model_class), rows, _primary_key_fields(model_class))
+        self._conn.bulk_write_nodes(
+            DbBulkAction.UPDATE,
+            _node_label(model_class),
+            rows,
+            _primary_key_fields(model_class),
+            node_merge_policies(model_class),
+        )
     def bulk_update_node_groups(self, rows_by_class: dict[Type[Any], list[dict[str, Any]]]) -> None:
         self._conn.bulk_write_nodes_many(
             [
-                (DbBulkAction.UPDATE, _node_label(cls), rows, _primary_key_fields(cls))
+                (
+                    DbBulkAction.UPDATE,
+                    _node_label(cls),
+                    rows,
+                    _primary_key_fields(cls),
+                    node_merge_policies(cls),
+                )
                 for cls, rows in rows_by_class.items()
             ]
         )
     def bulk_delete_nodes(self, model_class: Type[Any], pks: list[Any]) -> None:
         key_fields = _primary_key_fields(model_class)
-        self._conn.bulk_write_nodes(DbBulkAction.DELETE, _node_label(model_class), [_pk_row(key_fields, pk) for pk in pks], key_fields)
+        self._conn.bulk_write_nodes(
+            DbBulkAction.DELETE,
+            _node_label(model_class),
+            [_pk_row(key_fields, pk) for pk in pks],
+            key_fields,
+            node_merge_policies(model_class),
+        )
     def bulk_update_relationships(self, instances: list[Any], fields: list[str]) -> None:
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
         for instance in instances:
@@ -257,7 +276,10 @@ class KuzuSession:
         rels: dict[RelationshipRoute, list[dict[str, Any]]],
     ) -> None:
         self._conn.bulk_write_nodes_and_relationships_many(
-            [(action, _node_label(cls), rows, _primary_key_fields(cls)) for cls, rows in nodes.items()],
+            [
+                (action, _node_label(cls), rows, _primary_key_fields(cls), node_merge_policies(cls))
+                for cls, rows in nodes.items()
+            ],
             [
                 (action, rel_type, from_label, to_label, rows, [from_key], [to_key])
                 for (rel_type, from_label, to_label, from_key, to_key), rows in rels.items()
