@@ -7,7 +7,10 @@ from .kuzu_query_expressions import AggregateFunction, FilterExpression, JoinTyp
 from .kuzu_query_fields import ModelFieldAccessor, QueryField
 from .kuzu_relationship_read import (
     can_use_native_relationship_read,
+    construct_model_from_db_payload,
     materialize_endpoint_node,
+    model_payload_fields,
+    relationship_read_filter_statements,
     relationship_endpoint_types,
 )
 if TYPE_CHECKING:
@@ -229,6 +232,7 @@ class Query(Generic[ModelType]):
                 self._state.model_class,
                 self._state.alias,
                 self._state.pairs_subset,
+                filters=relationship_read_filter_statements(self._state),
             )
             return self._materialize(rows)
         query, params = self.to_cypher()
@@ -305,10 +309,7 @@ class Query(Generic[ModelType]):
                 if key in row:
                     payload[output_name] = row[key]
                     break
-        construct = getattr(model_class, "model_construct", None)
-        if construct is None:
-            return model_class(**payload)
-        return construct(**payload)
+        return construct_model_from_db_payload(model_class, payload)
     def _materialize_page(
         self,
         row: dict[str, Any],
@@ -327,7 +328,7 @@ class Query(Generic[ModelType]):
             payload = dict(payload)
             payload["from_node"] = materialize_endpoint_node(row.get("from_node"), endpoint_types)
             payload["to_node"] = materialize_endpoint_node(row.get("to_node"), endpoint_types)
-        return model_class(**_model_payload(model_class, payload))
+        return construct_model_from_db_payload(model_class, payload)
     def _relationship_endpoint_types(self) -> dict[str, Type[Any]] | None:
         model_class = self._state.return_model_class or self._state.model_class
         if hasattr(model_class, "__kuzu_rel_name__"):
@@ -338,10 +339,8 @@ class Query(Generic[ModelType]):
         query = self.to_cypher()[0]
         return f"Query({self._state.model_class.__name__}, {query!r})"
 def _model_payload(model_class: Type[Any], payload: dict[str, Any]) -> dict[str, Any]:
-    fields = getattr(model_class, "model_fields", None)
-    if isinstance(fields, dict):
-        return {key: value for key, value in payload.items() if key in fields}
-    raise TypeError(f"{model_class.__name__} has no Pydantic field map")
+    fields = model_payload_fields(model_class)
+    return {key: value for key, value in payload.items() if key in fields}
 
 def _normalize_join_type(join_type: JoinType | str) -> JoinType:
     if isinstance(join_type, JoinType):

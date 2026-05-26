@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import lru_cache
 from typing import Any
 from atp_pipeline import normalize_kuzu_model_row, resolve_kuzu_relationship_route
 from .constants import KuzuDefaultFunction
@@ -8,35 +9,63 @@ from .kuzu_orm import BulkInsertValueGeneratorRegistry
 RelationshipRoute = tuple[str, str, str, str, str]
 _RELATIONSHIP_ENDPOINT_FIELDS = frozenset({"from_node", "to_node"})
 RelationshipEndpointMetadata = tuple[str, str, str, str]
+RelationshipRouteSpec = dict[str, str]
+ModelFieldSpec = dict[str, Any]
 EndpointRow = tuple[str, str, Any]
 
+def clear_session_row_metadata_caches() -> None:
+    _node_label_cached.cache_clear()
+    _primary_key_fields_cached.cache_clear()
+    _node_merge_policies_cached.cache_clear()
+    _relationship_pair_metadata_cached.cache_clear()
+    _relationship_route_specs_cached.cache_clear()
+    _model_field_specs_cached.cache_clear()
+
 def _node_label(model_class: type[Any]) -> str:
+    return _node_label_cached(model_class)
+
+@lru_cache(maxsize=None)
+def _node_label_cached(model_class: type[Any]) -> str:
     label = getattr(model_class, "__kuzu_node_name__", None)
     if not isinstance(label, str) or not label:
         raise ValueError(f"{model_class.__name__} is not a registered Kuzu node")
     return label
 
 def _primary_key_fields(model_class: type[Any]) -> list[str]:
+    return list(_primary_key_fields_cached(model_class))
+
+@lru_cache(maxsize=None)
+def _primary_key_fields_cached(model_class: type[Any]) -> tuple[str, ...]:
     getter = getattr(model_class, "get_primary_key_fields", None)
     if not callable(getter):
         raise ValueError(f"{model_class.__name__} has no primary key metadata")
     fields = getter()
     if not isinstance(fields, list) or not fields:
         raise ValueError(f"{model_class.__name__} primary key metadata is empty")
-    return fields
+    if not all(isinstance(field, str) and field for field in fields):
+        raise ValueError(f"{model_class.__name__} primary key metadata contains invalid fields")
+    return tuple(fields)
 
 def _node_merge_policies(model_class: type[Any]) -> dict[str, str]:
+    return dict(_node_merge_policies_cached(model_class))
+
+@lru_cache(maxsize=None)
+def _node_merge_policies_cached(model_class: type[Any]) -> tuple[tuple[str, str], ...]:
     getter = getattr(model_class, "get_all_kuzu_metadata", None)
     if not callable(getter):
-        return {}
+        return ()
     policies: dict[str, str] = {}
     for field, metadata in getter().items():
         policy = getattr(metadata, "atp_merge_policy", None)
         if policy is not None:
             policies[field] = str(policy)
-    return policies
+    return tuple(sorted(policies.items()))
 
 def _relationship_pair_metadata(rel_cls: type[Any]) -> tuple[RelationshipEndpointMetadata, ...]:
+    return _relationship_pair_metadata_cached(rel_cls)
+
+@lru_cache(maxsize=None)
+def _relationship_pair_metadata_cached(rel_cls: type[Any]) -> tuple[RelationshipEndpointMetadata, ...]:
     pairs = getattr(rel_cls, "__kuzu_relationship_pairs__", [])
     if not pairs:
         raise ValueError(f"{rel_cls.__name__} endpoint metadata is empty")
@@ -53,6 +82,18 @@ def _relationship_pair_metadata(rel_cls: type[Any]) -> tuple[RelationshipEndpoin
             _primary_key_fields(to_node_cls)[0],
         ))
     return tuple(metadata)
+
+@lru_cache(maxsize=None)
+def _relationship_route_specs_cached(rel_cls: type[Any]) -> tuple[RelationshipRouteSpec, ...]:
+    return tuple(
+        {
+            "from_label": from_label,
+            "to_label": to_label,
+            "from_key_field": from_key,
+            "to_key_field": to_key,
+        }
+        for from_label, to_label, from_key, to_key in _relationship_pair_metadata(rel_cls)
+    )
 
 def _relationship_pair_node_class(pair: Any, attr: str, label: str) -> type[Any]:
     raw_node = getattr(pair, attr, None)
@@ -80,15 +121,7 @@ def _relationship_endpoint_metadata(
     from_endpoint = _node_endpoint(from_node)
     to_endpoint = _node_endpoint(to_node)
     route = resolve_kuzu_relationship_route(
-        [
-            {
-                "from_label": from_label,
-                "to_label": to_label,
-                "from_key_field": from_key,
-                "to_key_field": to_key,
-            }
-            for from_label, to_label, from_key, to_key in _relationship_pair_metadata(rel_cls)
-        ],
+        _relationship_route_specs_cached(rel_cls),
         _endpoint_map(from_endpoint),
         _endpoint_map(to_endpoint),
         rel_cls.__name__,
@@ -132,13 +165,17 @@ def _model_row(instance: Any, exclude: frozenset[str] = frozenset()) -> dict[str
     )
 
 def normalize_model_row(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
-    return normalize_kuzu_model_row(row, model_field_specs(model_class))
+    return normalize_kuzu_model_row(row, _model_field_specs_cached(model_class))
 
 def model_field_specs(model_class: type[Any]) -> list[dict[str, Any]]:
+    return [dict(spec) for spec in _model_field_specs_cached(model_class)]
+
+@lru_cache(maxsize=None)
+def _model_field_specs_cached(model_class: type[Any]) -> tuple[ModelFieldSpec, ...]:
     getter = getattr(model_class, "get_all_kuzu_metadata", None)
     if not callable(getter):
         raise TypeError(f"{model_class.__name__} has no Kuzu field metadata")
-    return [
+    return tuple(
         {
             "field": field,
             "kuzu_type": str(getattr(metadata, "kuzu_type", "")),
@@ -147,7 +184,7 @@ def model_field_specs(model_class: type[Any]) -> list[dict[str, Any]]:
             "auto_increment": bool(getattr(metadata, "auto_increment", False)),
         }
         for field, metadata in getter().items()
-    ]
+    )
 
 def _materialize_default_function(value: Any) -> Any:
     if isinstance(value, (KuzuDefaultFunction, DefaultFunctionBase)):

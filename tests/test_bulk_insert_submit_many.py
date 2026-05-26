@@ -6,6 +6,8 @@ from __future__ import annotations
 from typing import Any
 
 from kuzualchemy import (
+    ComparisonOperator,
+    FieldFilterExpression,
     KuzuBaseModel,
     KuzuDataType,
     KuzuRelationshipBase,
@@ -43,8 +45,20 @@ class _CaptureConnection:
         self.node_writes: list[
             tuple[str, list[dict[str, Any]], list[str], dict[str, object]]
         ] = []
-        self.relationship_writes: list[tuple[str, str, str, list[dict[str, Any]], list[str], list[str]]] = []
-        self.relationship_reads: list[tuple[str, str, str, list[dict[str, str]], list[int]]] = []
+        self.relationship_writes: list[
+            tuple[str, str, str, list[dict[str, Any]], list[str], list[str]]
+        ] = []
+        self.relationship_reads: list[
+            tuple[
+                str,
+                str,
+                str,
+                list[dict[str, str]],
+                list[int],
+                list[Any] | None,
+                int,
+            ]
+        ] = []
         self.combined_write_count = 0
 
     def bulk_write_nodes(
@@ -118,8 +132,20 @@ class _CaptureConnection:
         direction: str,
         pairs: list[dict[str, str]],
         pairs_subset: list[int],
+        filters: list[Any] | None = None,
+        page_size: int = 0,
     ) -> list[dict[str, Any]]:
-        self.relationship_reads.append((relationship, alias, direction, pairs, pairs_subset))
+        self.relationship_reads.append(
+            (
+                relationship,
+                alias,
+                direction,
+                pairs,
+                pairs_subset,
+                filters,
+                page_size,
+            )
+        )
         return [
             {
                 alias: {"rank": 7},
@@ -217,7 +243,43 @@ def test_relationship_query_submits_metadata_to_atp_relationship_read() -> None:
                 }
             ],
             [],
+            [],
+            0,
         )
+    ]
+
+
+def test_relationship_query_submits_filters_to_atp_relationship_read() -> None:
+    conn = _CaptureConnection()
+    session = _session_for_capture(conn)
+
+    rows = session.query(BulkSubmitManyLinked).filter(
+        FieldFilterExpression("from_node.id", ComparisonOperator.IN, [1, 3]),
+        FieldFilterExpression("rank", ComparisonOperator.GTE, 7),
+    ).all()
+
+    assert [row.rank for row in rows] == [7]
+    filters = conn.relationship_reads[0][5]
+    assert filters is not None
+    assert [statement.cypher for statement in filters] == [
+        "from_node.id IN $rel_filter_0_param_{}".format(
+            abs(hash(("from_node.id", ComparisonOperator.IN, str([1, 3]))))
+        ),
+        "n.rank >= $rel_filter_1_param_{}".format(
+            abs(hash(("rank", ComparisonOperator.GTE, str(7))))
+        ),
+    ]
+    assert [statement.params for statement in filters] == [
+        {
+            "rel_filter_0_param_{}".format(
+                abs(hash(("from_node.id", ComparisonOperator.IN, str([1, 3]))))
+            ): [1, 3]
+        },
+        {
+            "rel_filter_1_param_{}".format(
+                abs(hash(("rank", ComparisonOperator.GTE, str(7))))
+            ): 7
+        },
     ]
 
 

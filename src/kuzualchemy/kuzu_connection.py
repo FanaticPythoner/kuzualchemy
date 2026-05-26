@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import atp_pipeline as atp
-from atp_pipeline import ATPHandler, DatabaseType, DbBulkAction, DbBulkMergePolicy
+from atp_pipeline import ATPHandler, DatabaseType, DbBulkAction, DbBulkMergePolicy, DbStatement
 
 from .constants import ErrorMessages
 
@@ -88,6 +88,8 @@ class KuzuConnection:
         direction: str,
         pairs: list[dict[str, str]],
         pairs_subset: list[int],
+        filters: list[DbStatement] | None = None,
+        page_size: int = 0,
     ) -> list[dict[str, Any]]:
         return atp.read_kuzu_relationships(
             self._open_handler(),
@@ -96,6 +98,8 @@ class KuzuConnection:
             direction=direction,
             pairs=pairs,
             pairs_subset=pairs_subset,
+            filters=filters,
+            page_size=page_size,
         )
 
     def schema_apply(self, statements: Iterable[str]) -> None:

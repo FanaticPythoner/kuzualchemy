@@ -2,7 +2,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Type, TypeVar
-from atp_pipeline import DbBulkAction, validate_kuzu_manual_auto_increment_values
+from atp_pipeline import DbBulkAction, DbStatement, validate_kuzu_manual_auto_increment_values
 from .constants import PerformanceConstants
 from .kuzu_connection import KuzuConnection
 from .kuzu_orm import KuzuRelationshipBase
@@ -28,7 +28,6 @@ from .kuzu_session_rows import (
 )
 ModelType = TypeVar("ModelType")
 class KuzuSession:
-    """Collect ORM objects and submit typed DB work to ATP."""
     def __init__(
         self,
         connection: KuzuConnection | None = None,
@@ -39,6 +38,7 @@ class KuzuSession:
         bulk_insert_threshold: int = PerformanceConstants.BATCH_INSERT_SIZE,
         bulk_batch_size: int = PerformanceConstants.BATCH_INSERT_SIZE,
         bulk_batch_size_max: int = PerformanceConstants.BATCH_INSERT_SIZE * 64,
+        identity_tracking: bool = True,
     ) -> None:
         if connection is None and db_path is None:
             raise ValueError("connection or db_path is required")
@@ -50,6 +50,7 @@ class KuzuSession:
         self.bulk_insert_threshold = bulk_insert_threshold
         self.bulk_batch_size = bulk_batch_size
         self.bulk_batch_size_max = bulk_batch_size_max
+        self.identity_tracking = identity_tracking
         self._new: list[Any] = []
         self._dirty: list[Any] = []
         self._deleted: list[Any] = []
@@ -92,6 +93,8 @@ class KuzuSession:
         relationship_class: Type[Any],
         alias: str,
         pairs_subset: list[int] | None,
+        filters: list[DbStatement] | None = None,
+        page_size: int = 0,
     ) -> list[dict[str, Any]]:
         self._flush_for_read()
         return self._conn.read_relationships(
@@ -100,6 +103,7 @@ class KuzuSession:
             direction=relationship_read_direction(relationship_class),
             pairs=relationship_read_pairs(relationship_class),
             pairs_subset=list(pairs_subset or []),
+            filters=filters, page_size=page_size,
         )
     def _iterate_for_query_object(
         self,
@@ -162,17 +166,31 @@ class KuzuSession:
             setattr(current, name, value)
         self._append_pending(self._dirty, self._dirty_ids(), current)
         return current
-    def bulk_insert_immediate(self, instances: list[Any], batch_size: int | None = None) -> None:
-        self._write_instances(DbBulkAction.CREATE, instances, batch_size=batch_size)
+    def bulk_insert_immediate(
+        self,
+        instances: list[Any],
+        batch_size: int | None = None,
+        *,
+        track_identity: bool = False,
+    ) -> None:
+        self._write_instances(
+            DbBulkAction.CREATE,
+            instances,
+            batch_size=batch_size,
+            track_identity=track_identity,
+        )
     def bulk_insert_graph_immediate(
         self,
         node_instances: list[Any],
         relationship_instances: list[Any],
+        *,
+        track_identity: bool = False,
     ) -> None:
         self._write_instance_groups(
             DbBulkAction.CREATE,
             node_instances,
             relationship_instances,
+            track_identity=track_identity,
         )
     def bulk_update_nodes(self, model_class: Type[Any], rows: list[dict[str, Any]]) -> None:
         self._conn.bulk_write_nodes(
@@ -242,6 +260,8 @@ class KuzuSession:
         self._identity_map.clear()
         self._identity_keys_by_object_id.clear()
     def expire(self, instance: Any) -> None:
+        if not getattr(self, "identity_tracking", True):
+            return
         object_key = id(instance)
         identity_key = self._identity_keys_by_object_id.pop(object_key, None)
         if identity_key is not None:
@@ -310,7 +330,9 @@ class KuzuSession:
                 return
         object_ids.discard(object_id)
 
-    def _remember(self, instance: Any) -> None:
+    def _remember(self, instance: Any, *, track_identity: bool = True) -> None:
+        if not track_identity or not getattr(self, "identity_tracking", True):
+            return
         if hasattr(type(instance), "__kuzu_node_name__"):
             identity_key = self._identity_key_or_none(instance)
             if identity_key is None:
@@ -339,18 +361,28 @@ class KuzuSession:
         instances: list[Any],
         *,
         batch_size: int | None = None,
+        track_identity: bool = True,
     ) -> None:
         if not instances:
             return
-        self._write_instance_batch(action, instances)
+        self._write_instance_batch(action, instances, track_identity=track_identity)
 
-    def _write_instance_batch(self, action: DbBulkAction, instances: list[Any]) -> None:
+    def _write_instance_batch(
+        self,
+        action: DbBulkAction,
+        instances: list[Any],
+        *,
+        track_identity: bool,
+    ) -> None:
         if action == DbBulkAction.CREATE:
             self._validate_create_auto_increment_values(instances)
         if action == DbBulkAction.CREATE and any(
             auto_generation_fields(instance) for instance in instances
         ):
-            self._write_create_instances_with_generated_fields(instances)
+            self._write_create_instances_with_generated_fields(
+                instances,
+                track_identity=track_identity,
+            )
             return
         nodes: dict[type[Any], list[dict[str, Any]]] = {}
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
@@ -360,9 +392,10 @@ class KuzuSession:
                 rows = _node_delete_row(instance) if action == DbBulkAction.DELETE else _node_row(instance)
                 nodes.setdefault(cls, []).append(rows)
                 if action == DbBulkAction.DELETE:
-                    self.expire(instance)
+                    if track_identity:
+                        self.expire(instance)
                 else:
-                    self._remember(instance)
+                    self._remember(instance, track_identity=track_identity)
             elif hasattr(cls, "__kuzu_rel_name__"):
                 row = _relationship_row(instance)
                 rels.setdefault(_relationship_route(cls, row), []).append(row)
@@ -389,7 +422,12 @@ class KuzuSession:
             model_field_specs(model_class),
             model_class.__name__,
         )
-    def _write_create_instances_with_generated_fields(self, instances: list[Any]) -> None:
+    def _write_create_instances_with_generated_fields(
+        self,
+        instances: list[Any],
+        *,
+        track_identity: bool,
+    ) -> None:
         normal_nodes: dict[type[Any], list[dict[str, Any]]] = {}
         generated_nodes: list[Any] = []
         normal_relationships: list[Any] = []
@@ -402,7 +440,7 @@ class KuzuSession:
                     generated_nodes.append(instance)
                 else:
                     normal_nodes.setdefault(cls, []).append(_node_row(instance))
-                    self._remember(instance)
+                    self._remember(instance, track_identity=track_identity)
             elif hasattr(cls, "__kuzu_rel_name__"):
                 if generated_fields:
                     generated_relationships.append(instance)
@@ -411,14 +449,14 @@ class KuzuSession:
             else:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu model")
         self._write_grouped_rows(DbBulkAction.CREATE, normal_nodes, {})
-        self._write_generated_nodes(generated_nodes)
+        self._write_generated_nodes(generated_nodes, track_identity=track_identity)
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
         for instance in normal_relationships:
             row = _relationship_row(instance)
             rels.setdefault(_relationship_route(type(instance), row), []).append(row)
         self._write_grouped_rows(DbBulkAction.CREATE, {}, rels)
         self._write_generated_relationships(generated_relationships)
-    def _write_generated_nodes(self, instances: list[Any]) -> None:
+    def _write_generated_nodes(self, instances: list[Any], *, track_identity: bool) -> None:
         if not instances:
             return
         payloads = self._conn.create_generated_nodes(
@@ -426,7 +464,7 @@ class KuzuSession:
         )
         for instance, payload in zip(instances, payloads):
             apply_generated_values(instance, payload, auto_generation_fields(instance))
-            self._remember(instance)
+            self._remember(instance, track_identity=track_identity)
     def _write_generated_relationships(self, instances: list[Any]) -> None:
         if not instances:
             return
@@ -440,6 +478,8 @@ class KuzuSession:
         action: DbBulkAction,
         node_instances: list[Any],
         relationship_instances: list[Any],
+        *,
+        track_identity: bool = True,
     ) -> None:
         nodes: dict[type[Any], list[dict[str, Any]]] = {}
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
@@ -450,9 +490,10 @@ class KuzuSession:
             row = _node_delete_row(instance) if action == DbBulkAction.DELETE else _node_row(instance)
             nodes.setdefault(cls, []).append(row)
             if action == DbBulkAction.DELETE:
-                self.expire(instance)
+                if track_identity:
+                    self.expire(instance)
             else:
-                self._remember(instance)
+                self._remember(instance, track_identity=track_identity)
         for instance in relationship_instances:
             cls = type(instance)
             if not hasattr(cls, "__kuzu_rel_name__"):

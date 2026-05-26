@@ -1,7 +1,28 @@
 from __future__ import annotations
+from functools import lru_cache
 from typing import Any, Type
-from atp_pipeline import normalize_relationship_db_direction
+from atp_pipeline import DbStatement, normalize_relationship_db_direction
 from .kuzu_session_rows import primary_key_fields
+
+
+@lru_cache(maxsize=None)
+def model_payload_fields(model_class: Type[Any]) -> frozenset[str]:
+    fields = getattr(model_class, "model_fields", None)
+    if not isinstance(fields, dict):
+        raise TypeError(f"{model_class.__name__} has no field metadata")
+    return frozenset(fields.keys())
+
+
+def construct_model_from_db_payload(model_class: Type[Any], payload: dict[str, Any]) -> Any:
+    construct = getattr(model_class, "model_construct", None)
+    filtered = {
+        key: value
+        for key, value in payload.items()
+        if key in model_payload_fields(model_class)
+    }
+    if construct is None:
+        return model_class(**filtered)
+    return construct(**filtered)
 
 
 def relationship_read_name(relationship_class: Type[Any]) -> str:
@@ -80,7 +101,6 @@ def _pair_node_class(raw_node: Any, label: str) -> Type[Any]:
 def can_use_native_relationship_read(state: Any) -> bool:
     return (
         hasattr(state.model_class, "__kuzu_rel_name__")
-        and not state.filters
         and not state.order_by
         and state.limit_value is None
         and state.offset_value is None
@@ -99,6 +119,37 @@ def can_use_native_relationship_read(state: Any) -> bool:
     )
 
 
+def relationship_read_filter_statements(state: Any) -> list[DbStatement]:
+    filters = list(getattr(state, "filters", []) or [])
+    if not filters:
+        return []
+    alias = str(getattr(state, "alias", "n") or "n")
+    model_class = getattr(state, "model_class", None)
+    model_alias = getattr(model_class, "__name__", alias)
+    alias_map = {
+        alias: alias,
+        str(model_alias): alias,
+        "from_node": "from_node",
+        "to_node": "to_node",
+    }
+    statements: list[DbStatement] = []
+    for idx, expression in enumerate(filters):
+        to_cypher = getattr(expression, "to_cypher", None)
+        get_parameters = getattr(expression, "get_parameters", None)
+        if not callable(to_cypher) or not callable(get_parameters):
+            raise TypeError("relationship filter lacks KuzuAlchemy expression methods")
+        prefix = f"rel_filter_{idx}_"
+        fragment = str(to_cypher(alias_map, prefix, relationship_alias=alias)).strip()
+        if not fragment:
+            raise ValueError("relationship filter fragment is empty")
+        statements.append(DbStatement(fragment, _prefixed_parameters(get_parameters(), prefix)))
+    return statements
+
+
+def _prefixed_parameters(parameters: dict[str, Any], prefix: str) -> dict[str, Any]:
+    return {f"{prefix}{key}": value for key, value in parameters.items()}
+
+
 def materialize_endpoint_node(value: Any, endpoint_types: dict[str, Type[Any]]) -> Any:
     if not isinstance(value, dict):
         return value
@@ -113,7 +164,7 @@ def materialize_endpoint_node(value: Any, endpoint_types: dict[str, Type[Any]]) 
     if not isinstance(fields, dict):
         raise TypeError(f"relationship endpoint label has no field metadata: {label}")
     if issubclass(model_class, KuzuNodeBase):
-        return model_class(**{key: item for key, item in value.items() if key in fields})
+        return construct_model_from_db_payload(model_class, value)
     pk_fields = primary_key_fields(model_class)
     if len(pk_fields) == 1:
         return value.get(pk_fields[0])

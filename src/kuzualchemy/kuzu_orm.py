@@ -3049,6 +3049,10 @@ def get_all_ddl() -> str:
 
 def clear_registry():
     """Clear all registered models and reset registry state."""
+    from .kuzu_session_rows import clear_session_row_metadata_caches
+
+    clear_session_row_metadata_caches()
+
     # @@ STEP 1: Break circular references FIRST (critical for preventing segfaults)
     # || S.S.1: Clear dependency tracking to break circular references between Pydantic models
     _kuzu_registry._model_dependencies.clear()
