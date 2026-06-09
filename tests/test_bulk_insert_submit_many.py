@@ -12,6 +12,7 @@ from kuzualchemy import (
     KuzuDataType,
     KuzuRelationshipBase,
     KuzuSession,
+    QueryField,
     kuzu_field,
     kuzu_node,
     kuzu_relationship,
@@ -164,6 +165,7 @@ def _session_for_capture(conn: _CaptureConnection) -> KuzuSession:
     session._new = []
     session._dirty = []
     session._deleted = []
+    session.bulk_batch_size = 1000
     return session
 
 
@@ -249,6 +251,34 @@ def test_relationship_query_submits_metadata_to_atp_relationship_read() -> None:
     ]
 
 
+def test_relationship_iterator_submits_metadata_to_atp_relationship_read() -> None:
+    conn = _CaptureConnection()
+    session = _session_for_capture(conn)
+
+    rows = list(session.query(BulkSubmitManyLinked).all(as_iterator=True, page_size=256))
+
+    assert [row.rank for row in rows] == [7]
+    assert [(row.from_node, row.to_node) for row in rows] == [(1, 2)]
+    assert conn.relationship_reads == [
+        (
+            "BulkSubmitManyLinked",
+            "n",
+            "forward",
+            [
+                {
+                    "from_label": "BulkSubmitManyA",
+                    "to_label": "BulkSubmitManyB",
+                    "from_key_field": "id",
+                    "to_key_field": "id",
+                }
+            ],
+            [],
+            [],
+            256,
+        )
+    ]
+
+
 def test_relationship_query_submits_filters_to_atp_relationship_read() -> None:
     conn = _CaptureConnection()
     session = _session_for_capture(conn)
@@ -280,6 +310,44 @@ def test_relationship_query_submits_filters_to_atp_relationship_read() -> None:
                 abs(hash(("rank", ComparisonOperator.GTE, str(7))))
             ): 7
         },
+    ]
+
+
+def test_relationship_queryfield_endpoint_filters_target_atp_endpoint_aliases() -> None:
+    conn = _CaptureConnection()
+    session = _session_for_capture(conn)
+
+    rows = session.query(BulkSubmitManyLinked).filter(
+        QueryField("from_node.id", BulkSubmitManyLinked).in_([1, 3]),
+        QueryField("to_node.id", BulkSubmitManyLinked).in_([2, 4]),
+    ).all()
+
+    assert [row.rank for row in rows] == [7]
+    filters = conn.relationship_reads[0][5]
+    assert filters is not None
+    assert [statement.cypher for statement in filters] == [
+        "from_node.id IN $rel_filter_0_param_{}".format(
+            abs(
+                hash(
+                    (
+                        "BulkSubmitManyLinked.from_node.id",
+                        ComparisonOperator.IN,
+                        str([1, 3]),
+                    )
+                )
+            )
+        ),
+        "to_node.id IN $rel_filter_1_param_{}".format(
+            abs(
+                hash(
+                    (
+                        "BulkSubmitManyLinked.to_node.id",
+                        ComparisonOperator.IN,
+                        str([2, 4]),
+                    )
+                )
+            )
+        ),
     ]
 
 

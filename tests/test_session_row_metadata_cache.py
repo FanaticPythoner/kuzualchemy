@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import ClassVar
 
+import pytest
+from atp_pipeline import DbBulkAction
 from pydantic import BaseModel, model_validator
 
 from kuzualchemy.kuzu_relationship_read import construct_model_from_db_payload
@@ -76,6 +78,17 @@ class _RelationshipPair:
 class _CachedRelationship:
     __kuzu_rel_name__ = "CachedRelationship"
     __kuzu_relationship_pairs__ = [_RelationshipPair()]
+
+    def __init__(self, from_node: _CachedNode, to_node: _CachedTargetNode, weight: int) -> None:
+        self.from_node = from_node
+        self.to_node = to_node
+        self.weight = weight
+
+    @classmethod
+    def get_all_kuzu_metadata(cls) -> dict[str, _Metadata]:
+        return {
+            "weight": _Metadata(kuzu_type="INT64"),
+        }
 
 
 class _ConstructedModel(BaseModel):
@@ -198,6 +211,63 @@ def test_bulk_immediate_can_track_identity_when_requested() -> None:
 
     identity_key = session._identity_key(node)
     assert session._identity_map[identity_key] is node
+
+
+def test_threaded_row_partition_preserves_order_and_identity(monkeypatch) -> None:
+    _reset_counters()
+    conn = _CaptureConnection()
+    session = KuzuSession(connection=conn, bulk_batch_size=2)
+    monkeypatch.setattr("kuzualchemy.kuzu_session.os.process_cpu_count", lambda: 2)
+    target = _CachedTargetNode(100)
+    nodes = [_CachedNode(row_id) for row_id in range(5)]
+    relationships = [_CachedRelationship(nodes[row_id], target, row_id) for row_id in range(3)]
+
+    assert session._row_partition_worker_count(len(nodes) + len(relationships)) == 2
+
+    session._write_instance_batch(
+        DbBulkAction.CREATE,
+        [*nodes, *relationships],
+        track_identity=True,
+    )
+
+    assert len(conn.node_batches) == 1
+    assert [row["id"] for row in conn.node_batches[0][2]] == [0, 1, 2, 3, 4]
+    assert len(conn.relationship_batches) == 1
+    assert [row["weight"] for row in conn.relationship_batches[0][4]] == [0, 1, 2]
+    assert [row["from_pk"] for row in conn.relationship_batches[0][4]] == [0, 1, 2]
+    assert [session._identity_map[session._identity_key(node)] for node in nodes] == nodes
+
+
+def test_row_partition_workers_are_limited_by_batch_size(monkeypatch) -> None:
+    session = KuzuSession(connection=_CaptureConnection(), bulk_batch_size=4)
+    monkeypatch.setattr("kuzualchemy.kuzu_session.os.process_cpu_count", lambda: 32)
+
+    assert session._row_partition_worker_count(3) == 1
+    assert session._row_partition_worker_count(10) == 3
+    assert session._row_partition_worker_count(200) == 32
+
+
+def test_graph_partition_rejects_misrouted_model_lists() -> None:
+    conn = _CaptureConnection()
+    session = KuzuSession(connection=conn)
+    source = _CachedNode(1)
+    target = _CachedTargetNode(2)
+    relationship = _CachedRelationship(source, target, 3)
+
+    with pytest.raises(TypeError, match="is not a registered Kuzu node"):
+        session._write_instance_groups(
+            DbBulkAction.CREATE,
+            [relationship],
+            [],
+            track_identity=False,
+        )
+    with pytest.raises(TypeError, match="is not a registered Kuzu relationship"):
+        session._write_instance_groups(
+            DbBulkAction.CREATE,
+            [],
+            [source],
+            track_identity=False,
+        )
 
 
 def test_db_payload_construction_bypasses_validation_and_filters_unknown_fields() -> None:

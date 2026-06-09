@@ -1,7 +1,7 @@
 from __future__ import annotations
 from functools import lru_cache
 from typing import Any
-from atp_pipeline import normalize_kuzu_model_row, resolve_kuzu_relationship_route
+import uuid
 from .constants import KuzuDefaultFunction
 from .kuzu_function_types import DefaultFunctionBase
 from .kuzu_orm import BulkInsertValueGeneratorRegistry
@@ -11,6 +11,7 @@ _RELATIONSHIP_ENDPOINT_FIELDS = frozenset({"from_node", "to_node"})
 RelationshipEndpointMetadata = tuple[str, str, str, str]
 RelationshipRouteSpec = dict[str, str]
 ModelFieldSpec = dict[str, Any]
+ModelUuidFieldSpec = tuple[str, bool, bool]
 EndpointRow = tuple[str, str, Any]
 
 def clear_session_row_metadata_caches() -> None:
@@ -19,7 +20,9 @@ def clear_session_row_metadata_caches() -> None:
     _node_merge_policies_cached.cache_clear()
     _relationship_pair_metadata_cached.cache_clear()
     _relationship_route_specs_cached.cache_clear()
+    _relationship_route_for_labels_cached.cache_clear()
     _model_field_specs_cached.cache_clear()
+    _model_uuid_field_specs_cached.cache_clear()
 
 def _node_label(model_class: type[Any]) -> str:
     return _node_label_cached(model_class)
@@ -120,27 +123,41 @@ def _relationship_endpoint_metadata(
 ) -> tuple[EndpointRow, EndpointRow]:
     from_endpoint = _node_endpoint(from_node)
     to_endpoint = _node_endpoint(to_node)
-    route = resolve_kuzu_relationship_route(
-        _relationship_route_specs_cached(rel_cls),
-        _endpoint_map(from_endpoint),
-        _endpoint_map(to_endpoint),
-        rel_cls.__name__,
+    route = _relationship_route_for_labels_cached(
+        rel_cls,
+        None if from_endpoint is None else from_endpoint[0],
+        None if to_endpoint is None else to_endpoint[0],
     )
     return (
-        from_endpoint or (route["from_label"], route["from_key_field"], from_node),
-        to_endpoint or (route["to_label"], route["to_key_field"], to_node),
+        from_endpoint or (route[0], route[2], from_node),
+        to_endpoint or (route[1], route[3], to_node),
     )
 
-def _endpoint_map(endpoint: EndpointRow | None) -> dict[str, Any] | None:
-    if endpoint is None:
-        return None
-    return {"label": endpoint[0], "key_field": endpoint[1], "value": endpoint[2]}
+@lru_cache(maxsize=None)
+def _relationship_route_for_labels_cached(
+    rel_cls: type[Any],
+    from_label: str | None,
+    to_label: str | None,
+) -> RelationshipEndpointMetadata:
+    candidates = []
+    for candidate in _relationship_pair_metadata(rel_cls):
+        if from_label is not None and candidate[0] != from_label:
+            continue
+        if to_label is not None and candidate[1] != to_label:
+            continue
+        candidates.append(candidate)
+    if len(candidates) != 1:
+        raise ValueError(
+            f"{rel_cls.__name__} endpoint route is ambiguous: "
+            f"from={from_label or '*'} to={to_label or '*'} candidates={len(candidates)}"
+        )
+    return candidates[0]
 
 def _model_row(instance: Any, exclude: frozenset[str] = frozenset()) -> dict[str, Any]:
     model_class = type(instance)
     data = getattr(instance, "__dict__", None)
     if not isinstance(data, dict):
-        return normalize_model_row(
+        return _normalize_model_row_in_place(
             model_class,
             {
                 field: _materialize_default_function(value)
@@ -148,14 +165,14 @@ def _model_row(instance: Any, exclude: frozenset[str] = frozenset()) -> dict[str
             },
         )
     if not exclude:
-        return normalize_model_row(
+        return _normalize_model_row_in_place(
             model_class,
             {
                 field: _materialize_default_function(value)
                 for field, value in data.items()
             },
         )
-    return normalize_model_row(
+    return _normalize_model_row_in_place(
         model_class,
         {
             field: _materialize_default_function(value)
@@ -165,7 +182,20 @@ def _model_row(instance: Any, exclude: frozenset[str] = frozenset()) -> dict[str
     )
 
 def normalize_model_row(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
-    return normalize_kuzu_model_row(row, _model_field_specs_cached(model_class))
+    return _normalize_model_row_in_place(model_class, dict(row))
+
+def _normalize_model_row_in_place(model_class: type[Any], row: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise TypeError("row must be a dict")
+    for field, primary_key, not_null in _model_uuid_field_specs_cached(model_class):
+        if field not in row:
+            continue
+        value = row[field]
+        if isinstance(value, uuid.UUID) and value.int == 0:
+            if primary_key or not_null:
+                raise ValueError(f"UUID field {field} cannot use nil UUID for non-null storage")
+            row[field] = None
+    return row
 
 def model_field_specs(model_class: type[Any]) -> list[dict[str, Any]]:
     return [dict(spec) for spec in _model_field_specs_cached(model_class)]
@@ -184,6 +214,18 @@ def _model_field_specs_cached(model_class: type[Any]) -> tuple[ModelFieldSpec, .
             "auto_increment": bool(getattr(metadata, "auto_increment", False)),
         }
         for field, metadata in getter().items()
+    )
+
+@lru_cache(maxsize=None)
+def _model_uuid_field_specs_cached(model_class: type[Any]) -> tuple[ModelUuidFieldSpec, ...]:
+    return tuple(
+        (
+            str(spec["field"]),
+            bool(spec["primary_key"]),
+            bool(spec["not_null"]),
+        )
+        for spec in _model_field_specs_cached(model_class)
+        if str(spec.get("kuzu_type", "")).upper() == "UUID"
     )
 
 def _materialize_default_function(value: Any) -> Any:

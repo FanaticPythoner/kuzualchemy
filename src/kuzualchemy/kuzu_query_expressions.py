@@ -14,6 +14,31 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .constants import CypherConstants
 
 
+def _resolve_field_reference(
+    field_path: str,
+    alias_map: Dict[str, str],
+    *,
+    relationship_alias: Optional[str],
+    post_with: bool,
+) -> str:
+    parts = field_path.split(".")
+    if len(parts) >= 3 and parts[0] in alias_map and parts[1] in alias_map:
+        return f"{alias_map[parts[1]]}.{'.'.join(parts[2:])}"
+    if len(parts) >= 2:
+        alias = parts[0]
+        field = ".".join(parts[1:])
+        if alias in alias_map:
+            return f"{alias_map[alias]}.{field}"
+        mapped_alias = next(iter(alias_map.values())) if alias_map else alias
+        return f"{mapped_alias}.{field}"
+    if post_with:
+        return field_path
+    if relationship_alias:
+        return f"{relationship_alias}.{field_path}"
+    default_alias = next(iter(alias_map.values())) if alias_map else "n"
+    return f"{default_alias}.{field_path}"
+
+
 class ComparisonOperator(Enum):
     """Supported comparison operators for queries."""
     EQ = CypherConstants.EQ
@@ -181,47 +206,22 @@ class FieldFilterExpression(FilterExpression):
     def to_cypher(self, alias_map: Dict[str, str], param_prefix: str = "", relationship_alias: Optional[str] = None, post_with: bool = False) -> str:
         """Convert to Cypher WHERE clause fragment."""
         # Resolve left-hand side field reference
-        parts = self.field_path.split(".", 1)
-        if len(parts) == 2:
-            alias, field = parts
-            if alias in alias_map:
-                mapped_alias = alias_map[alias]
-            else:
-                mapped_alias = next(iter(alias_map.values())) if alias_map else alias
-            field_ref = f"{mapped_alias}.{field}"
-        else:
-            # @@ STEP: Handle post-WITH context (HAVING clauses)
-            if post_with:
-                # In post-WITH context, use bare field names (they are aliases from WITH clause)
-                field_ref = self.field_path
-            elif relationship_alias:
-                # @@ STEP: For relationship queries, use relationship alias for unqualified fields
-                # || S.S: This fixes the core issue where relationship properties were being
-                # || looked up on nodes instead of on the relationship itself
-                field_ref = f"{relationship_alias}.{self.field_path}"
-            else:
-                default_alias = next(iter(alias_map.values())) if alias_map else "n"
-                field_ref = f"{default_alias}.{self.field_path}"
+        field_ref = _resolve_field_reference(
+            self.field_path,
+            alias_map,
+            relationship_alias=relationship_alias,
+            post_with=post_with,
+        )
 
         # Field-to-field comparisons: if RHS is a QueryField, inline it (no parameter)
         from .kuzu_query_fields import QueryField as _QF
         if isinstance(self.value, _QF):
-            rhs_parts = self.value.field_path.split(".", 1)
-            if len(rhs_parts) == 2:
-                r_alias, r_field = rhs_parts
-                if r_alias in alias_map:
-                    r_mapped = alias_map[r_alias]
-                else:
-                    r_mapped = next(iter(alias_map.values())) if alias_map else r_alias
-                rhs_ref = f"{r_mapped}.{r_field}"
-            else:
-                if relationship_alias:
-                    rhs_ref = f"{relationship_alias}.{self.value.field_path}"
-                elif post_with:
-                    rhs_ref = self.value.field_path
-                else:
-                    default_alias = next(iter(alias_map.values())) if alias_map else "n"
-                    rhs_ref = f"{default_alias}.{self.value.field_path}"
+            rhs_ref = _resolve_field_reference(
+                self.value.field_path,
+                alias_map,
+                relationship_alias=relationship_alias,
+                post_with=post_with,
+            )
 
             if not self.case_sensitive and self.operator in (
                 ComparisonOperator.EQ, ComparisonOperator.NEQ,

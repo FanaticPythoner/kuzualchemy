@@ -244,6 +244,16 @@ class Query(Generic[ModelType]):
             raise ValueError("page_size must be a positive integer")
         if self._session is None:
             raise RuntimeError("query execution requires a session")
+        if can_use_native_relationship_read(self._state):
+            endpoint_types = self._relationship_endpoint_types()
+            rows = self._session._execute_relationship_read_for_query_object(
+                self._state.model_class,
+                self._state.alias,
+                self._state.pairs_subset,
+                filters=relationship_read_filter_statements(self._state),
+                page_size=page_size,
+            )
+            return (self._materialize_row(row, endpoint_types) for row in rows)
         query, params = self.to_cypher()
         endpoint_types = self._relationship_endpoint_types()
         return (

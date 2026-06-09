@@ -15,14 +15,21 @@ def model_payload_fields(model_class: Type[Any]) -> frozenset[str]:
 
 def construct_model_from_db_payload(model_class: Type[Any], payload: dict[str, Any]) -> Any:
     construct = getattr(model_class, "model_construct", None)
+    fields = getattr(model_class, "model_fields", None)
+    if not isinstance(fields, dict):
+        raise TypeError(f"{model_class.__name__} has no field metadata")
     filtered = {
         key: value
         for key, value in payload.items()
-        if key in model_payload_fields(model_class)
+        if key in fields and not (value is None and _field_has_default_factory(fields[key]))
     }
     if construct is None:
         return model_class(**filtered)
     return construct(**filtered)
+
+
+def _field_has_default_factory(field: Any) -> bool:
+    return callable(getattr(field, "default_factory", None))
 
 
 def relationship_read_name(relationship_class: Type[Any]) -> str:
