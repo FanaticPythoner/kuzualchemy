@@ -50,6 +50,19 @@ class _SingleTableReadHandler:
         return _Ticket({"cypher_results": [[{"n": 1}]]})
 
 
+class _LifecycleHandler:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def flush(self, timeout: float | None) -> None:
+        assert timeout is None
+        self.calls.append("flush")
+
+    def shutdown(self, timeout: float | None) -> None:
+        assert timeout is None
+        self.calls.append("shutdown")
+
+
 def _connection_for_handler(handler: _GatewayHandler) -> KuzuConnection:
     connection = object.__new__(KuzuConnection)
     connection._handler = handler
@@ -93,6 +106,22 @@ def test_single_read_routes_to_native_atp_read() -> None:
     assert handler.calls == [
         ("execute_kuzu_read", ("MATCH (n) RETURN n", {"limit": 1}), True)
     ]
+
+
+def test_close_releases_native_handler_after_ordered_shutdown() -> None:
+    handler = _LifecycleHandler()
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    connection._handler = handler
+
+    connection.close()
+    connection.close()
+
+    assert handler.calls == ["flush", "shutdown"]
+    assert connection._handler is None
+    with pytest.raises(RuntimeError, match="closed"):
+        connection._open_handler()
 
 
 def test_bulk_write_nodes_many_routes_to_single_handler_call() -> None:

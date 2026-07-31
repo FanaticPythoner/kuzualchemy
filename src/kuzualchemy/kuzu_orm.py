@@ -51,7 +51,7 @@ from .constants import (
     RegistryResolutionConstants,
     RelationshipNodeTypeQueryConstants,
 )
-from .enum_normalization import convert_input_enums_for_model
+from .enum_normalization import clear_enum_conversion_plan_cache, convert_input_enums_for_model
 
 if TYPE_CHECKING:
     from .kuzu_query import Query
@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 ModelType = TypeVar("ModelType", bound="KuzuBaseModel")
 _KUZU_FIELD_DIRECTIVE_UNSET = object()
+_PYDANTIC_IGNORED_CALLABLE_TYPES = (type(lambda: None),)
 
 
 # -----------------------------------------------------------------------------
@@ -1166,6 +1167,7 @@ def _apply_kuzu_field_directives(cls: Type[T], decorator_directives: Any) -> Typ
         cls.__pydantic_fields__[directive.field_name] = field_definition
         cls.__annotations__[directive.field_name] = annotation
     cls.model_rebuild(force=True)
+    clear_enum_conversion_plan_cache()
     return cls
 
 
@@ -1819,7 +1821,10 @@ class KuzuBaseModel(BaseModel):
     """Base model for all Kùzu entities with metadata helpers."""
 
     model_config = ConfigDict(
-        arbitrary_types_allowed=True, validate_assignment=True, use_enum_values=False
+        arbitrary_types_allowed=True,
+        validate_assignment=True,
+        use_enum_values=False,
+        ignored_types=_PYDANTIC_IGNORED_CALLABLE_TYPES,
     )
 
     @model_validator(mode='before')
@@ -3051,6 +3056,7 @@ def clear_registry():
     """Clear all registered models and reset registry state."""
     from .kuzu_session_rows import clear_session_row_metadata_caches
 
+    clear_enum_conversion_plan_cache()
     clear_session_row_metadata_caches()
 
     # @@ STEP 1: Break circular references FIRST (critical for preventing segfaults)

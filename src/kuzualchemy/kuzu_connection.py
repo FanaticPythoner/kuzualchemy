@@ -4,7 +4,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import atp_pipeline as atp
-from atp_pipeline import ATPHandler, DatabaseType, DbBulkAction, DbBulkMergePolicy, DbStatement
+from atp_pipeline import (
+    ATPHandler,
+    DatabaseType,
+    DbBulkAction,
+    DbBulkMergePolicy,
+    DbRelationshipEndpointReplace,
+    DbStatement,
+)
 
 from .constants import ErrorMessages
 
@@ -15,13 +22,17 @@ class KuzuConnection:
     def __init__(self, db_path: str | Path) -> None:
         raw_path = str(db_path)
         self.db_path = raw_path if raw_path == ":memory:" else str(Path(raw_path).resolve())
-        self._handler = ATPHandler(DatabaseType.KUZU, {"db_path": self.db_path})
+        self._handler: ATPHandler | None = ATPHandler(
+            DatabaseType.KUZU,
+            {"db_path": self.db_path},
+        )
         self._closed = False
 
     def _open_handler(self) -> ATPHandler:
-        if getattr(self, "_closed", False):
+        handler = getattr(self, "_handler", None)
+        if getattr(self, "_closed", False) or handler is None:
             raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
-        return self._handler
+        return handler
 
     def execute(
         self,
@@ -181,6 +192,12 @@ class KuzuConnection:
     ) -> None:
         atp.bulk_write_kuzu_relationships_many(self._open_handler(), batches)
 
+    def replace_relationship_endpoints(
+        self,
+        replacements: Iterable[DbRelationshipEndpointReplace],
+    ) -> None:
+        atp.replace_kuzu_relationship_endpoints(self._open_handler(), replacements)
+
     def bulk_write_nodes_and_relationships_many(
         self,
         node_batches: Iterable[tuple[Any, ...]],
@@ -209,6 +226,8 @@ class KuzuConnection:
     def close(self) -> None:
         if self._closed:
             return
-        self._handler.flush(None)
-        self._handler.shutdown(None)
+        handler = self._open_handler()
+        handler.flush(None)
+        handler.shutdown(None)
+        self._handler = None
         self._closed = True

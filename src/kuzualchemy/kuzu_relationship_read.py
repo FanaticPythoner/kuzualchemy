@@ -2,6 +2,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Type
 from atp_pipeline import DbStatement, normalize_relationship_db_direction
+from .enum_normalization import convert_input_enums_for_model
 from .kuzu_session_rows import primary_key_fields
 
 
@@ -25,7 +26,10 @@ def construct_model_from_db_payload(model_class: Type[Any], payload: dict[str, A
     }
     if construct is None:
         return model_class(**filtered)
-    return construct(**filtered)
+    normalized = convert_input_enums_for_model(model_class=model_class, values=filtered)
+    if not isinstance(normalized, dict):
+        raise TypeError("model enum normalization must return a dictionary payload")
+    return construct(**normalized)
 
 
 def _field_has_default_factory(field: Any) -> bool:

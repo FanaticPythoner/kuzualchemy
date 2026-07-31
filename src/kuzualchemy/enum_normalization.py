@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 import types
 from typing import Any, Dict, Type, Union, get_args, get_origin
 
@@ -218,8 +219,13 @@ def _build_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFiel
     return tuple(plans)
 
 
+@lru_cache(maxsize=None)
 def _get_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFieldConversionPlan, ...]:
     return _build_model_enum_conversion_plans(model_class)
+
+
+def clear_enum_conversion_plan_cache() -> None:
+    _get_model_enum_conversion_plans.cache_clear()
 
 
 def _convert_sequence_branch(field_name: str, branch: EnumConversionBranch, raw_value: Any) -> list[Any] | tuple[Any, ...] | object:
