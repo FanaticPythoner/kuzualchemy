@@ -52,6 +52,7 @@ from .constants import (
     RelationshipNodeTypeQueryConstants,
 )
 from .enum_normalization import clear_enum_conversion_plan_cache, convert_input_enums_for_model
+from .cython_pydantic import CythonModelMetaclass
 
 if TYPE_CHECKING:
     from .kuzu_query import Query
@@ -1817,7 +1818,7 @@ def kuzu_relationship(
 # Base models
 # -----------------------------------------------------------------------------
 
-class KuzuBaseModel(BaseModel):
+class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
     """Base model for all Kùzu entities with metadata helpers."""
 
     model_config = ConfigDict(

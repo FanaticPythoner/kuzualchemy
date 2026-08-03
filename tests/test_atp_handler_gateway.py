@@ -146,7 +146,7 @@ def test_bulk_write_nodes_many_routes_to_single_handler_call() -> None:
     assert expect_rows is False
 
 
-def test_bulk_write_nodes_and_relationships_many_preserves_typed_work_items() -> None:
+def test_bulk_write_nodes_and_relationships_many_orders_endpoint_dependent_phases() -> None:
     handler = _GatewayHandler()
     connection = object.__new__(KuzuConnection)
     connection.db_path = ":memory:"
@@ -158,16 +158,17 @@ def test_bulk_write_nodes_and_relationships_many_preserves_typed_work_items() ->
         [(DbBulkAction.CREATE, "REL", "A", "B", [{"from_pk": 1, "to_pk": 2}], ["id"], ["id"])],
     )
 
-    assert len(handler.calls) == 1
-    kind, works, expect_rows = handler.calls[0]
-    assert kind == "submit_many_work"
-    assert [work.kind for work in works] == [
-        DbWorkKind.NODE_BULK_WRITE,
-        DbWorkKind.RELATIONSHIP_BULK_WRITE,
+    assert len(handler.calls) == 2
+    node_kind, node_works, node_expect_rows = handler.calls[0]
+    relationship_kind, relationship_works, relationship_expect_rows = handler.calls[1]
+    assert node_kind == relationship_kind == "submit_many_work"
+    assert [work.kind for work in node_works] == [DbWorkKind.NODE_BULK_WRITE]
+    assert [work.kind for work in relationship_works] == [
+        DbWorkKind.RELATIONSHIP_BULK_WRITE
     ]
-    assert works[0].node_bulk.label == "A"
-    assert works[1].relationship_bulk.rel_type == "REL"
-    assert expect_rows is False
+    assert node_works[0].node_bulk.label == "A"
+    assert relationship_works[0].relationship_bulk.rel_type == "REL"
+    assert node_expect_rows is relationship_expect_rows is False
 
 
 def test_kuzu_connection_rejects_batched_read_table_count_mismatch() -> None:
