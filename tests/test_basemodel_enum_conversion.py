@@ -24,6 +24,10 @@ from kuzualchemy import (
     kuzu_relationship,
 )
 from kuzualchemy.test_utilities import initialize_schema
+from kuzualchemy.enum_normalization import (
+    clear_enum_conversion_plan_cache,
+    get_enum_lookups,
+)
 
 
 class StatusEnum(Enum):
@@ -31,6 +35,31 @@ class StatusEnum(Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
     PENDING = "pending"
+
+
+def test_enum_lookup_cache_is_identity_stable_and_explicitly_invalidated() -> None:
+    clear_enum_conversion_plan_cache()
+    first = get_enum_lookups(StatusEnum)
+    second = get_enum_lookups(StatusEnum)
+    assert second is first
+    assert get_enum_lookups.cache_info().hits == 1
+
+    clear_enum_conversion_plan_cache()
+    third = get_enum_lookups(StatusEnum)
+    assert third == first
+    assert third is not first
+
+
+def test_enum_conversion_plan_tracks_pydantic_schema_identity() -> None:
+    clear_enum_conversion_plan_cache()
+    before_validator = TestAccount.__pydantic_validator__
+    before = TestAccount.convert_str_to_enum({"status": "ACTIVE"})
+    assert before["status"] is StatusEnum.ACTIVE
+
+    assert TestAccount.model_rebuild(force=True) is True
+    assert TestAccount.__pydantic_validator__ is not before_validator
+    after = TestAccount.convert_str_to_enum({"status": "ACTIVE"})
+    assert after["status"] is StatusEnum.ACTIVE
 
 
 class PriorityEnum(Enum):

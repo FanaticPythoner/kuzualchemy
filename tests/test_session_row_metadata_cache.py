@@ -7,15 +7,19 @@ import pytest
 from atp_pipeline import DbBulkAction
 from pydantic import BaseModel, model_validator
 
+from kuzualchemy.constants import KuzuDefaultFunction
+from kuzualchemy.kuzu_function_types import DefaultFunctionBase
 from kuzualchemy.kuzu_relationship_read import construct_model_from_db_payload
 from kuzualchemy.kuzu_session import KuzuSession
 from kuzualchemy.kuzu_session_rows import (
+    _materialize_default_function,
     _primary_key_fields,
     _relationship_pair_metadata,
     clear_session_row_metadata_caches,
     model_field_specs,
     node_merge_policies,
     normalize_model_row,
+    primary_key_field_tuple,
 )
 
 
@@ -118,6 +122,12 @@ class _CaptureConnection:
         self.node_batches.extend(node_batches)
         self.relationship_batches.extend(relationship_batches)
 
+    def run_row_partition_tasks(
+        self,
+        tasks: list[tuple[object, tuple[object, ...], dict[str, object]]],
+    ) -> list[object]:
+        return [function(*arguments, **keyword_arguments) for function, arguments, keyword_arguments in tasks]
+
 
 def _reset_counters() -> None:
     clear_session_row_metadata_caches()
@@ -154,6 +164,46 @@ def test_primary_key_and_merge_policy_caches_return_mutable_copies() -> None:
     assert node_merge_policies(_CachedNode) == {"external_id": "keep_existing"}
     assert _CachedNode.primary_key_calls == 1
     assert _CachedNode.metadata_calls == 1
+
+
+def test_primary_key_tuple_reuses_immutable_class_metadata() -> None:
+    _reset_counters()
+
+    fields = primary_key_field_tuple(_CachedNode)
+
+    assert fields == ("id",)
+    assert fields is primary_key_field_tuple(_CachedNode)
+    assert _CachedNode.primary_key_calls == 1
+
+    clear_session_row_metadata_caches()
+
+    assert primary_key_field_tuple(_CachedNode) == ("id",)
+    assert _CachedNode.primary_key_calls == 2
+
+
+def test_default_function_materialization_preserves_exact_and_subclass_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CustomDefaultFunction(DefaultFunctionBase):
+        pass
+
+    sentinel = object()
+    calls: list[object] = []
+
+    def generate(value: object) -> object:
+        calls.append(value)
+        return sentinel
+
+    monkeypatch.setattr(
+        "kuzualchemy.kuzu_session_rows.BulkInsertValueGeneratorRegistry.generate_value",
+        generate,
+    )
+    custom = _CustomDefaultFunction("custom()")
+
+    assert _materialize_default_function(KuzuDefaultFunction.CURRENT_TIMESTAMP) is sentinel
+    assert _materialize_default_function(custom) is sentinel
+    assert _materialize_default_function("current_timestamp()") == "current_timestamp()"
+    assert calls == [KuzuDefaultFunction.CURRENT_TIMESTAMP, custom]
 
 
 def test_relationship_pair_metadata_reuses_endpoint_primary_key_metadata() -> None:

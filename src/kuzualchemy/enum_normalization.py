@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
+from threading import Lock
 import types
 from typing import Any, Dict, Type, Union, get_args, get_origin
 
@@ -28,6 +29,7 @@ class EnumFieldConversionPlan:
     allow_passthrough: bool
 
 
+@lru_cache(maxsize=None)
 def get_enum_lookups(enum_type: Type[Enum]) -> tuple[Dict[str, Enum], Dict[Any, Enum]]:
     names: Dict[str, Enum] = {}
     values: Dict[Any, Enum] = {}
@@ -45,6 +47,8 @@ def _try_value_lookup(value_map: Dict[Any, Enum], raw_value: Any) -> Enum | obje
 
 
 def _lookup_enum_value(enum_type: Type[Enum], raw_value: Any) -> Enum | object:
+    if raw_value.__class__ is enum_type:
+        return raw_value
     names, value_map = get_enum_lookups(enum_type)
     if isinstance(raw_value, Enum):
         if raw_value.__class__ is enum_type:
@@ -105,6 +109,10 @@ def _extract_direct_enum_types(args: tuple[Any, ...]) -> tuple[Type[Enum], ...]:
 
 
 def _try_convert_multi_enum_value(enum_types: tuple[Type[Enum], ...], raw_value: Any) -> Enum | object:
+    raw_type = raw_value.__class__
+    for enum_type in enum_types:
+        if raw_type is enum_type:
+            return raw_value
     for enum_type in enum_types:
         member = _lookup_enum_value(enum_type, raw_value)
         if member is not _MISSING:
@@ -219,13 +227,33 @@ def _build_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFiel
     return tuple(plans)
 
 
-@lru_cache(maxsize=None)
-def _get_model_enum_conversion_plans(model_class: type[Any]) -> tuple[EnumFieldConversionPlan, ...]:
-    return _build_model_enum_conversion_plans(model_class)
+_model_enum_plan_lock = Lock()
+_model_enum_plan_values: dict[
+    type[Any],
+    tuple[Any, tuple[EnumFieldConversionPlan, ...]],
+] = {}
+
+
+def _get_model_enum_conversion_plans(
+    model_class: type[Any],
+    schema_validator: Any,
+) -> tuple[EnumFieldConversionPlan, ...]:
+    cached = _model_enum_plan_values.get(model_class)
+    if cached is not None and cached[0] is schema_validator:
+        return cached[1]
+    with _model_enum_plan_lock:
+        cached = _model_enum_plan_values.get(model_class)
+        if cached is not None and cached[0] is schema_validator:
+            return cached[1]
+        plans = _build_model_enum_conversion_plans(model_class)
+        _model_enum_plan_values[model_class] = (schema_validator, plans)
+        return plans
 
 
 def clear_enum_conversion_plan_cache() -> None:
-    _get_model_enum_conversion_plans.cache_clear()
+    with _model_enum_plan_lock:
+        _model_enum_plan_values.clear()
+        get_enum_lookups.cache_clear()
 
 
 def _convert_sequence_branch(field_name: str, branch: EnumConversionBranch, raw_value: Any) -> list[Any] | tuple[Any, ...] | object:
@@ -252,7 +280,10 @@ def _convert_sequence_branch(field_name: str, branch: EnumConversionBranch, raw_
 def convert_input_enums_for_model(*, model_class: type[Any], values: Any) -> Any:
     if not isinstance(values, dict):
         return values
-    plans = _get_model_enum_conversion_plans(model_class)
+    plans = _get_model_enum_conversion_plans(
+        model_class,
+        model_class.__pydantic_validator__,
+    )
     if not plans:
         return values
     for plan in plans:

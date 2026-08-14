@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Type, TypeVar
@@ -35,12 +34,6 @@ BulkRowPartition = tuple[
     dict[RelationshipRoute, list[dict[str, Any]]],
     list[BulkIdentityAction],
 ]
-BulkNodeRowPartition = tuple[
-    dict[type[Any], list[dict[str, Any]]],
-    list[BulkIdentityAction],
-]
-
-
 class KuzuSession:
     def __init__(
         self,
@@ -108,7 +101,6 @@ class KuzuSession:
         alias: str,
         pairs_subset: list[int] | None,
         filters: list[DbStatement] | None = None,
-        page_size: int = 0,
     ) -> list[dict[str, Any]]:
         self._flush_for_read()
         return self._conn.read_relationships(
@@ -117,7 +109,28 @@ class KuzuSession:
             direction=relationship_read_direction(relationship_class),
             pairs=relationship_read_pairs(relationship_class),
             pairs_subset=list(pairs_subset or []),
-            filters=filters, page_size=page_size,
+            filters=filters,
+        )
+
+    def _iterate_relationship_read_for_query_object(
+        self,
+        relationship_class: Type[Any],
+        alias: str,
+        pairs_subset: list[int] | None,
+        filters: list[DbStatement] | None,
+        page_size: int,
+        prefetch_pages: int,
+    ) -> Iterator[dict[str, Any]]:
+        self._flush_for_read()
+        return self._conn.iterate_relationships(
+            relationship=relationship_read_name(relationship_class),
+            alias=alias,
+            direction=relationship_read_direction(relationship_class),
+            pairs=relationship_read_pairs(relationship_class),
+            pairs_subset=list(pairs_subset or []),
+            filters=filters,
+            page_size=page_size,
+            prefetch_pages=prefetch_pages,
         )
     def _iterate_for_query_object(
         self,
@@ -125,6 +138,7 @@ class KuzuSession:
         parameters: dict[str, Any] | None,
         page_size: int,
         prefetch_pages: int,
+        total_rows: int,
     ) -> Iterator[dict[str, Any]]:
         self._flush_for_read()
         return self._conn.iterate(
@@ -132,6 +146,7 @@ class KuzuSession:
             parameters or {},
             page_size=page_size,
             prefetch_pages=prefetch_pages,
+            total_rows=total_rows,
         )
     def iterate(
         self,
@@ -188,7 +203,7 @@ class KuzuSession:
         track_identity: bool = False,
     ) -> None:
         self._write_instances(
-            DbBulkAction.CREATE,
+            DbBulkAction.INSERT,
             instances,
             batch_size=batch_size,
             track_identity=track_identity,
@@ -201,7 +216,7 @@ class KuzuSession:
         track_identity: bool = False,
     ) -> None:
         self._write_instance_groups(
-            DbBulkAction.CREATE,
+            DbBulkAction.INSERT,
             node_instances,
             relationship_instances,
             track_identity=track_identity,
@@ -388,13 +403,14 @@ class KuzuSession:
         *,
         track_identity: bool,
     ) -> None:
-        if action == DbBulkAction.CREATE:
+        if action in {DbBulkAction.INSERT, DbBulkAction.CREATE}:
             self._validate_create_auto_increment_values(instances)
-        if action == DbBulkAction.CREATE and any(
+        if action in {DbBulkAction.INSERT, DbBulkAction.CREATE} and any(
             auto_generation_fields(instance) for instance in instances
         ):
             self._write_create_instances_with_generated_fields(
                 instances,
+                action=action,
                 track_identity=track_identity,
             )
             return
@@ -429,6 +445,7 @@ class KuzuSession:
         self,
         instances: list[Any],
         *,
+        action: DbBulkAction,
         track_identity: bool,
     ) -> None:
         normal_nodes: dict[type[Any], list[dict[str, Any]]] = {}
@@ -451,13 +468,13 @@ class KuzuSession:
                     normal_relationships.append(instance)
             else:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu model")
-        self._write_grouped_rows(DbBulkAction.CREATE, normal_nodes, {})
+        self._write_grouped_rows(action, normal_nodes, {})
         self._write_generated_nodes(generated_nodes, track_identity=track_identity)
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
         for instance in normal_relationships:
             row = _relationship_row(instance)
             rels.setdefault(_relationship_route(type(instance), row), []).append(row)
-        self._write_grouped_rows(DbBulkAction.CREATE, {}, rels)
+        self._write_grouped_rows(action, {}, rels)
         self._write_generated_relationships(generated_relationships)
     def _write_generated_nodes(self, instances: list[Any], *, track_identity: bool) -> None:
         if not instances:
@@ -484,12 +501,19 @@ class KuzuSession:
         *,
         track_identity: bool = True,
     ) -> None:
-        nodes, identity_actions = self._partition_node_instance_rows(
+        for instance in node_instances:
+            if not hasattr(type(instance), "__kuzu_node_name__"):
+                raise TypeError(f"{type(instance).__name__} is not a registered Kuzu node")
+        for instance in relationship_instances:
+            if not hasattr(type(instance), "__kuzu_rel_name__"):
+                raise TypeError(
+                    f"{type(instance).__name__} is not a registered Kuzu relationship"
+                )
+        nodes, rels, identity_actions = self._partition_instance_rows(
             action,
-            node_instances,
+            [*node_instances, *relationship_instances],
             track_identity=track_identity,
         )
-        rels = self._partition_relationship_instance_rows(relationship_instances)
         self._apply_identity_actions(identity_actions)
         self._write_grouped_rows(action, nodes, rels)
 
@@ -513,92 +537,26 @@ class KuzuSession:
         nodes: dict[type[Any], list[dict[str, Any]]] = {}
         rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
         identity_actions: list[BulkIdentityAction] = []
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
+        partitions = self._conn.run_row_partition_tasks(
+            [
+                (
                     self._partition_instance_row_range,
-                    action,
-                    instances,
-                    start,
-                    min(len(instances), start + chunk_size),
-                    track_identity=track_identity,
+                    (
+                        action,
+                        instances,
+                        start,
+                        min(len(instances), start + chunk_size),
+                    ),
+                    {"track_identity": track_identity},
                 )
                 for start in range(0, len(instances), chunk_size)
             ]
-            for future in futures:
-                chunk_nodes, chunk_rels, chunk_identity_actions = future.result()
-                self._append_partition_rows(nodes, chunk_nodes)
-                self._append_partition_rows(rels, chunk_rels)
-                identity_actions.extend(chunk_identity_actions)
+        )
+        for chunk_nodes, chunk_rels, chunk_identity_actions in partitions:
+            self._append_partition_rows(nodes, chunk_nodes)
+            self._append_partition_rows(rels, chunk_rels)
+            identity_actions.extend(chunk_identity_actions)
         return nodes, rels, identity_actions
-
-    def _partition_node_instance_rows(
-        self,
-        action: DbBulkAction,
-        instances: list[Any],
-        *,
-        track_identity: bool,
-    ) -> BulkNodeRowPartition:
-        if not instances:
-            return {}, []
-        worker_count = self._row_partition_worker_count(len(instances))
-        if worker_count == 1:
-            return self._partition_node_instance_row_range(
-                action,
-                instances,
-                0,
-                len(instances),
-                track_identity=track_identity,
-            )
-        chunk_size = self._row_partition_chunk_size(len(instances), worker_count)
-        nodes: dict[type[Any], list[dict[str, Any]]] = {}
-        identity_actions: list[BulkIdentityAction] = []
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    self._partition_node_instance_row_range,
-                    action,
-                    instances,
-                    start,
-                    min(len(instances), start + chunk_size),
-                    track_identity=track_identity,
-                )
-                for start in range(0, len(instances), chunk_size)
-            ]
-            for future in futures:
-                chunk_nodes, chunk_identity_actions = future.result()
-                self._append_partition_rows(nodes, chunk_nodes)
-                identity_actions.extend(chunk_identity_actions)
-        return nodes, identity_actions
-
-    def _partition_relationship_instance_rows(
-        self,
-        instances: list[Any],
-    ) -> dict[RelationshipRoute, list[dict[str, Any]]]:
-        if not instances:
-            return {}
-        worker_count = self._row_partition_worker_count(len(instances))
-        if worker_count == 1:
-            return self._partition_relationship_instance_row_range(
-                instances,
-                0,
-                len(instances),
-            )
-        chunk_size = self._row_partition_chunk_size(len(instances), worker_count)
-        rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    self._partition_relationship_instance_row_range,
-                    instances,
-                    start,
-                    min(len(instances), start + chunk_size),
-                )
-                for start in range(0, len(instances), chunk_size)
-            ]
-            for future in futures:
-                self._append_partition_rows(rels, future.result())
-        return rels
 
     @staticmethod
     def _row_partition_chunk_size(total_instances: int, worker_count: int) -> int:
@@ -663,51 +621,6 @@ class KuzuSession:
             else:
                 raise TypeError(f"{cls.__name__} is not a registered Kuzu model")
         return nodes, rels, identity_actions
-
-    @staticmethod
-    def _partition_node_instance_row_range(
-        action: DbBulkAction,
-        instances: list[Any],
-        start: int,
-        stop: int,
-        *,
-        track_identity: bool,
-    ) -> BulkNodeRowPartition:
-        nodes: dict[type[Any], list[dict[str, Any]]] = {}
-        identity_actions: list[BulkIdentityAction] = []
-        for index in range(start, stop):
-            instance = instances[index]
-            cls = type(instance)
-            if not hasattr(cls, "__kuzu_node_name__"):
-                raise TypeError(f"{cls.__name__} is not a registered Kuzu node")
-            row = (
-                _node_delete_row(instance)
-                if action == DbBulkAction.DELETE
-                else _node_row(instance)
-            )
-            nodes.setdefault(cls, []).append(row)
-            if track_identity:
-                if action == DbBulkAction.DELETE:
-                    identity_actions.append(("expire", instance))
-                else:
-                    identity_actions.append(("remember", instance))
-        return nodes, identity_actions
-
-    @staticmethod
-    def _partition_relationship_instance_row_range(
-        instances: list[Any],
-        start: int,
-        stop: int,
-    ) -> dict[RelationshipRoute, list[dict[str, Any]]]:
-        rels: dict[RelationshipRoute, list[dict[str, Any]]] = {}
-        for index in range(start, stop):
-            instance = instances[index]
-            cls = type(instance)
-            if not hasattr(cls, "__kuzu_rel_name__"):
-                raise TypeError(f"{cls.__name__} is not a registered Kuzu relationship")
-            row = _relationship_row(instance)
-            rels.setdefault(_relationship_route(cls, row), []).append(row)
-        return rels
 
     @staticmethod
     def _append_partition_rows(

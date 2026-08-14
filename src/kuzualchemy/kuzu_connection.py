@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import atp_pipeline as atp
 from atp_pipeline import (
@@ -9,11 +14,59 @@ from atp_pipeline import (
     DatabaseType,
     DbBulkAction,
     DbBulkMergePolicy,
-    DbRelationshipEndpointReplace,
+    DbRelationshipEndpointMerge,
+    DbRelationshipEndpointMove,
     DbStatement,
 )
 
 from .constants import ErrorMessages
+
+RowPartitionTask = tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+_ROW_PARTITION_THREAD_STATE = threading.local()
+
+
+def _process_cpu_capacity() -> int:
+    capacity = os.process_cpu_count()
+    if capacity is None or capacity < 1:
+        raise RuntimeError("process CPU count is unavailable")
+    return capacity
+
+
+def _current_cpu_affinity() -> tuple[int, ...] | None:
+    affinity_reader = getattr(os, "sched_getaffinity", None)
+    if affinity_reader is None:
+        return None
+    try:
+        cpu_ids = tuple(sorted(affinity_reader(0)))
+    except OSError as exc:
+        raise RuntimeError(f"row partition CPU-affinity discovery failed: {exc}") from exc
+    if not cpu_ids:
+        raise RuntimeError("row partition CPU affinity is empty")
+    return cpu_ids
+
+
+def _execute_row_partition_task(
+    cpu_ids: tuple[int, ...] | None,
+    function: Callable[..., Any],
+    arguments: tuple[Any, ...],
+    keyword_arguments: dict[str, Any],
+) -> Any:
+    if cpu_ids is not None and getattr(_ROW_PARTITION_THREAD_STATE, "cpu_ids", None) != cpu_ids:
+        affinity_writer = getattr(os, "sched_setaffinity", None)
+        affinity_reader = getattr(os, "sched_getaffinity", None)
+        if affinity_writer is None or affinity_reader is None:
+            raise RuntimeError("row partition CPU-affinity activation is unavailable")
+        try:
+            affinity_writer(0, cpu_ids)
+            observed = tuple(sorted(affinity_reader(0)))
+        except OSError as exc:
+            raise RuntimeError(f"row partition CPU-affinity activation failed: {exc}") from exc
+        if observed != cpu_ids:
+            raise RuntimeError(
+                f"row partition CPU affinity mismatch: observed={observed}, expected={cpu_ids}"
+            )
+        _ROW_PARTITION_THREAD_STATE.cpu_ids = cpu_ids
+    return function(*arguments, **keyword_arguments)
 
 
 class KuzuConnection:
@@ -26,6 +79,14 @@ class KuzuConnection:
             DatabaseType.KUZU,
             {"db_path": self.db_path},
         )
+        self._row_partition_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_process_cpu_capacity(),
+            thread_name_prefix="kuzualchemy-row",
+        )
+        self._row_partition_executor_override: ContextVar[Executor | None] = ContextVar(
+            "kuzualchemy_row_partition_executor",
+            default=None,
+        )
         self._closed = False
 
     def _open_handler(self) -> ATPHandler:
@@ -33,6 +94,70 @@ class KuzuConnection:
         if getattr(self, "_closed", False) or handler is None:
             raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
         return handler
+
+    def _open_row_partition_executor(self) -> Executor:
+        override = getattr(self, "_row_partition_executor_override", None)
+        if override is not None:
+            selected = override.get()
+            if selected is not None:
+                if getattr(self, "_closed", False):
+                    raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
+                return selected
+        executor = getattr(self, "_row_partition_executor", None)
+        if getattr(self, "_closed", False) or executor is None:
+            raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
+        return executor
+
+    @contextmanager
+    def row_partition_executor_scope(self, executor: Executor) -> Iterator[None]:
+        if not isinstance(executor, Executor):
+            raise TypeError("row partition executor must implement concurrent.futures.Executor")
+        if getattr(self, "_closed", False):
+            raise RuntimeError(ErrorMessages.CONNECTION_CLOSED)
+        override = getattr(self, "_row_partition_executor_override", None)
+        if override is None:
+            override = ContextVar(
+                "kuzualchemy_row_partition_executor",
+                default=None,
+            )
+            self._row_partition_executor_override = override
+        token = override.set(executor)
+        try:
+            yield
+        finally:
+            override.reset(token)
+
+    def run_row_partition_tasks(
+        self,
+        tasks: Iterable[RowPartitionTask],
+    ) -> list[Any]:
+        task_list = list(tasks)
+        if not task_list:
+            return []
+        executor = self._open_row_partition_executor()
+        cpu_ids = _current_cpu_affinity()
+        futures = [
+            executor.submit(
+                _execute_row_partition_task,
+                cpu_ids,
+                function,
+                arguments,
+                keyword_arguments,
+            )
+            for function, arguments, keyword_arguments in task_list
+        ]
+        results: list[Any] = []
+        first_error: BaseException | None = None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:
+                results.append(None)
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error.with_traceback(first_error.__traceback__)
+        return results
 
     def execute(
         self,
@@ -73,6 +198,7 @@ class KuzuConnection:
         *,
         page_size: int = 1000,
         prefetch_pages: int = 1,
+        total_rows: int | None = None,
     ):
         return atp.iter_kuzu(
             self._open_handler(),
@@ -80,6 +206,7 @@ class KuzuConnection:
             parameters or {},
             page_size=page_size,
             prefetch_pages=prefetch_pages,
+            total_rows=total_rows,
         )
 
     def read_pages(
@@ -100,7 +227,6 @@ class KuzuConnection:
         pairs: list[dict[str, str]],
         pairs_subset: list[int],
         filters: list[DbStatement] | None = None,
-        page_size: int = 0,
     ) -> list[dict[str, Any]]:
         return atp.read_kuzu_relationships(
             self._open_handler(),
@@ -110,7 +236,30 @@ class KuzuConnection:
             pairs=pairs,
             pairs_subset=pairs_subset,
             filters=filters,
+        )
+
+    def iterate_relationships(
+        self,
+        *,
+        relationship: str,
+        alias: str,
+        direction: str,
+        pairs: list[dict[str, str]],
+        pairs_subset: list[int],
+        filters: list[DbStatement] | None,
+        page_size: int,
+        prefetch_pages: int,
+    ) -> Iterator[dict[str, Any]]:
+        return atp.iter_kuzu_relationships(
+            self._open_handler(),
+            relationship=relationship,
+            alias=alias,
+            direction=direction,
+            pairs=pairs,
+            pairs_subset=pairs_subset,
+            filters=filters,
             page_size=page_size,
+            prefetch_pages=prefetch_pages,
         )
 
     def schema_apply(self, statements: Iterable[str]) -> None:
@@ -192,11 +341,16 @@ class KuzuConnection:
     ) -> None:
         atp.bulk_write_kuzu_relationships_many(self._open_handler(), batches)
 
-    def replace_relationship_endpoints(
+    def canonicalize_relationship_endpoints(
         self,
-        replacements: Iterable[DbRelationshipEndpointReplace],
+        moves: Iterable[DbRelationshipEndpointMove],
+        merges: Iterable[DbRelationshipEndpointMerge],
     ) -> None:
-        atp.replace_kuzu_relationship_endpoints(self._open_handler(), replacements)
+        atp.canonicalize_kuzu_relationship_endpoints(
+            self._open_handler(),
+            moves,
+            merges,
+        )
 
     def bulk_write_nodes_and_relationships_many(
         self,
@@ -226,6 +380,10 @@ class KuzuConnection:
     def close(self) -> None:
         if self._closed:
             return
+        executor = getattr(self, "_row_partition_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._row_partition_executor = None
         handler = self._open_handler()
         handler.flush(None)
         handler.shutdown(None)

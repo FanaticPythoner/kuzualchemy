@@ -94,6 +94,7 @@ class TestSetsUnionsInRelationships:
         )
 
         assert len(pairs) == 2
+        assert [pair.get_to_name() for pair in pairs] == ["Node2", "Node3"]
         names = {(p.get_from_name(), p.get_to_name()) for p in pairs}
         assert ("Node1", "Node2") in names
         assert ("Node1", "Node3") in names
@@ -237,6 +238,15 @@ class TestSetsUnionsInRelationships:
         )
         
         assert len(pairs) == 4
+        assert [
+            (pair.get_from_name(), pair.get_to_name())
+            for pair in pairs
+        ] == [
+            ("M1", "N1"),
+            ("M1", "N2"),
+            ("M2", "N1"),
+            ("M2", "N2"),
+        ]
         names = {(p.get_from_name(), p.get_to_name()) for p in pairs}
         assert ("M1", "N1") in names
         assert ("M1", "N2") in names

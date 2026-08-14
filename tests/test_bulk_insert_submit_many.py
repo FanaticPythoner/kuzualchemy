@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from atp_pipeline import DbBulkAction
+
 from kuzualchemy import (
     ComparisonOperator,
     FieldFilterExpression,
@@ -43,6 +45,7 @@ class BulkSubmitManyLinked(KuzuRelationshipBase):
 
 class _CaptureConnection:
     def __init__(self) -> None:
+        self.write_actions: list[DbBulkAction] = []
         self.node_writes: list[
             tuple[str, list[dict[str, Any]], list[str], dict[str, object]]
         ] = []
@@ -64,12 +67,13 @@ class _CaptureConnection:
 
     def bulk_write_nodes(
         self,
-        _action: object,
+        action: DbBulkAction,
         label: str,
         rows: list[dict[str, Any]],
         key_fields: list[str],
         merge_policies: dict[str, object] | None = None,
     ) -> None:
+        self.write_actions.append(action)
         self.node_writes.append((label, rows, key_fields, dict(merge_policies or {})))
 
     def bulk_write_nodes_many(
@@ -77,13 +81,14 @@ class _CaptureConnection:
         batches: list[tuple[object, ...]],
     ) -> None:
         for batch in batches:
-            _action, label, rows, key_fields = batch[:4]
+            action, label, rows, key_fields = batch[:4]
+            self.write_actions.append(action)
             merge_policies = batch[4] if len(batch) == 5 else {}
             self.node_writes.append((label, rows, key_fields, dict(merge_policies or {})))
 
     def bulk_write_relationships(
         self,
-        _action: object,
+        action: DbBulkAction,
         rel_type: str,
         from_label: str,
         to_label: str,
@@ -91,6 +96,7 @@ class _CaptureConnection:
         from_key_fields: list[str],
         to_key_fields: list[str],
     ) -> None:
+        self.write_actions.append(action)
         self.relationship_writes.append(
             (rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
         )
@@ -102,7 +108,7 @@ class _CaptureConnection:
         ],
     ) -> None:
         for (
-            _action,
+            action,
             rel_type,
             from_label,
             to_label,
@@ -110,6 +116,7 @@ class _CaptureConnection:
             from_key_fields,
             to_key_fields,
         ) in batches:
+            self.write_actions.append(action)
             self.relationship_writes.append(
                 (rel_type, from_label, to_label, rows, from_key_fields, to_key_fields)
             )
@@ -134,8 +141,39 @@ class _CaptureConnection:
         pairs: list[dict[str, str]],
         pairs_subset: list[int],
         filters: list[Any] | None = None,
-        page_size: int = 0,
     ) -> list[dict[str, Any]]:
+        self.relationship_reads.append(
+            (
+                relationship,
+                alias,
+                direction,
+                pairs,
+                pairs_subset,
+                filters,
+                0,
+            )
+        )
+        return [
+            {
+                alias: {"rank": 7},
+                "from_node": {"_label": "BulkSubmitManyA", "id": 1, "name": "a1"},
+                "to_node": {"_label": "BulkSubmitManyB", "id": 2, "name": "b2"},
+            }
+        ]
+
+    def iterate_relationships(
+        self,
+        *,
+        relationship: str,
+        alias: str,
+        direction: str,
+        pairs: list[dict[str, str]],
+        pairs_subset: list[int],
+        filters: list[Any] | None,
+        page_size: int,
+        prefetch_pages: int,
+    ):
+        _ = prefetch_pages
         self.relationship_reads.append(
             (
                 relationship,
@@ -147,13 +185,15 @@ class _CaptureConnection:
                 page_size,
             )
         )
-        return [
-            {
-                alias: {"rank": 7},
-                "from_node": {"_label": "BulkSubmitManyA", "id": 1, "name": "a1"},
-                "to_node": {"_label": "BulkSubmitManyB", "id": 2, "name": "b2"},
-            }
-        ]
+        return iter(
+            [
+                {
+                    alias: {"rank": 7},
+                    "from_node": {"id": 1, "_label": "BulkSubmitManyA"},
+                    "to_node": {"id": 2, "_label": "BulkSubmitManyB"},
+                }
+            ]
+        )
 
 
 def _session_for_capture(conn: _CaptureConnection) -> KuzuSession:
@@ -192,6 +232,7 @@ def test_bulk_insert_submits_label_batches_by_model() -> None:
     assert conn.node_writes[0][3] == {"score": "KEEP_MAX_NUMERIC"}
     assert conn.node_writes[1][3] == {}
     assert conn.combined_write_count == 1
+    assert conn.write_actions == [DbBulkAction.INSERT, DbBulkAction.INSERT]
 
 
 def test_bulk_insert_submits_concrete_relationship_routes() -> None:
@@ -221,6 +262,7 @@ def test_bulk_insert_submits_concrete_relationship_routes() -> None:
         )
     ]
     assert conn.combined_write_count == 1
+    assert conn.write_actions == [DbBulkAction.INSERT]
 
 
 def test_relationship_query_submits_metadata_to_atp_relationship_read() -> None:

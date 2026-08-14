@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
-from atp_pipeline import DbBulkAction, DbWorkKind
+from atp_pipeline import (
+    DbBulkAction,
+    DbRelationshipEndpointMerge,
+    DbRelationshipEndpointMergeSource,
+    DbRelationshipEndpointMove,
+    DbWorkKind,
+)
+
 from kuzualchemy.kuzu_connection import KuzuConnection
 
 
@@ -91,7 +101,7 @@ def test_read_and_write_batches_route_to_typed_work() -> None:
     read_work = handler.calls[0][1]
     write_work = handler.calls[1][1]
     assert read_work.kind == DbWorkKind.QUERY_READ
-    assert write_work.kind == DbWorkKind.QUERY_READ
+    assert write_work.kind == DbWorkKind.QUERY_WRITE
     assert handler.calls[0][2] is True
     assert handler.calls[1][2] is False
 
@@ -114,14 +124,76 @@ def test_close_releases_native_handler_after_ordered_shutdown() -> None:
     connection.db_path = ":memory:"
     connection._closed = False
     connection._handler = handler
+    connection._row_partition_executor = ThreadPoolExecutor(max_workers=1)
 
     connection.close()
     connection.close()
 
     assert handler.calls == ["flush", "shutdown"]
     assert connection._handler is None
+    assert connection._row_partition_executor is None
     with pytest.raises(RuntimeError, match="closed"):
         connection._open_handler()
+
+
+def test_row_partition_executor_preserves_order_reuses_pool_and_applies_affinity() -> None:
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    connection._row_partition_executor = ThreadPoolExecutor(max_workers=2)
+    executor_identity = id(connection._row_partition_executor)
+    inherited_cpu_ids = tuple(sorted(os.sched_getaffinity(0)))
+    selected_cpu_ids = inherited_cpu_ids[: min(2, len(inherited_cpu_ids))]
+
+    def capture(value: int) -> tuple[int, int, tuple[int, ...]]:
+        return value, threading.get_native_id(), tuple(sorted(os.sched_getaffinity(0)))
+
+    try:
+        os.sched_setaffinity(0, selected_cpu_ids)
+        first = connection.run_row_partition_tasks(
+            [(capture, (value,), {}) for value in range(4)]
+        )
+        second = connection.run_row_partition_tasks(
+            [(capture, (value,), {}) for value in range(4, 8)]
+        )
+        assert id(connection._row_partition_executor) == executor_identity
+    finally:
+        os.sched_setaffinity(0, inherited_cpu_ids)
+        connection._row_partition_executor.shutdown(wait=True, cancel_futures=False)
+        connection._row_partition_executor = None
+
+    assert [row[0] for row in [*first, *second]] == list(range(8))
+    assert all(row[2] == selected_cpu_ids for row in [*first, *second])
+    assert len({row[1] for row in [*first, *second]}) <= 2
+
+
+def test_row_partition_executor_scope_uses_caller_pool_and_restores_owner_pool() -> None:
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    connection._row_partition_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="owned-row",
+    )
+    shared_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="phase-row",
+    )
+
+    def capture() -> str:
+        return threading.current_thread().name
+
+    try:
+        with connection.row_partition_executor_scope(shared_executor):
+            shared_result = connection.run_row_partition_tasks([(capture, (), {})])
+        owned_result = connection.run_row_partition_tasks([(capture, (), {})])
+    finally:
+        shared_executor.shutdown(wait=True, cancel_futures=False)
+        connection._row_partition_executor.shutdown(wait=True, cancel_futures=False)
+        connection._row_partition_executor = None
+
+    assert shared_result[0].startswith("phase-row")
+    assert owned_result[0].startswith("owned-row")
 
 
 def test_bulk_write_nodes_many_routes_to_single_handler_call() -> None:
@@ -169,6 +241,69 @@ def test_bulk_write_nodes_and_relationships_many_orders_endpoint_dependent_phase
     assert node_works[0].node_bulk.label == "A"
     assert relationship_works[0].relationship_bulk.rel_type == "REL"
     assert node_expect_rows is relationship_expect_rows is False
+
+
+def test_endpoint_canonicalization_routes_moves_and_merges_to_one_work() -> None:
+    handler = _GatewayHandler()
+    connection = _connection_for_handler(handler)
+    endpoint_move = DbRelationshipEndpointMove(
+        rel_type="REL",
+        old_from_label="A",
+        old_to_label="B",
+        new_from_label="A",
+        new_to_label="C",
+        old_from_key_field="id",
+        old_to_key_field="id",
+        new_from_key_field="id",
+        new_to_key_field="id",
+        identity_fields=["site"],
+        property_fields=["active"],
+        rows=[
+            {
+                "old_from_pk": 1,
+                "old_to_pk": 2,
+                "new_from_pk": 1,
+                "new_to_pk": 3,
+                "site": 10,
+                "active": True,
+            }
+        ],
+    )
+    endpoint_merge = DbRelationshipEndpointMerge(
+        rel_type="REL",
+        new_from_label="A",
+        new_to_label="C",
+        new_from_key_field="id",
+        new_to_key_field="id",
+        identity_fields=["site"],
+        property_fields=["active"],
+        sources=[
+            DbRelationshipEndpointMergeSource(
+                old_from_label="A",
+                old_to_label="B",
+                old_from_key_field="id",
+                old_to_key_field="id",
+                rows=[{"old_from_pk": 1, "old_to_pk": 2, "site": 20}],
+            )
+        ],
+        target_row={
+            "new_from_pk": 1,
+            "new_to_pk": 3,
+            "site": 20,
+            "active": True,
+        },
+        target_preexisting=True,
+    )
+
+    connection.canonicalize_relationship_endpoints([endpoint_move], [endpoint_merge])
+
+    assert len(handler.calls) == 1
+    kind, work, expect_rows = handler.calls[0]
+    assert kind == "submit_work"
+    assert work.kind == DbWorkKind.RELATIONSHIP_ENDPOINT_CANONICALIZE
+    assert work.relationship_endpoint_moves == [endpoint_move]
+    assert work.relationship_endpoint_merges == [endpoint_merge]
+    assert expect_rows is False
 
 
 def test_kuzu_connection_rejects_batched_read_table_count_mismatch() -> None:

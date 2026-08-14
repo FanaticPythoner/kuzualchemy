@@ -350,6 +350,7 @@ from .kuzu_session import (
     KuzuSession,
 )
 from .kuzu_connection import KuzuConnection
+from .kuzu_storage import kuzu_storage_equivalent
 
 # Package metadata - dynamically retrieved from package metadata (PEP 621 compliant)
 __version__ = _resolve_package_version()
@@ -410,6 +411,7 @@ __all__ = [
     "CheckConstraintMetadata",
     "IndexMetadata",
     "KuzuFieldMetadata",
+    "kuzu_storage_equivalent",
     # Query classes
     "Query",
     "CypherQueryBuilder",

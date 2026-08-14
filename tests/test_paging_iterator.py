@@ -108,6 +108,107 @@ def test_iter_prefetch_on_off_equivalence(test_models, sample_users, sample_post
         _cleanup_session(sess, db_path)
 
 
+def test_iter_without_order_uses_primary_key_total_order(
+    test_models,
+    sample_users,
+    sample_posts,
+    monkeypatch,
+):
+    sess, db_path = _new_isolated_session()
+    try:
+        _setup_basic_users(sess, test_models, sample_users, sample_posts)
+        TestUser = test_models["TestUser"]
+        submitted_queries: list[str] = []
+        original_read_pages = atp_kuzu.read_kuzu_pages
+
+        def _record_read_pages(handler, query: str, parameters, offsets, limit):
+            submitted_queries.append(query)
+            return original_read_pages(handler, query, parameters, offsets, limit)
+
+        monkeypatch.setattr(atp_kuzu, "read_kuzu_pages", _record_read_pages)
+
+        items = list(sess.query(TestUser).iter(page_size=2, prefetch_pages=1))
+
+        assert [item.id for item in items] == [1, 2, 3]
+        assert submitted_queries
+        assert all("ORDER BY n.id ASC" in query for query in submitted_queries)
+    finally:
+        _cleanup_session(sess, db_path)
+
+
+def test_iter_appends_primary_key_to_nonunique_explicit_order(
+    test_models,
+    sample_users,
+    sample_posts,
+    monkeypatch,
+):
+    sess, db_path = _new_isolated_session()
+    try:
+        _setup_basic_users(sess, test_models, sample_users, sample_posts)
+        TestUser = test_models["TestUser"]
+        submitted_queries: list[str] = []
+        original_read_pages = atp_kuzu.read_kuzu_pages
+
+        def _record_read_pages(handler, query: str, parameters, offsets, limit):
+            submitted_queries.append(query)
+            return original_read_pages(handler, query, parameters, offsets, limit)
+
+        monkeypatch.setattr(atp_kuzu, "read_kuzu_pages", _record_read_pages)
+
+        items = list(
+            sess.query(TestUser)
+            .order_by("age")
+            .iter(page_size=2, prefetch_pages=1)
+        )
+
+        assert [(item.age, item.id) for item in items] == sorted(
+            (item.age, item.id) for item in items
+        )
+        assert submitted_queries
+        assert all(
+            "ORDER BY n.age ASC, n.id ASC" in query for query in submitted_queries
+        )
+    finally:
+        _cleanup_session(sess, db_path)
+
+
+def test_iter_rejects_non_derivable_paged_query_even_with_explicit_order(
+    test_models,
+):
+    sess, db_path = _new_isolated_session()
+    try:
+        TestUser = test_models["TestUser"]
+
+        with pytest.raises(
+            ValueError,
+            match="paged query shape has no derivable total row identity",
+        ):
+            sess.query(TestUser).distinct().order_by("id").iter(page_size=2)
+    finally:
+        _cleanup_session(sess, db_path)
+
+
+@pytest.mark.parametrize(
+    "query_window",
+    (
+        lambda query: query.limit(2),
+        lambda query: query.offset(1),
+    ),
+)
+def test_iter_rejects_nested_query_window(test_models, query_window):
+    sess, db_path = _new_isolated_session()
+    try:
+        TestUser = test_models["TestUser"]
+
+        with pytest.raises(
+            ValueError,
+            match="page_size cannot be combined with query limit or offset",
+        ):
+            query_window(sess.query(TestUser)).iter(page_size=2)
+    finally:
+        _cleanup_session(sess, db_path)
+
+
 def test_iter_page_size_edge_cases(test_models, sample_users, sample_posts):
     sess, db_path = _new_isolated_session()
     try:
@@ -143,10 +244,12 @@ def test_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
         monkeypatch.setenv("ATP_READONLY_POOL_MAX_SIZE", "1")
 
         executed_offsets: list[int] = []
+        executed_limits: list[int] = []
         original_read_pages = atp_kuzu.read_kuzu_pages
 
         def _spy_read_pages(handler, query: str, parameters, offsets: list[int], limit: int):
             executed_offsets.extend(offsets)
+            executed_limits.append(limit)
             return original_read_pages(handler, query, parameters, offsets, limit)
 
         monkeypatch.setattr(atp_kuzu, "read_kuzu_pages", _spy_read_pages)
@@ -155,6 +258,7 @@ def test_iter_exact_multiple_page_size_avoids_terminal_out_of_range_query(
         assert [u.id for u in items] == [1, 2, 3, 4]
 
         assert executed_offsets == [0, 2]
+        assert executed_limits == [2]
     finally:
         _cleanup_session(sess, db_path)
 

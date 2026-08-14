@@ -237,6 +237,59 @@ class Query(Generic[ModelType]):
             return self._materialize(rows)
         query, params = self.to_cypher()
         return self._materialize(self._session._execute_for_query_object(query, params))
+
+    def _ordered_for_paging(self) -> Query[ModelType]:
+        """Append model identity fields as stable paging tie-breakers."""
+        state = self._state
+        if state.limit_value is not None or state.offset_value is not None:
+            raise ValueError(
+                "page_size cannot be combined with query limit or offset"
+            )
+        if (
+            state.aggregations
+            or state.group_by
+            or state.distinct
+            or state.union_queries
+            or state.subqueries
+            or state.with_clauses
+            or state.joins
+            or state.return_model_class is not None
+            or hasattr(state.model_class, "__kuzu_rel_name__")
+        ):
+            raise ValueError(
+                "paged query shape has no derivable total row identity; use eager execution"
+            )
+
+        order_by = list(state.order_by)
+        normalized_fields = {
+            field if "." in field else f"{state.alias}.{field}"
+            for field, _direction in order_by
+        }
+
+        def _append_model_identity(model_class: Type[Any], alias: str) -> None:
+            getter = getattr(model_class, "get_primary_key_fields", None)
+            if not callable(getter):
+                raise ValueError(
+                    f"paged query model has no primary key metadata: {model_class.__name__}"
+                )
+            primary_keys = getter()
+            if not isinstance(primary_keys, list) or not primary_keys:
+                raise ValueError(
+                    f"paged query model has empty primary key metadata: {model_class.__name__}"
+                )
+            if not all(isinstance(field, str) and field for field in primary_keys):
+                raise ValueError(
+                    f"paged query model has invalid primary key metadata: {model_class.__name__}"
+                )
+            for primary_key in primary_keys:
+                qualified = f"{alias}.{primary_key}"
+                if qualified not in normalized_fields:
+                    order_by.append((qualified, OrderDirection.ASC))
+                    normalized_fields.add(qualified)
+
+        _append_model_identity(state.model_class, state.alias)
+        return self._copy_with_state(order_by=order_by)
+
     def iter(self, page_size: int | None = None, prefetch_pages: int = 1) -> Iterator[Any]:
         if page_size is None:
             return iter(self._execute())
@@ -246,23 +299,27 @@ class Query(Generic[ModelType]):
             raise RuntimeError("query execution requires a session")
         if can_use_native_relationship_read(self._state):
             endpoint_types = self._relationship_endpoint_types()
-            rows = self._session._execute_relationship_read_for_query_object(
+            rows = self._session._iterate_relationship_read_for_query_object(
                 self._state.model_class,
                 self._state.alias,
                 self._state.pairs_subset,
-                filters=relationship_read_filter_statements(self._state),
-                page_size=page_size,
+                relationship_read_filter_statements(self._state),
+                page_size,
+                prefetch_pages,
             )
             return (self._materialize_row(row, endpoint_types) for row in rows)
-        query, params = self.to_cypher()
-        endpoint_types = self._relationship_endpoint_types()
+        paged_query = self._ordered_for_paging()
+        query, params = paged_query.to_cypher()
+        total_rows = paged_query._copy_with_state(order_by=[]).count_results()
+        endpoint_types = paged_query._relationship_endpoint_types()
         return (
-            self._materialize_row(row, endpoint_types)
+            paged_query._materialize_row(row, endpoint_types)
             for row in self._session._iterate_for_query_object(
                 query,
                 params,
                 page_size,
                 prefetch_pages,
+                total_rows,
             )
         )
     def all(

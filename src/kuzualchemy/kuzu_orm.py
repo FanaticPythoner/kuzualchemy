@@ -14,6 +14,8 @@ from dataclasses import dataclass, field, replace
 import datetime
 import decimal
 import logging
+from threading import Lock
+from types import MappingProxyType
 import uuid
 from typing import (
     TYPE_CHECKING,
@@ -23,6 +25,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Mapping,
     Tuple,
     Type,
     TypeVar,
@@ -1169,6 +1172,7 @@ def _apply_kuzu_field_directives(cls: Type[T], decorator_directives: Any) -> Typ
         cls.__annotations__[directive.field_name] = annotation
     cls.model_rebuild(force=True)
     clear_enum_conversion_plan_cache()
+    clear_model_kuzu_metadata_cache()
     return cls
 
 
@@ -1616,9 +1620,104 @@ class KuzuRegistry:
 _kuzu_registry = KuzuRegistry()
 
 
+@dataclass(frozen=True, slots=True)
+class _KuzuModelMetadataPlan:
+    metadata_by_field: Mapping[str, KuzuFieldMetadata]
+    entries: Tuple[Tuple[str, KuzuFieldMetadata], ...]
+    primary_key_fields: Tuple[str, ...]
+    foreign_key_fields: Tuple[Tuple[str, ForeignKeyReference], ...]
+    auto_increment_fields: Tuple[str, ...]
+    auto_increment_metadata: Tuple[Tuple[str, KuzuFieldMetadata], ...]
+    auto_increment_field_set: frozenset[str]
+    has_auto_increment_primary_key: bool
+
+
+def _build_model_kuzu_metadata_plan(model_class: Type[Any]) -> _KuzuModelMetadataPlan:
+    entries: List[Tuple[str, KuzuFieldMetadata]] = []
+    primary_key_fields: List[str] = []
+    foreign_key_fields: List[Tuple[str, ForeignKeyReference]] = []
+    auto_increment_fields: List[str] = []
+    auto_increment_metadata: List[Tuple[str, KuzuFieldMetadata]] = []
+    has_auto_increment_primary_key = False
+
+    for field_name, field_info in model_class.model_fields.items():
+        metadata = _kuzu_registry.get_field_metadata(field_info)
+        if metadata is None:
+            continue
+        entries.append((field_name, metadata))
+        if metadata.primary_key:
+            primary_key_fields.append(field_name)
+        if metadata.foreign_key is not None:
+            foreign_key_fields.append((field_name, metadata.foreign_key))
+        if metadata.auto_increment:
+            auto_increment_fields.append(field_name)
+            auto_increment_metadata.append((field_name, metadata))
+            has_auto_increment_primary_key = has_auto_increment_primary_key or metadata.primary_key
+
+    entry_tuple = tuple(entries)
+    auto_increment_tuple = tuple(auto_increment_fields)
+    return _KuzuModelMetadataPlan(
+        metadata_by_field=MappingProxyType(dict(entry_tuple)),
+        entries=entry_tuple,
+        primary_key_fields=tuple(primary_key_fields),
+        foreign_key_fields=tuple(foreign_key_fields),
+        auto_increment_fields=auto_increment_tuple,
+        auto_increment_metadata=tuple(auto_increment_metadata),
+        auto_increment_field_set=frozenset(auto_increment_tuple),
+        has_auto_increment_primary_key=has_auto_increment_primary_key,
+    )
+
+
+_model_kuzu_metadata_plan_build_lock = Lock()
+_model_kuzu_metadata_plan_values: Dict[Type[Any], _KuzuModelMetadataPlan] = {}
+
+
+def _model_kuzu_metadata_plan(model_class: Type[Any]) -> _KuzuModelMetadataPlan:
+    cached = _model_kuzu_metadata_plan_values.get(model_class)
+    if cached is not None:
+        return cached
+    with _model_kuzu_metadata_plan_build_lock:
+        cached = _model_kuzu_metadata_plan_values.get(model_class)
+        if cached is not None:
+            return cached
+        metadata_plan = _build_model_kuzu_metadata_plan(model_class)
+        _model_kuzu_metadata_plan_values[model_class] = metadata_plan
+        return metadata_plan
+
+
+def clear_model_kuzu_metadata_cache() -> None:
+    """Clear cached immutable field-metadata plans."""
+    with _model_kuzu_metadata_plan_build_lock:
+        _model_kuzu_metadata_plan_values.clear()
+
+
 # -----------------------------------------------------------------------------
 # Relationship pair processing helpers
 # -----------------------------------------------------------------------------
+
+def _relationship_endpoint_sort_key(endpoint: Any) -> Tuple[str, str, str]:
+    """Return the canonical ordering key for an unordered endpoint collection."""
+    if isinstance(endpoint, str):
+        return endpoint, "", ""
+    node_name = getattr(endpoint, "__kuzu_node_name__", None)
+    if not isinstance(node_name, str) or not node_name:
+        raise ValueError(
+            "Relationship endpoint sets require decorated node classes or string node names: "
+            f"received {endpoint!r}"
+        )
+    return (
+        node_name,
+        str(getattr(endpoint, "__module__", "")),
+        str(getattr(endpoint, "__qualname__", "")),
+    )
+
+
+def _ordered_relationship_endpoints(endpoint: Any) -> Tuple[Any, ...]:
+    """Normalize one endpoint declaration while preserving explicit order."""
+    if isinstance(endpoint, (set, frozenset)):
+        return tuple(sorted(endpoint, key=_relationship_endpoint_sort_key))
+    return (endpoint,)
+
 
 def _process_relationship_pairs(
     pairs: List[Tuple[Union[Set[Any], Any], Union[Set[Any], Any]]],
@@ -1653,19 +1752,8 @@ def _process_relationship_pairs(
                 raise ValueError(f"Relationship {rel_name}: Each pair must be a 2-tuple (from_type, to_type)")
             from_type, to_type = pair
 
-            # Handle sets in FROM position
-            from_types = []
-            if isinstance(from_type, (set, frozenset)):
-                from_types = list(from_type)
-            else:
-                from_types = [from_type]
-
-            # Handle sets in TO position
-            to_types = []
-            if isinstance(to_type, (set, frozenset)):
-                to_types = list(to_type)
-            else:
-                to_types = [to_type]
+            from_types = _ordered_relationship_endpoints(from_type)
+            to_types = _ordered_relationship_endpoints(to_type)
 
             # Create Cartesian product of FROM and TO types
             for ft in from_types:
@@ -1835,21 +1923,18 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
 
     def __hash__(self) -> int:
         """Make model instances hashable for use in sets."""
-        # Use primary key if available, otherwise use id() for object identity
-        primary_key_fields = self.get_primary_key_fields()
+        metadata_plan = _model_kuzu_metadata_plan(self.__class__)
+        primary_key_fields = metadata_plan.primary_key_fields
         if primary_key_fields:
-            # Use the first primary key field for hashing
             primary_key_field = primary_key_fields[0]
-            # @@ STEP: Access attribute directly
             try:
                 pk_value = self.__dict__[primary_key_field]
 
-                if pk_value is None and primary_key_field in self.get_auto_increment_fields():
+                if pk_value is None and primary_key_field in metadata_plan.auto_increment_field_set:
                     return hash(id(self))
 
                 return hash((self.__class__.__name__, pk_value))
             except KeyError:
-                # Primary key not set - THIS IS AN ERROR
                 raise ValueError(
                     f"Cannot compute hash for {self.__class__.__name__}: "
                     f"primary key field '{primary_key_field}' is not set"
@@ -1861,22 +1946,20 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
         if not isinstance(other, self.__class__):
             return False
 
-        primary_key_fields = self.get_primary_key_fields()
+        metadata_plan = _model_kuzu_metadata_plan(self.__class__)
+        primary_key_fields = metadata_plan.primary_key_fields
         if primary_key_fields:
-            # Use the first primary key field for equality
             primary_key_field = primary_key_fields[0]
-            # @@ STEP: Access attributes directly
             try:
                 self_pk = self.__dict__[primary_key_field]
                 other_pk = other.__dict__[primary_key_field]
                 if (
-                    primary_key_field in self.get_auto_increment_fields()
+                    primary_key_field in metadata_plan.auto_increment_field_set
                     and (self_pk is None or other_pk is None)
                 ):
                     return self is other
                 return self_pk == other_pk
             except KeyError as e:
-                # One or both PKs not set - THIS IS AN ERROR
                 raise ValueError(
                     f"Cannot compare {self.__class__.__name__} instances: "
                     f"primary key field '{primary_key_field}' is not set. Error: {e}"
@@ -1899,37 +1982,21 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
 
     @classmethod
     def get_kuzu_metadata(cls, field_name: str) -> Optional[KuzuFieldMetadata]:
-        field_info = cls.model_fields.get(field_name)
-        if field_info:
-            return _kuzu_registry.get_field_metadata(field_info)
-        raise AttributeError(f"Field '{field_name}' not found in {cls.__name__}")
+        if field_name not in cls.model_fields:
+            raise AttributeError(f"Field '{field_name}' not found in {cls.__name__}")
+        return _model_kuzu_metadata_plan(cls).metadata_by_field.get(field_name)
 
     @classmethod
     def get_all_kuzu_metadata(cls) -> Dict[str, KuzuFieldMetadata]:
-        res: Dict[str, KuzuFieldMetadata] = {}
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta:
-                res[field_name] = meta
-        return res
+        return dict(_model_kuzu_metadata_plan(cls).entries)
 
     @classmethod
     def get_primary_key_fields(cls) -> List[str]:
-        pks: List[str] = []
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta and meta.primary_key:
-                pks.append(field_name)
-        return pks
+        return list(_model_kuzu_metadata_plan(cls).primary_key_fields)
 
     @classmethod
     def get_foreign_key_fields(cls) -> Dict[str, ForeignKeyReference]:
-        fks: Dict[str, ForeignKeyReference] = {}
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta and meta.foreign_key:
-                fks[field_name] = meta.foreign_key
-        return fks
+        return dict(_model_kuzu_metadata_plan(cls).foreign_key_fields)
 
     @classmethod
     def get_auto_increment_fields(cls) -> List[str]:
@@ -1939,12 +2006,7 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
         Returns:
             List of field names that are auto-increment (SERIAL) fields
         """
-        auto_inc_fields: List[str] = []
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta and meta.auto_increment:
-                auto_inc_fields.append(field_name)
-        return auto_inc_fields
+        return list(_model_kuzu_metadata_plan(cls).auto_increment_fields)
 
     @classmethod
     def get_auto_increment_metadata(cls) -> Dict[str, KuzuFieldMetadata]:
@@ -1954,12 +2016,7 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
         Returns:
             Dictionary mapping field names to their KuzuFieldMetadata for auto-increment fields
         """
-        auto_inc_meta: Dict[str, KuzuFieldMetadata] = {}
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta and meta.auto_increment:
-                auto_inc_meta[field_name] = meta
-        return auto_inc_meta
+        return dict(_model_kuzu_metadata_plan(cls).auto_increment_metadata)
 
     @classmethod
     def has_auto_increment_primary_key(cls) -> bool:
@@ -1969,11 +2026,7 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
         Returns:
             True if there's a primary key field with auto_increment=True
         """
-        for field_name, field_info in cls.model_fields.items():
-            meta = _kuzu_registry.get_field_metadata(field_info)
-            if meta and meta.primary_key and meta.auto_increment:
-                return True
-        return False
+        return _model_kuzu_metadata_plan(cls).has_auto_increment_primary_key
 
     def get_auto_increment_fields_needing_generation(self) -> List[str]:
         """
@@ -1986,7 +2039,7 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
         Returns:
             List of field names that need auto-generation from database
         """
-        auto_increment_fields = self.get_auto_increment_fields()
+        auto_increment_fields = _model_kuzu_metadata_plan(self.__class__).auto_increment_fields
         fields_needing_generation = []
 
         # Check which fields were explicitly set during model instantiation
@@ -2025,7 +2078,7 @@ class KuzuBaseModel(BaseModel, metaclass=CythonModelMetaclass):
             )
 
         # @@ STEP 2: Get all auto-increment fields for this model
-        auto_increment_fields = self.get_auto_increment_fields()
+        auto_increment_fields = _model_kuzu_metadata_plan(self.__class__).auto_increment_fields
 
         # || S.2.1: Early return optimization for models with no auto-increment fields
         if not auto_increment_fields:
@@ -2257,12 +2310,12 @@ class KuzuNodeBase(KuzuBaseModel):
         Raises:
             ValueError: If no primary key fields are defined or set
         """
-        primary_key_fields = self.get_primary_key_fields()
+        metadata_plan = _model_kuzu_metadata_plan(self.__class__)
+        primary_key_fields = metadata_plan.primary_key_fields
         if not primary_key_fields:
             raise ValueError(NodeBaseConstants.NODE_MISSING_PRIMARY_KEY.format(self.__class__.__name__))
 
-        # @@ STEP: Get auto-increment fields to allow None values for them
-        auto_increment_fields = self.get_auto_increment_fields()
+        auto_increment_fields = metadata_plan.auto_increment_field_set
 
         # @@ STEP: Check that at least one primary key field has a value or is auto-increment
         for field_name in primary_key_fields:
@@ -2471,15 +2524,14 @@ class KuzuRelationshipBase(KuzuBaseModel):
             TypeError: If node type is unsupported
         """
         if hasattr(type(node), 'model_fields'):
-            # It's a model instance, find the primary key field
             model_class = type(node)
-            for field_name, field_info in model_class.model_fields.items():
-                metadata = _kuzu_registry.get_field_metadata(field_info)
-                if metadata and metadata.primary_key:
-                    pk_value = getattr(node, field_name)
-                    # Validate the primary key value
-                    self._validate_primary_key_value(pk_value, metadata.kuzu_type, field_name, model_class.__name__)
-                    return pk_value
+            metadata_plan = _model_kuzu_metadata_plan(model_class)
+            if metadata_plan.primary_key_fields:
+                field_name = metadata_plan.primary_key_fields[0]
+                metadata = metadata_plan.metadata_by_field[field_name]
+                pk_value = getattr(node, field_name)
+                self._validate_primary_key_value(pk_value, metadata.kuzu_type, field_name, model_class.__name__)
+                return pk_value
             raise ValueError(f"No primary key found in node {model_class.__name__}")
         else:
             # It's a raw primary key value - validate it against Kuzu PK requirements
@@ -3058,6 +3110,7 @@ def clear_registry():
     from .kuzu_session_rows import clear_session_row_metadata_caches
 
     clear_enum_conversion_plan_cache()
+    clear_model_kuzu_metadata_cache()
     clear_session_row_metadata_caches()
 
     # @@ STEP 1: Break circular references FIRST (critical for preventing segfaults)

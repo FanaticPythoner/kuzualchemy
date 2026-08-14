@@ -35,7 +35,10 @@ def _node_label_cached(model_class: type[Any]) -> str:
     return label
 
 def _primary_key_fields(model_class: type[Any]) -> list[str]:
-    return list(_primary_key_fields_cached(model_class))
+    return list(primary_key_field_tuple(model_class))
+
+def primary_key_field_tuple(model_class: type[Any]) -> tuple[str, ...]:
+    return _primary_key_fields_cached(model_class)
 
 @lru_cache(maxsize=None)
 def _primary_key_fields_cached(model_class: type[Any]) -> tuple[str, ...]:
@@ -229,7 +232,11 @@ def _model_uuid_field_specs_cached(model_class: type[Any]) -> tuple[ModelUuidFie
     )
 
 def _materialize_default_function(value: Any) -> Any:
-    if isinstance(value, (KuzuDefaultFunction, DefaultFunctionBase)):
+    value_type = type(value)
+    if (
+        value_type is KuzuDefaultFunction
+        or DefaultFunctionBase in value_type.__mro__
+    ):
         return BulkInsertValueGeneratorRegistry.generate_value(value)
     return value
 

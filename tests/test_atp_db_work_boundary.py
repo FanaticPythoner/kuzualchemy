@@ -124,17 +124,15 @@ def test_atp_db_work_updates_and_deletes_nodes(tmp_path: Path) -> None:
 def test_atp_db_work_node_create_is_idempotent_without_null_overwrite(tmp_path: Path) -> None:
     session = _session(tmp_path)
     try:
-        session.bulk_insert_immediate(
+        session.add_all(
             [
                 BoundaryAuthor(id=1, name="alpha", score=1, nickname="live"),
                 BoundaryAuthor(id=1, name="alpha", score=1, nickname=None),
             ]
         )
-        session.bulk_insert_immediate(
-            [
-                BoundaryAuthor(id=1, name="alpha", score=1, nickname=None),
-            ]
-        )
+        session.flush()
+        session.add(BoundaryAuthor(id=1, name="alpha", score=1, nickname=None))
+        session.flush()
 
         rows = session.execute(
             "MATCH (a:BoundaryAuthor) RETURN a.id AS id, a.name AS name, "
@@ -283,5 +281,48 @@ def test_atp_relationship_read_uses_native_route_metadata(tmp_path: Path) -> Non
         assert [(rel.rank, rel.marker, rel.from_node, rel.to_node) for rel in rels] == [
             (3, "route", 1, 10)
         ]
+    finally:
+        session.close()
+
+
+def test_atp_relationship_iterator_pages_duplicate_endpoints_exactly_once(
+    tmp_path: Path,
+) -> None:
+    session = _session(tmp_path)
+    try:
+        author = BoundaryAuthor(id=1, name="alpha", score=1)
+        post = BoundaryPost(id=10, title="first")
+        session.bulk_insert_immediate([author, post])
+        session.bulk_insert_immediate(
+            [
+                BoundaryAuthored.create_between(
+                    author.id,
+                    post.id,
+                    rank=1,
+                    marker="first",
+                ),
+                BoundaryAuthored.create_between(
+                    author.id,
+                    post.id,
+                    rank=2,
+                    marker="second",
+                ),
+            ]
+        )
+
+        relationships = list(
+            session.query(BoundaryAuthored).iter(
+                page_size=1,
+                prefetch_pages=1,
+            )
+        )
+
+        assert sorted(
+            (relationship.rank, relationship.marker) for relationship in relationships
+        ) == [(1, "first"), (2, "second")]
+        assert all(
+            (relationship.from_node, relationship.to_node) == (author.id, post.id)
+            for relationship in relationships
+        )
     finally:
         session.close()
