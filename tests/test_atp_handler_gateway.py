@@ -15,6 +15,7 @@ from atp_pipeline import (
 )
 
 from kuzualchemy.kuzu_connection import KuzuConnection
+from atp_pipeline.read_cancellation import ReadCancellation, ReadCancelled, current_read_cancellation, read_cancellation_scope
 
 
 class _Ticket:
@@ -194,6 +195,36 @@ def test_row_partition_executor_scope_uses_caller_pool_and_restores_owner_pool()
 
     assert shared_result[0].startswith("phase-row")
     assert owned_result[0].startswith("owned-row")
+
+
+def test_row_workers_preserve_cancellation_owner_without_leaking_into_reused_threads() -> None:
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    token = ReadCancellation()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        connection._row_partition_executor = executor
+        with read_cancellation_scope(token):
+            assert connection.run_row_partition_tasks([(current_read_cancellation, (), {})]) == [token]
+        assert connection.run_row_partition_tasks([(current_read_cancellation, (), {})]) == [None]
+
+
+def test_row_worker_rejects_result_if_its_owner_is_cancelled_during_materialization() -> None:
+    connection = object.__new__(KuzuConnection)
+    connection.db_path = ":memory:"
+    connection._closed = False
+    token = ReadCancellation()
+
+    def cancel_read():
+        assert current_read_cancellation() is token
+        token.cancel()
+        return "retained source canary"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        connection._row_partition_executor = executor
+        with read_cancellation_scope(token), pytest.raises(ReadCancelled):
+            connection.run_row_partition_tasks([(cancel_read, (), {})])
+        assert connection.run_row_partition_tasks([(lambda: 41, (), {})]) == [41]
 
 
 def test_bulk_write_nodes_many_routes_to_single_handler_call() -> None:

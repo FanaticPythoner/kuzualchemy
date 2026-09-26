@@ -4,11 +4,12 @@ import os
 import threading
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 import atp_pipeline as atp
+from atp_pipeline.read_cancellation import current_read_cancellation
 from atp_pipeline import (
     ATPHandler,
     DatabaseType,
@@ -66,19 +67,31 @@ def _execute_row_partition_task(
                 f"row partition CPU affinity mismatch: observed={observed}, expected={cpu_ids}"
             )
         _ROW_PARTITION_THREAD_STATE.cpu_ids = cpu_ids
-    return function(*arguments, **keyword_arguments)
+    cancellation = current_read_cancellation()
+    if cancellation is not None:
+        cancellation.require_active()
+    result = function(*arguments, **keyword_arguments)
+    if cancellation is not None:
+        cancellation.require_active()
+    return result
 
 
 class KuzuConnection:
     """Submit Kuzu work through ATP."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, read_only: bool = False) -> None:
+        if type(read_only) is not bool:
+            raise TypeError("read_only requires a boolean")
         raw_path = str(db_path)
         self.db_path = raw_path if raw_path == ":memory:" else str(Path(raw_path).resolve())
         self._handler: ATPHandler | None = ATPHandler(
             DatabaseType.KUZU,
-            {"db_path": self.db_path},
+            {"db_path": self.db_path, "read_only": read_only},
         )
+        if read_only and "READ_ONLY_DATABASE" not in self._handler.get_capability_report()["capabilities"]:
+            self._handler.shutdown()
+            self._handler = None
+            raise RuntimeError("ATP backend lacks read-only database capability")
         self._row_partition_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=_process_cpu_capacity(),
             thread_name_prefix="kuzualchemy-row",
@@ -138,6 +151,7 @@ class KuzuConnection:
         cpu_ids = _current_cpu_affinity()
         futures = [
             executor.submit(
+                copy_context().run,
                 _execute_row_partition_task,
                 cpu_ids,
                 function,
